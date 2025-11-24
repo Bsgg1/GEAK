@@ -14,22 +14,22 @@ It contains a Generator, a Reflector, an Evaluator and an Optimizer. The actor g
 ## Quick Start: Run the Agent on TritonBench
 1. prepare the Agent environment
    ```
-   git clone https://github.com/AMD-AGI/gpu-kernel-agent.git
-   cd gpu-kernel-agent
+   git clone https://github.com/AMD-AGI/GEAK-agent.git
+   cd GEAK-agent
    python3 -m pip install -r requirements.txt
    ```
 2. prepare the TritonBench environment
    ```
    cd ..
-   git clone https://github.com/AMD-AGI/TB-eval.git
-   cd TB-eval
+   git clone https://github.com/AMD-AGI/GEAK-eval.git
+   cd GEAK-eval
    python3 -m pip install -r requirements.txt
    python3 -m pip install -e .
    ```
 
 3. edit config file. You need to give your API key, dataloader path and agent parameters in your config file.
    ```
-   cd ../gpu-kernel-agent/src
+   cd ../GEAK-eval/src
    cp configs/tritonbench_gaagent_config.yaml configs/tritonbench_gaagent_config_new.yaml
    ```
    You can modify dataloader paths to the above downloaded TritonBench.
