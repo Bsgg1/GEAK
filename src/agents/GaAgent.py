@@ -156,7 +156,7 @@ class GaAgent(Reflexion_Oneshot):
                         for future in as_completed(futures):
                             pbar.update(1)
                 else:
-                    for mem in self.memories[start_idx:data_len]:
+                    for mem in self.memories[start_idx:(start_idx + data_len)]:
                         self.generate_solution(mem, temperature=temperature, descendant_num=descendant_num, mutation=mutation)
                         pbar.update(1)
             
@@ -169,7 +169,7 @@ class GaAgent(Reflexion_Oneshot):
                         for future in as_completed(futures):
                             pbar.update(1)
                 else:
-                    for mem in self.memories[start_idx:data_len]:
+                    for mem in self.memories[start_idx:(start_idx + data_len)]:
                         self.generate_llm_evaluate(mem, temperature=temperature)
                         pbar.update(1)
             
@@ -187,7 +187,7 @@ class GaAgent(Reflexion_Oneshot):
                 exe_dir = "pass_exe"
                 perf_result_dir = "perf_results"
                 perf_log_dir = "perf_logs"
-            for mem in tqdm(self.memories[start_idx:data_len]):
+            for mem in tqdm(self.memories[start_idx:(start_idx + data_len)]):
                 if mem.raw_codes:
                     for i in range(len(mem.raw_codes)):
                         raw_code = mem.raw_codes[i]
@@ -247,13 +247,13 @@ class GaAgent(Reflexion_Oneshot):
                         for future in as_completed(futures):
                             pbar.update(1)
                 else:
-                    for mem in self.memories[start_idx:data_len]:
+                    for mem in self.memories[start_idx:(start_idx + data_len)]:
                         self.generate_reflexion(mem, temperature=temperature)
                         pbar.update(1)
 
             # update perf_candidates
 
-            for mem in self.memories[start_idx:data_len]:
+            for mem in self.memories[start_idx:(start_idx + data_len)]:
                 if mem.raw_codes:
                     for i in range(len(mem.raw_codes)):
                         raw_code = mem.raw_codes[i]
