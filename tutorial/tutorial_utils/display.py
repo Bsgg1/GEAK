@@ -38,7 +38,7 @@ def setup_environment():
     corpus_path = os.path.join(src_dir, 'dataloaders', 'TB_eval', 'train_crawl.json')
     
     # Now we can import TutorialDataloader since paths are set
-    from utils.tutorial_dataloader import TutorialDataloader
+    from tutorial_utils.tutorial_dataloader import TutorialDataloader
     
     return tutorial_dir, src_dir, corpus_path, TutorialDataloader
 
