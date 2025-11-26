@@ -38,11 +38,34 @@ def clear_json(response):
         return response
     elif type(response) is not str:
         response = str(response)
+    
+    # Try to extract JSON from markdown code blocks first
+    json_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', response)
+    if json_match:
+        json_str = json_match.group(1)
+    else:
+        # Fall back to finding raw JSON object
+        json_match = re.search(r'(\{[\s\S]*\})', response)
+        if json_match:
+            json_str = json_match.group(1)
+        else:
+            return "ERR_SYNTAX"
+    
+    # Try json.loads first (handles null, true, false)
     try:
-        response = response.replace("\n", " ")
-        response = re.search('({.+})', response).group(0)
-        response = re.sub(r"(\w)'(\w|\s)", r"\1\\'\2", response)
-        result = ast.literal_eval(response)
-    except (SyntaxError, NameError, AttributeError):
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        pass
+    
+    # Fall back to ast.literal_eval with preprocessing
+    try:
+        json_str_clean = json_str.replace("\n", " ")
+        json_str_clean = re.sub(r"(\w)'(\w|\s)", r"\1\\'\2", json_str_clean)
+        # Convert JSON keywords to Python
+        json_str_clean = json_str_clean.replace('null', 'None')
+        json_str_clean = json_str_clean.replace('true', 'True')
+        json_str_clean = json_str_clean.replace('false', 'False')
+        result = ast.literal_eval(json_str_clean)
+        return result
+    except (SyntaxError, NameError, AttributeError, ValueError):
         return "ERR_SYNTAX"
-    return result

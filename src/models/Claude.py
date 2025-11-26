@@ -5,8 +5,9 @@ from models.Base import BaseModel
 
 
 class ClaudeModel(BaseModel):
+    """AMD LLM API Gateway - Claude client"""
     def __init__(self, 
-                 model_id="claude-3.7", 
+                 model_id="claude-sonnet-4", 
                  api_key=None):
         assert api_key is not None, "no api key is provided."
         self.model_id = model_id
@@ -15,15 +16,18 @@ class ClaudeModel(BaseModel):
             'Ocp-Apim-Subscription-Key': api_key
         }
     
-    @retry(wait=wait_random_exponential(min=20, max=60), stop=stop_after_attempt(5))
+    @retry(wait=wait_random_exponential(min=5, max=60), stop=stop_after_attempt(5))
     def generate(self, 
                  messages: List,
                  temperature=1.0,
                  presence_penalty=0, 
                  frequency_penalty=0, 
-                 max_tokens=30000,
-                 max_completion_tokens=30000
+                 max_tokens=16000,
+                 max_completion_tokens=16000
                  ) -> str:
+        # Cap max_tokens
+        max_tokens = min(max_tokens, 16000)
+        
         body = {
             "messages": messages,
             "temperature": temperature,
@@ -41,7 +45,15 @@ class ClaudeModel(BaseModel):
                         timeout=600
                     )
         except Exception as e:
-            raise ValueError("No response from the API.")
-        assert response.status_code == 200
-        return response.json()['content'][0]['text']
-    
+            raise ValueError(f"No response from the API: {str(e)}")
+        
+        if response.status_code != 200:
+            raise ValueError(f"API returned status {response.status_code}: {response.text}")
+        
+        result = response.json()
+        if 'content' in result and len(result['content']) > 0:
+            return result['content'][0]['text']
+        elif 'choices' in result and len(result['choices']) > 0:
+            return result['choices'][0]['message']['content']
+        else:
+            raise ValueError(f"Unexpected response format: {result}")

@@ -201,7 +201,7 @@ def code_kernel_profiling(code, fname, py_folder, target_gpu, temp_root="tmp2", 
 
     code =  code + '\n\n' + hash_line + '\n' + '\n' + '\n'.join(test_code_lines_procs)
     
-    code_bash = f"python3 {gen_file}"
+    code_bash = f'python3 "{gen_file}"'
     with open(gen_file, 'w') as f:
         f.write(code)
     with open(gen_bash_file, 'w') as f:
@@ -331,11 +331,11 @@ def code_call_exec_success_allclose(code, fname, py_folder, temp_root="tmp2", at
 
     try:
         ## Just to a simple call to the generated code
-        result_call = subprocess.run([f'HIP_VISIBLE_DEVICES={gpu_id} python3 {gen_file}'], capture_output=True, text=True, timeout=timeout, shell=True)
+        result_call = subprocess.run([f'HIP_VISIBLE_DEVICES={gpu_id} python3 "{gen_file}"'], capture_output=True, text=True, timeout=timeout, shell=True)
         call_status = result_call.returncode == 0
 
         # Check for correctness
-        result_corr = subprocess.run([f'HIP_VISIBLE_DEVICES={gpu_id} python3 dataloaders/TB_eval/correctness.py --gen_file {gen_file} --ref_file {triton_file} --atol {atol} --rtol {rtol}'], capture_output=True, text=True, timeout=timeout, shell=True)
+        result_corr = subprocess.run([f'HIP_VISIBLE_DEVICES={gpu_id} python3 "dataloaders/TB_eval/correctness.py" --gen_file "{gen_file}" --ref_file "{triton_file}" --atol {atol} --rtol {rtol}'], capture_output=True, text=True, timeout=timeout, shell=True)
         stdout_corr = result_corr.stdout
         stderr_corr = result_corr.stderr
 

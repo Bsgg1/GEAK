@@ -255,6 +255,9 @@ class GaAgent(Reflexion_Oneshot):
 
             for mem in self.memories[start_idx:(start_idx + data_len)]:
                 if mem.raw_codes:
+                    # Extend history if descendant_num increased since initialization
+                    while len(mem.history) < len(mem.raw_codes):
+                        mem.history.append([])
                     for i in range(len(mem.raw_codes)):
                         raw_code = mem.raw_codes[i]
                         mem.history[i].append(raw_code)
@@ -320,6 +323,9 @@ class GaAgent(Reflexion_Oneshot):
                 text += f"\nHere is an example snippet of code: {one_shot}"
         
         if mem.raw_codes :
+            # Extend history if descendant_num increased since initialization
+            while len(mem.history) < len(mem.raw_codes):
+                mem.history.append([])
             for i in range(len(mem.raw_codes)):
                 raw_code = mem.raw_codes[i]
                 if not raw_code.pass_perf:
@@ -364,6 +370,9 @@ class GaAgent(Reflexion_Oneshot):
 """
         
         if mem.raw_codes :
+            # Extend history if descendant_num increased since initialization
+            while len(mem.history) < len(mem.raw_codes):
+                mem.history.append([])
             for i in range(len(mem.raw_codes)):
                 raw_code = mem.raw_codes[i]
                 if  raw_code.reflections:
@@ -422,28 +431,39 @@ Error Message: {raw_code.test_stderr}
     def call_llm_code(self, prompt, temperature):
         msg = [{"role": "user", "content": prompt}]
         try:
-            # import pdb; pdb.set_trace()
             response = self.model.generate(msg, temperature=temperature, max_tokens=30000)
             opti = clear_json(response)
-            if 'code' in opti.keys() and  'strategy' in opti.keys():
+            if opti == "ERR_SYNTAX":
+                logger.info(f"JSON parsing failed. Response preview: {response[:500] if response else 'None'}...")
+                raise ValueError("Failed to parse JSON from LLM response")
+            if isinstance(opti, dict) and 'code' in opti.keys() and 'strategy' in opti.keys():
                 code = clear_code(opti['code'])
                 strategy = opti['strategy']
-                return code, strategy 
-        except:
-            logger.info(f"failed to call LLM")
-            raise ValueError("failed to call LLM")
+                return code, strategy
+            else:
+                logger.info(f"Missing code/strategy keys. Got keys: {opti.keys() if isinstance(opti, dict) else type(opti)}")
+                raise ValueError("LLM response missing required keys")
+        except Exception as e:
+            logger.info(f"failed to call LLM: {str(e)}")
+            raise ValueError(f"failed to call LLM: {str(e)}")
 
     def call_llm_reflecion(self, prompt, temperature):
         msg = [{"role": "user", "content": prompt}]
         try:
             response = self.model.generate(msg, temperature=temperature, max_tokens=30000)
             opti = clear_json(response)
-            if 'reflection' in opti.keys():
+            if opti == "ERR_SYNTAX":
+                logger.info(f"JSON parsing failed for reflection. Response preview: {response[:500] if response else 'None'}...")
+                raise ValueError("Failed to parse JSON from LLM response")
+            if isinstance(opti, dict) and 'reflection' in opti.keys():
                 reflection = opti['reflection']
-                return reflection 
-        except:
-            logger.info(f"failed to call LLM")
-            raise ValueError("failed to call LLM")
+                return reflection
+            else:
+                logger.info(f"Missing reflection key. Got: {opti.keys() if isinstance(opti, dict) else type(opti)}")
+                raise ValueError("LLM response missing reflection key")
+        except Exception as e:
+            logger.info(f"failed to call LLM reflection: {str(e)}")
+            raise ValueError(f"failed to call LLM reflection: {str(e)}")
 
     def update_perf_candidates(self,mem, raw_code: tempCode, ancestor_num):
         if len(mem.perf_candidates) < ancestor_num:
@@ -481,7 +501,7 @@ correctness test: Succeed
 speedup: {latency}
 """
                 test_txt = test_txt.format(
-                    speedup=raw_code.latency
+                    latency=raw_code.latency
                 )
             elif raw_code.pass_exe and not raw_code.pass_perf:
                 test_txt = """
