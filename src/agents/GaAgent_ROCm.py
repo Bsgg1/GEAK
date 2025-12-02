@@ -417,6 +417,9 @@ class GaAgent(Reflexion_Oneshot):
 """
         
         if mem.raw_codes :
+            # Extend history if needed (same check as in generate_solution)
+            while len(mem.history) < len(mem.raw_codes):
+                mem.history.append([])
             for i in range(len(mem.raw_codes)):
                 raw_code = mem.raw_codes[i]
                 if  raw_code.reflections:
