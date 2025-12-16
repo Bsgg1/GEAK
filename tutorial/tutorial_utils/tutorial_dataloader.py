@@ -1,3 +1,5 @@
+# Copyright(C) [2025] Advanced Micro Devices, Inc. All rights reserved.
+
 """
 Minimal Tutorial Dataloader for GEAK-agent
 Uses the self-contained v1 evaluation system with minimal kernel data

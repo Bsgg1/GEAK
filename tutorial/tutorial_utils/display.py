@@ -1,3 +1,5 @@
+# Copyright(C) [2025] Advanced Micro Devices, Inc. All rights reserved.
+
 """
 Display utilities for GEAK-Agent Tutorial
 Handles all formatting and results display logic
