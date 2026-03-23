@@ -186,3 +186,6 @@ pyrightconfig.json
 .cursor/
 .optimization_strategies.md
 optimization_logs/
+test_harness.py
+examples/add_kernel/test_harness.py
+examples/matmul_kernel/kernel.py
