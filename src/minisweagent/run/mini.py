@@ -59,10 +59,9 @@ There are two different user interfaces:
 [bold green]mini[/bold green] Simple REPL-style interface
 [bold green]mini -v[/bold green] Pager-style interface (Textual)
 
-MCP integration (AMD AI DevTool):
+RAG MCP:
 
-[bold green]mini --mcp[/bold green] Enable MCP integration
-[bold green]mini --mcp -d[/bold green] Enable MCP integration with debug output
+[bold green]mini -c mini_rag[/bold green] Enable RAG MCP knowledge base retrieval
 
 More information about the usage: [bold green]https://mini-swe-agent.com/latest/usage/mini/[/bold green]
 [/not dim]
@@ -81,8 +80,7 @@ def main(
     config_spec: Path = typer.Option(DEFAULT_CONFIG, "-c", "--config", help="Path to config file"),
     output: Path | None = typer.Option(DEFAULT_OUTPUT, "-o", "--output", help="Output trajectory file"),
     exit_immediately: bool = typer.Option( False, "--exit-immediately", help="Exit immediately when the agent wants to finish instead of prompting.", rich_help_panel="Advanced"),
-    mcp: bool = typer.Option(False, "--mcp", help="Enable MCP integration (AMD AI DevTool)"),
-    debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug output (only with --mcp)"),
+    test_command: str | None = typer.Option(None, "--test-command", help="Test command to run after agent finishes"),
 ) -> Any:
     # fmt: on
     # 捕获所有 print 输出到 trajectory
@@ -127,42 +125,20 @@ def main(
     _api_key_display = f"{_api_key[:8]}..." if _api_key and len(_api_key) > 8 else _api_key or "Not set"
     console.print(f"\\[mini-swe-agent] Using model: [bold cyan]{_model_name}[/bold cyan], API key: [bold cyan]{_api_key_display}[/bold cyan]")
     
-    # MCP integration
     extra_agent_kwargs = {}
-    if mcp:
-        try:
-            from dataclasses import dataclass
-            from minisweagent.mcp_integration.mcp_environment import MCPEnabledEnvironment
-            from minisweagent.mcp_integration.prompts import SYSTEM_TEMPLATE, INSTANCE_TEMPLATE
-            from minisweagent.mcp_integration.run_agent import DebugMCPEnvironment
-        except ImportError as e:
-            console.print(f"[red]Error: MCP integration requires 'amd-ai-devtool'. Please install it first.[/red]")
-            console.print(f"[red]Import error: {e}[/red]")
-            raise typer.Exit(1)
-        
-        # Create MCP-compatible config class for InteractiveAgent
-        @dataclass
-        class MCPInteractiveAgentConfig(InteractiveAgentConfig):
-            system_template: str = SYSTEM_TEMPLATE
-            instance_template: str = INSTANCE_TEMPLATE
-        
-        if debug:
-            env = DebugMCPEnvironment(**config.get("env", {}))
-            console.print("[bold yellow]🐛 Debug mode enabled[/bold yellow]")
-        else:
-            env = MCPEnabledEnvironment(**config.get("env", {}))
-        
-        extra_agent_kwargs["config_class"] = MCPInteractiveAgentConfig
-        
-        # Remove yaml prompts so MCP prompts take effect
-        agent_config = config.get("agent", {}).copy()
-        agent_config.pop("system_template", None)
-        agent_config.pop("instance_template", None)
-        
-        console.print("[bold green]🔌 MCP integration enabled[/bold green]")
+    env = LocalEnvironment(**config.get("env", {}))
+    agent_config = config.get("agent", {})
+
+    # RAG MCP integration (activated via config, e.g. -c mini_rag)
+    rag_cfg = config.get("rag") or config.get("tools", {}).get("rag")
+    if rag_cfg and rag_cfg is not True:
+        agent_config["rag_config"] = rag_cfg
+        console.print("[bold green]RAG: enabled (MCP)[/bold green]")
+    elif rag_cfg is True:
+        agent_config["rag_config"] = {"enable_subagent": False}
+        console.print("[bold green]RAG: enabled (MCP, default config)[/bold green]")
     else:
-        env = LocalEnvironment(**config.get("env", {}))
-        agent_config = config.get("agent", {})
+        console.print("[dim]RAG: disabled[/dim]")
 
     # Both visual flag and the MSWEA_VISUAL_MODE_DEFAULT flip the mode, so it's essentially a XOR
     agent_class = InteractiveAgent
