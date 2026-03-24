@@ -1,202 +1,155 @@
-English | [中文](README_zh.md)
-
 # Mini SWE Agent
 
-A minimal AI coding agent powered by LLM-generated Bash commands. The core agent is ~100 lines of code.
+A minimal AI coding agent powered by LLM tool calling and Bash commands. Features optional RAG knowledge retrieval via MCP (Model Context Protocol) for GPU/ROCm/HIP optimization tasks.
 
 ## Installation
 
 ```bash
 pip install -e .
-
-# To use the MCP RAG feature, also install the langchain dependencies
-pip install -e '.[langchain]'
 ```
 
 ## Usage
 
 ```bash
-# Interactive REPL
+# Interactive REPL (default: confirm mode)
 mini
 
 # Run with a specific task
 mini -t "fix the bug in main.py"
 
 # Auto-execute mode (no confirmation needed)
-mini --yolo
+mini -y
 
-# Enable MCP
-mini --mcp
+# Use Textual TUI
+mini -v
+
+# Enable RAG knowledge retrieval
+mini -c mini_rag
+
+# Custom config
+mini -c /path/to/config.yaml
 ```
 
-## MCP Integration
+## RAG MCP Integration
 
-Integrates AMD AI DevTool for hybrid knowledge base retrieval (BGE Embedding + BM25 + Reranking), with built-in AMD GPU and NVIDIA GPU knowledge bases.
+Optional GPU/ROCm/HIP knowledge base retrieval via a dedicated MCP server. Uses hybrid search (embedding + BM25 + RRF fusion + BGE reranker).
 
-### 1. Pre-download ROCm Library Source (Recommended)
-
-The agent may need to reference ROCm library source code at runtime. Pre-cloning is recommended to avoid timeouts when downloading a large repo on the fly:
+### Enable RAG
 
 ```bash
-git clone --depth 1 https://github.com/ROCm/rocm-libraries.git ~/.cache/rocm-libraries
+# Use the built-in mini_rag config
+mini -c mini_rag -t "optimize this HIP kernel for MI300X"
 ```
 
-### 2. Build Semantic Index (Required for First Use)
+Or add `rag:` to any config YAML:
 
-The knowledge base index must be built before MCP retrieval can work:
-
-```bash
-# Build index for all documents under knowledge-base/
-# --force overwrites any existing index
-python scripts/build_index.py --force
+```yaml
+# RAG MCP toggle: comment out the following two lines to disable RAG
+rag:
+  enable_subagent: false  # set true to enable LLM post-filtering of RAG results
 ```
 
-The index is saved to `~/.cache/amd-ai-devtool/semantic-index/` by default. Output files:
+### How RAG Works
 
-- `index.faiss` + `index.pkl` — FAISS semantic search index
-- `bm25_index.pkl` — BM25 keyword search index
+When RAG is enabled, two additional tools become available to the LLM:
 
-You need to rebuild the index when:
+- **`rag_query`** — Search the knowledge base by topic (e.g., "HIP shared memory optimization")
+- **`rag_optimize`** — Get optimization suggestions for a kernel type on a target GPU
 
-1. Knowledge base documents are added or modified
-2. Chunking or indexing logic is changed
-3. Metadata parsing bugs are fixed
+The LLM decides when to call these tools. Results are retrieved from a local knowledge base index via the `rag-mcp` server (spawned as a subprocess on first use).
 
-### 3. Test Retrieval
-
-After building the index, verify it with the test scripts:
-
-```bash
-python scripts/test_embedding_search.py      # Test FAISS semantic search
-python scripts/test_hybrid_retrieval.py      # Test hybrid retrieval (Embedding + BM25 + Reranker)
-python scripts/test_rrf_fusion.py            # Test RRF fusion algorithm
-```
-
-### 4. Enable MCP
-
-```bash
-mini --mcp        # Enable MCP
-mini --mcp -d     # Enable MCP with debug output
-```
-
-Inside the agent, use `@amd:your query` to invoke retrieval.
-
-### 5. RAG Retrieval Architecture
+### RAG Architecture
 
 ```
-Semantic + BM25 → RRF Fusion → BGE Reranker → Top K
+Agent → ToolRuntime.dispatch → MCPToolBridge → rag-mcp server (stdio subprocess)
+                                                    │
+                                            HybridRetriever.search()
+                                              ├─ Embedding (semantic)
+                                              ├─ BM25 (keyword)
+                                              ├─ RRF Fusion
+                                              └─ BGE Reranker
 ```
 
-- **Embedding**: BAAI/bge-large-en-v1.5 (semantic recall)
-- **BM25**: Keyword-based recall
-- **Fusion**: RRF (Reciprocal Rank Fusion) for deduplication and merging
-- **Reranker**: BAAI/bge-reranker-large (re-ranking)
+### RAG Server Config
 
-Config file: `src/minisweagent/config/rag_config.yaml` — tune retrieval parameters, toggle BM25 dual-path recall, reranking, LLM summarization, etc.
+The RAG MCP server config is at `mcp_tools/rag-mcp/src/rag_mcp/config/rag_config.yaml`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `retrieval.embed_top_k` | 25 | Embedding retrieval candidates |
+| `retrieval.bm25_top_k` | 25 | BM25 retrieval candidates |
+| `retrieval.enable_bm25` | true | Enable BM25 dual-path recall |
+| `retrieval.mcp_top_k` | 8 | Final results returned |
+| `reranker.enable_reranker` | true | Enable BGE reranker |
+| `fusion.semantic_weight` | 0.7 | Embedding weight in fusion |
+| `fusion.bm25_weight` | 0.3 | BM25 weight in fusion |
+
+Override with `RAG_MCP_CONFIG` env var or `~/.config/rag-mcp/config.yaml`.
 
 ## Project Structure
 
 ```
 src/minisweagent/
-├── __init__.py                # Version, protocols, global config
-├── agents/                    # Agent implementations
-│   ├── default.py             #   Core agent (~100 lines)
-│   ├── interactive.py         #   Human-in-the-loop agent
-│   └── interactive_textual.py #   Textual TUI agent
-├── models/                    # LLM model interfaces
-│   ├── litellm_model.py       #   LiteLLM (supports most providers)
-│   ├── anthropic_model.py     #   Anthropic
-│   ├── amd_llm.py             #   AMD LLM Gateway
-│   ├── openrouter_model.py    #   OpenRouter
-│   └── portkey_model.py       #   Portkey
-├── environments/              # Execution environments
-│   ├── local.py               #   Local subprocess
-│   ├── docker.py              #   Docker/Podman
-│   └── singularity.py         #   Singularity/Apptainer
-├── config/                    # YAML config files (see "Configuration" below)
-│   ├── mini.yaml              #   Default config for `mini` command
-│   ├── default.yaml           #   DefaultAgent base config
-│   ├── github_issue.yaml      #   GitHub issue solving config
-│   └── rag_config.yaml        #   RAG retrieval config
-├── run/                       # Entry points
-│   ├── mini.py                #   Main CLI (`mini` command)
-│   ├── hello_world.py         #   Simple example
-│   ├── github_issue.py        #   GitHub issue solver
-│   └── inspector.py           #   Trajectory browser
-├── mcp_integration/           # MCP (AMD AI DevTool) integration
-│   ├── mcp_environment.py     #   MCP environment wrapper
-│   ├── langchain_retrieval.py #   Hybrid retrieval (Embedding + BM25)
-│   └── prompts.py             #   MCP-specific prompts
-└── utils/                     # Utilities
-    ├── log.py                 #   Logging
-    └── subagent.py            #   Sub-agent utilities
+├── agents/                        # Agent implementations
+│   ├── default.py                 #   Core agent (tool calling + bash)
+│   ├── interactive.py             #   REPL-style interactive agent
+│   ├── interactive_textual.py     #   Textual TUI agent
+│   └── subagent.py                #   RAG result post-filtering sub-agent
+├── tools/                         # Tool runtime & implementations
+│   ├── tools_runtime.py           #   ToolRuntime: dispatch + RAG MCP registration
+│   ├── tools.json                 #   Tool schemas (bash, submit, str_replace_editor, rag_query, rag_optimize)
+│   ├── bash_command.py            #   Bash command execution
+│   ├── str_replace_editor.py      #   File editor (view, create, str_replace, insert)
+│   ├── submit.py                  #   Task submission
+│   └── mcp_bridge.py              #   Sync/async bridge for MCP server communication
+├── models/                        # LLM model interfaces
+│   ├── amd_llm.py                 #   AMD LLM Gateway router (Claude)
+│   ├── amd_base.py                #   Base class for AMD models
+│   ├── amd_claude.py              #   Claude backend via AMD Gateway
+│   ├── litellm_model.py           #   LiteLLM (supports most providers)
+│   ├── anthropic_model.py         #   Anthropic direct
+│   ├── openrouter_model.py        #   OpenRouter
+│   └── portkey_model.py           #   Portkey
+├── environments/                  # Execution environments
+│   ├── local.py                   #   Local subprocess
+│   ├── docker.py                  #   Docker/Podman
+│   └── singularity.py             #   Singularity/Apptainer
+├── config/                        # YAML config files
+│   ├── mini.yaml                  #   Default config (claude-opus-4.5, yolo, RAG enabled)
+│   ├── mini_rag.yaml              #   RAG-enabled config with subagent
+│   ├── default.yaml               #   Base DefaultAgent config
+│   └── ...
+└── run/                           # CLI entry points
+    ├── mini.py                    #   Main CLI (`mini` command)
+    └── ...
+
+mcp_tools/
+├── mcp-client/                    # Generic MCP client (JSON-RPC over stdio)
+│   └── src/mcp_client/
+│       ├── client.py              #   MCPClient: subprocess management + protocol
+│       ├── transport.py           #   Stdio transport layer
+│       └── config.py              #   Server registry
+└── rag-mcp/                       # RAG MCP server
+    └── src/rag_mcp/
+        ├── server.py              #   FastMCP server (query + optimize tools)
+        ├── retrieval.py           #   HybridRetriever (embedding + BM25 + RRF + reranker)
+        └── config/rag_config.yaml #   Retrieval config
 ```
-
-Other top-level directories:
-
-- `scripts/` — Utility scripts
-- `knowledge-base/` — RAG knowledge base (AMD / NVIDIA)
 
 ## Configuration
 
-All config files are located in `src/minisweagent/config/`. Use `mini -c <config_name>` to select one.
+Use `mini -c <config_name_or_path>` to select a config. Built-in configs:
 
-### Agent Configs
+| Config | Model | Mode | RAG | Description |
+|--------|-------|------|-----|-------------|
+| `mini.yaml` (default) | claude-opus-4.5 | yolo | enabled | Daily use, tool calling enabled |
+| `mini_rag.yaml` | claude-opus-4.5 | yolo | enabled + subagent | RAG with LLM post-filtering |
+| `default.yaml` | (not bound) | confirm | — | Generic base config |
 
-| File | Purpose | Model | Mode | Notes |
-|------|---------|-------|------|-------|
-| `mini.yaml` | Default config for `mini` | AMD LLM Gateway claude-opus-4.5 | yolo | Primary config for daily use. temperature=0.0, output truncation at 20000 chars, timeout 3600s |
-| `default.yaml` | DefaultAgent base config | Not bound to a specific model | confirm | Generic base config. temperature=0.0, output truncation at 10000 chars (5000 head + 5000 tail) |
-| `mini_no_temp.yaml` | No-temperature variant | Not bound to a specific model | confirm | Nearly identical to default.yaml but without temperature setting. cost_limit=3 |
-| `mini_reverse_kl.yaml` | GPU kernel optimization analysis | AMD LLM Gateway claude-opus-4.5 | confirm | Analyzes kernel optimization history in a repo and generates reports. Long prompt |
-| `github_issue.yaml` | Auto-solve GitHub Issues | Not bound to a specific model | — | Runs inside Docker (python:3.11, working dir /testbed) |
+### Environment Variables
 
-### RAG Config
-
-File: `rag_config.yaml` — controls the RAG retrieval pipeline:
-
-| Parameter | Description |
-|-----------|-------------|
-| `retrieval.embed_top_k` / `bm25_top_k` | Number of candidates from Embedding / BM25 retrieval |
-| `retrieval.enable_bm25` | Whether to enable BM25 dual-path recall |
-| `retrieval.mcp_top_k` | Number of final results returned |
-| `reranker.enable_reranker` | Whether to enable re-ranking |
-| `fusion.semantic_weight` / `bm25_weight` | Fusion weights for Embedding and BM25 |
-| `summary.enable_rag_subagent` | Whether to enable LLM summarization |
-| `debug.verbose` | Whether to print verbose MCP tool logs |
-
-## Knowledge Base
-
-### Directory Structure
-
-```
-knowledge-base/
-├── amd-knowledge-base/
-│   ├── layer-1-hardware/         # Hardware architecture
-│   ├── layer-2-compute-stack/    # Compute stack (HIP, ROCm)
-│   ├── layer-3-libraries/        # Libraries (rocBLAS, MIOpen, etc.)
-│   ├── layer-4-frameworks/       # Frameworks (PyTorch, TensorFlow)
-│   ├── layer-5-llm/              # LLM related
-│   ├── layer-6-extended/         # Extended knowledge
-│   └── best-practices/           # Best practices
-├── nvidia-knowledge-base/        # Same layer structure
-├── comparisons/                  # Cross-platform comparison docs
-└── INDEX.md
-```
-
-### Adding New Documents
-
-1. **Location**: Place the file under the appropriate subdirectory (e.g., `layer-6-extended/optimize-guides/*.md`)
-2. **Format**: Every `.md` file must include a YAML frontmatter:
-   ```yaml
-   ---
-   tags: ["category1", "category2"]   # Required
-   priority: "L1-important"           # Required
-   source_url: "https://..."          # Required
-   rocm_version: "6.0+"              # Required
-   last_updated: 2026-01-14           # Required
-   ---
-   ```
-3. **Filename**: Use English, make it descriptive (e.g., `bf16-vector-load-store.md`)
-4. **Quality**: 800–1200 words, with at least 2 syntactically correct code examples
-5. **Rebuild index after adding**: `python scripts/build_index.py --force`
+| Variable | Description |
+|----------|-------------|
+| `AMD_LLM_API_KEY` or `LLM_GATEWAY_KEY` | API key for AMD LLM Gateway |
+| `RAG_MCP_CONFIG` | Override RAG server config path |
+| `RAG_INDEX_PATH` | Override knowledge base index path |

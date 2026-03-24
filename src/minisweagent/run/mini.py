@@ -12,7 +12,7 @@ from typing import Any
 
 
 class TeeOutput:
-    """捕获 stdout/stderr 到 buffer，同时保持终端输出"""
+    """Capture stdout/stderr to a buffer while preserving terminal output."""
     def __init__(self, original):
         self.terminal = original
         self.buffer = StringIO()
@@ -83,7 +83,7 @@ def main(
     test_command: str | None = typer.Option(None, "--test-command", help="Test command to run after agent finishes"),
 ) -> Any:
     # fmt: on
-    # 捕获所有 print 输出到 trajectory
+    # Capture all print output for trajectory
     tee_out, tee_err = TeeOutput(sys.stdout), TeeOutput(sys.stderr)
     sys.stdout, sys.stderr = tee_out, tee_err
     
@@ -144,7 +144,7 @@ def main(
     agent_class = InteractiveAgent
     if visual == (os.getenv("MSWEA_VISUAL_MODE_DEFAULT", "false") == "false"):
         agent_class = TextualAgent
-        if mcp:
+        if rag_cfg:
             console.print("[yellow]Warning: MCP integration with -v (Textual UI) is not fully supported yet.[/yellow]")
 
     agent = agent_class(model, env, **agent_config, **extra_agent_kwargs)
@@ -157,7 +157,7 @@ def main(
         extra_info = {"traceback": traceback.format_exc()}
     finally:
         if output:
-            # 收集 console 日志
+            # Collect console logs
             console_logs = tee_out.getvalue() + tee_err.getvalue()
             if console_logs:
                 extra_info = extra_info or {}

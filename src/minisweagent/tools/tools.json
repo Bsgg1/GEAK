@@ -17,21 +17,6 @@
     }
   },
   {
-    "name": "save_and_test",
-    "type": "function",
-    "description": "Save current changes as patch and run correctness + benchmark tests. Use this after implementing optimizations to verify correctness and measure performance. The system will automatically save your changes, run the configured test command (SETUP + CORRECTNESS + BENCHMARK), and report results.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "description": {
-          "type": "string",
-          "description": "Brief description of what optimization is being tested (e.g., 'baseline', 'memory coalescing', 'vectorization')"
-        }
-      },
-      "required": []
-    }
-  },
-  {
     "name": "submit",
     "type": "function",
     "description": "Submit the final optimized implementation and complete the task. Use this when you are satisfied with your optimization results. After calling this, you cannot continue working on the task.",
@@ -94,105 +79,6 @@
       "required": [
         "command",
         "path"
-      ]
-    }
-  },
-  {
-    "name": "strategy_manager",
-    "type": "function",
-    "description": "Manage optimization strategies. Commands: create (initialize strategy list), show (view strategies), next (get next pending strategy), mark (update status), add (add new strategy), remove (skip/delete strategy), update (modify strategy), note (add note), summary (show statistics).",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "command": {
-          "type": "string",
-          "enum": [
-            "create",
-            "show",
-            "next",
-            "mark",
-            "add",
-            "remove",
-            "update",
-            "note",
-            "summary"
-          ],
-          "description": "The operation to perform."
-        },
-        "index": {
-          "type": "integer",
-          "description": "Strategy index (1-based). Required for: mark, remove, update. Optional for: show."
-        },
-        "status": {
-          "type": "string",
-          "enum": [
-            "pending",
-            "exploring",
-            "successful",
-            "failed",
-            "partial",
-            "skipped",
-            "combined"
-          ],
-          "description": "Strategy status. Required for: mark. Optional for: update."
-        },
-        "result": {
-          "type": "string",
-          "description": "Result description (e.g., '+21.1% improvement'). Optional for: mark, update."
-        },
-        "details": {
-          "type": "string",
-          "description": "Additional details or log file path. Optional for: mark, update."
-        },
-        "name": {
-          "type": "string",
-          "description": "Strategy name. Required for: add."
-        },
-        "description": {
-          "type": "string",
-          "description": "Strategy description. Required for: add."
-        },
-        "expected": {
-          "type": "string",
-          "description": "Expected improvement (e.g., '+20-30%'). Required for: add."
-        },
-        "target": {
-          "type": "string",
-          "description": "Optimization target. Optional for: add."
-        },
-        "baseline_metrics": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Baseline metrics in 'Key:Value' format. Required for: create."
-        },
-        "baseline_log": {
-          "type": "string",
-          "description": "Path to baseline benchmark log. Optional for: create."
-        },
-        "strategies": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Initial strategies in 'Name|Description|Expected|Target' format. Optional for: create."
-        },
-        "method": {
-          "type": "string",
-          "enum": [
-            "skip",
-            "delete"
-          ],
-          "description": "Remove method. Default: skip. For: remove."
-        },
-        "note": {
-          "type": "string",
-          "description": "Note message. Required for: note."
-        }
-      },
-      "required": [
-        "command"
       ]
     }
   },

@@ -3,9 +3,7 @@ from pathlib import Path
 from typing import Any
 
 from minisweagent.tools.bash_command import BashCommand
-from minisweagent.tools.save_and_test import SaveAndTestTool
 from minisweagent.tools.str_replace_editor import str_replace_editor
-from minisweagent.tools.strategy_manager import StrategyManagerTool
 from minisweagent.tools.submit import SubmitTool
 
 current_dir = Path(__file__).resolve().parent
@@ -14,43 +12,25 @@ with open(json_path, encoding="utf-8") as f:
     _all_tools = json.load(f)
 
 
-def get_tools_list(use_strategy_manager: bool = False) -> list:
-    excluded = set()
-    if not use_strategy_manager:
-        excluded.add("strategy_manager")
-    return [t for t in _all_tools if t["name"] not in excluded]
+def get_tools_list() -> list:
+    return list(_all_tools)
 
 
 tools_list = _all_tools
 
 
 class ToolRuntime:
-    def __init__(
-        self,
-        use_strategy_manager: bool = False,
-        strategy_file: str = ".optimization_strategies.md",
-        on_strategy_change=None,
-        patch_output_dir: str | None = None,
-        rag_config: dict | None = None,
-    ):
+    def __init__(self, rag_config: dict | None = None):
         self._mcp_bridges: list = []
 
         self._tool_table = {
             "bash": BashCommand(),
             "str_replace_editor": str_replace_editor(),
-            "save_and_test": SaveAndTestTool(),
             "submit": SubmitTool(),
         }
 
-        if use_strategy_manager:
-            self._tool_table["strategy_manager"] = StrategyManagerTool(
-                filepath=strategy_file, on_change_callback=on_strategy_change
-            )
-
         if rag_config:
             self._register_rag_mcp_tools(rag_config)
-
-        self.use_strategy_manager = use_strategy_manager
 
     def _register_rag_mcp_tools(self, rag_config: dict) -> None:
         try:
@@ -63,7 +43,7 @@ class ToolRuntime:
 
         enable_subagent = rag_config.get("enable_subagent", False)
         if enable_subagent:
-            from minisweagent.mcp_integration.subagent import RAGFilterSubAgent, SubAgentConfig
+            from minisweagent.agents.subagent import RAGFilterSubAgent, SubAgentConfig
 
             subagent = RAGFilterSubAgent(SubAgentConfig(enabled=True))
 
@@ -99,9 +79,6 @@ class ToolRuntime:
     def get_tools_schema(self) -> list[dict]:
         """Return tool schemas only for tools registered in _tool_table."""
         return [t for t in _all_tools if t["name"] in self._tool_table]
-
-    def get_tools_list(self) -> list:
-        return get_tools_list(self.use_strategy_manager)
 
     def dispatch(self, tool_call: dict[str, Any]) -> dict[str, Any]:
         name = tool_call["name"]
