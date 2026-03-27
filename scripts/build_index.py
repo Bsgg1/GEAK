@@ -25,8 +25,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
-import yaml
-
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -42,17 +40,10 @@ from rank_bm25 import BM25Okapi
 DEFAULT_KB_PATH = Path(__file__).parent.parent / "knowledge-base"
 DEFAULT_OUTPUT_PATH = Path.home() / ".cache" / "amd-ai-devtool" / "semantic-index"
 DEFAULT_MODEL = "BAAI/bge-large-en-v1.5"
-DEFAULT_RAG_CONFIG = Path(__file__).parent.parent / "src" / "minisweagent" / "config" / "rag_config.yaml"
-
-
-def load_chunking_config(config_path: Path | None = None) -> dict:
-    """Load chunking section from rag_config.yaml, returns empty dict on failure."""
-    config_path = config_path or DEFAULT_RAG_CONFIG
-    if config_path.exists():
-        with open(config_path) as f:
-            cfg = yaml.safe_load(f) or {}
-        return cfg.get("chunking", {})
-    return {}
+DEFAULT_CHUNK_SIZE = 1500
+DEFAULT_CHUNK_OVERLAP = 200
+DEFAULT_MIN_CHUNK_SIZE = 200
+DEFAULT_ENABLE_HEADER_SPLIT = False
 
 
 def _resolve_embedding_device(device: str) -> str:
@@ -86,10 +77,10 @@ class DocType(Enum):
 @dataclass
 class SplitterConfig:
     """Configuration for document splitting."""
-    chunk_size: int = 1000
-    chunk_overlap: int = 200
-    min_chunk_size: int = 200
-    enable_header_split: bool = True
+    chunk_size: int = DEFAULT_CHUNK_SIZE
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP
+    min_chunk_size: int = DEFAULT_MIN_CHUNK_SIZE
+    enable_header_split: bool = DEFAULT_ENABLE_HEADER_SPLIT
 
 
 # File extension to document type mapping
@@ -714,9 +705,6 @@ def build_index(
 
 
 def main():
-    # Load yaml config as defaults (CLI args override)
-    yaml_cfg = load_chunking_config()
-
     parser = argparse.ArgumentParser(description="Build semantic search index using LangChain")
     parser.add_argument(
         "--kb-path",
@@ -744,27 +732,35 @@ def main():
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=yaml_cfg.get("chunk_size", 1000),
-        help="Maximum chunk size in characters (default: from rag_config.yaml or 1000)",
+        default=DEFAULT_CHUNK_SIZE,
+        help=f"Maximum chunk size in characters (default: {DEFAULT_CHUNK_SIZE})",
     )
     parser.add_argument(
         "--chunk-overlap",
         type=int,
-        default=yaml_cfg.get("chunk_overlap", 200),
-        help="Overlap between chunks in characters (default: from rag_config.yaml or 200)",
+        default=DEFAULT_CHUNK_OVERLAP,
+        help=f"Overlap between chunks in characters (default: {DEFAULT_CHUNK_OVERLAP})",
     )
     parser.add_argument(
         "--min-chunk-size",
         type=int,
-        default=yaml_cfg.get("min_chunk_size", 200),
-        help="Minimum chunk size to keep (default: from rag_config.yaml or 200)",
+        default=DEFAULT_MIN_CHUNK_SIZE,
+        help=f"Minimum chunk size to keep (default: {DEFAULT_MIN_CHUNK_SIZE})",
     )
-    parser.add_argument(
-        "--no-header-split",
+    header_split_group = parser.add_mutually_exclusive_group()
+    header_split_group.add_argument(
+        "--enable-header-split",
+        dest="enable_header_split",
         action="store_true",
-        default=not yaml_cfg.get("enable_header_split", True),
-        help="Disable Stage 1 markdown header splitting (default: from rag_config.yaml)",
+        help="Enable Stage 1 markdown header splitting",
     )
+    header_split_group.add_argument(
+        "--no-header-split",
+        dest="enable_header_split",
+        action="store_false",
+        help="Disable Stage 1 markdown header splitting",
+    )
+    parser.set_defaults(enable_header_split=DEFAULT_ENABLE_HEADER_SPLIT)
     parser.add_argument(
         "--exclude",
         type=str,
@@ -790,7 +786,7 @@ def main():
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
         min_chunk_size=args.min_chunk_size,
-        enable_header_split=not args.no_header_split,
+        enable_header_split=args.enable_header_split,
         exclude_patterns=args.exclude,
         device=args.device,
     )

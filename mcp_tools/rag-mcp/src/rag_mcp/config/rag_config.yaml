@@ -5,7 +5,7 @@ retrieval:
   embed_top_k: 25
   bm25_top_k: 25
   enable_bm25: true
-  mcp_top_k: 8
+  mcp_top_k: 3
 
 reranker:
   enable_reranker: true
