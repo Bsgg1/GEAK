@@ -11,6 +11,7 @@ from minisweagent.models import GLOBAL_MODEL_STATS
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class AmdLlmModelConfig:
     model_name: str

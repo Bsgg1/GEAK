@@ -356,10 +356,9 @@ class LitellmModel:
 
 
 if __name__ == "__main__":
-    
     # Quick smoke test
     from minisweagent.tools.tools_runtime import ToolRuntime
-    
+
     model_configs = [
         {
             "model_name": "openai/gpt-5",
