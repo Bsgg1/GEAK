@@ -1,6 +1,5 @@
 import copy
 import json
-import logging
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +26,8 @@ _TOOL_PROFILES: dict[str, set[str] | None] = {
     },
 }
 
-class ToolRuntime:
 
+class ToolRuntime:
     @classmethod
     def load_tools_json(cls) -> list[dict[str, Any]]:
         """Load native tool definitions from ``tools.json`` (fresh list each call)."""
@@ -157,7 +156,6 @@ class ToolRuntime:
         self.use_strategy_manager = use_strategy_manager
         self._codebase_context: str | None = None
 
-<<<<<<< HEAD
     def wrap_rag_tools_with_postprocessor(self) -> None:
         """Wrap RAG MCP tools with RAGPostProcessor for result filtering."""
         from minisweagent.tools.rag_postprocessor import RAGPostProcessor, RAGPostProcessorConfig
@@ -179,9 +177,6 @@ class ToolRuntime:
             if name in ("query", "optimize"):
                 self._tool_table[name] = _wrap(self._tool_table[name])
 
-=======
-<<<<<<< HEAD
->>>>>>> 3ece2b07 (unified tools settings)
     @staticmethod
     def _create_own_bridges() -> list:
         """Create a fresh set of MCPToolBridge instances for this ToolRuntime."""
@@ -193,8 +188,6 @@ class ToolRuntime:
             logger.warning("_create_own_bridges: MCP bridge creation failed: %s", exc)
             return []
 
-=======
->>>>>>> bdfbf592 (unified tools settings)
     def _register_profiler_mcp(self):
         """Register only the profiler-mcp tool."""
         for bridge in self._mcp_bridges:
@@ -222,9 +215,7 @@ class ToolRuntime:
                 raw_name = mcp_tool.get("name")
                 if not isinstance(raw_name, str):
                     continue
-                base_name = (
-                    raw_name.split("__")[0] if f"__{server_name}" in raw_name else raw_name
-                )
+                base_name = raw_name.split("__")[0] if f"__{server_name}" in raw_name else raw_name
                 self._tool_table[raw_name] = bridge.tool(base_name)
 
     def set_env(self, env: dict[str, str]) -> None:
