@@ -1,4 +1,6 @@
+import os
 import re
+import shutil
 import subprocess
 import tempfile
 from collections import defaultdict
@@ -14,8 +16,13 @@ class ProfilingAnalyzer:
     def __init__(self, profiling_type: str, llm_model=None):
         self.profiling_type = profiling_type
         self.model = llm_model
-        with tempfile.TemporaryDirectory(prefix="rocprof_") as tmpdir:
-            self.output_path = Path(tmpdir).resolve()
+        self._env_override: dict[str, str] = {}
+        self.output_path = Path(tempfile.mkdtemp(prefix="rocprof_")).resolve()
+
+    def cleanup(self):
+        """Remove the temporary profiling output directory."""
+        if self.output_path.exists():
+            shutil.rmtree(self.output_path, ignore_errors=True)
 
     def _check_rocprof_compute(self):
         result_rocprof = subprocess.run(["rocprof-compute --version"], capture_output=True, text=True, shell=True)
@@ -721,78 +728,96 @@ class ProfilingAnalyzer:
 
         return {"roofline": roofline, "profiling": more_profiler}
 
-    def __call__(self, profiling_workdir: str, profiling_cmd: str, *args, **kwds):
+    def analyze_structured(self) -> dict:
+        """Return all parsed profiling sections as structured dicts."""
+        return {
+            "sys_info": self.parse_profiling_sys_info(),
+            "sys_speed": self.parse_profiling_sys_speed(),
+            "compute_units": self.parse_profiling_compute_units(),
+            "l1_data": self.parse_profiling_l1_data(),
+            "l2_data": self.parse_profiling_l2_data(),
+            "wavefront": self.parse_profiling_wavefront(),
+            "roofline_rates": self.parse_roofline_rates(),
+            "roofline_ai": self.parse_roofline_ai(),
+            "top_kernels": self.parse_profiling_top_kernel(),
+        }
+
+    def _run_rocprof(self, profiling_workdir: str, profiling_cmd: str):
+        """Run rocprof-compute profile + analyze, set self.content.
+
+        Returns (success: bool, error_msg: str | None).
+        """
         kernel_name = Path(profiling_workdir).name
-        results = {}
         rocprof_version = self._check_rocprof_compute()
         if not profiling_workdir or not profiling_cmd:
-            return {
-                "output": "No profiling_workdir and profiling_cmd arguments are provided.",
-                "returncode": 1,
-            }
+            return False, "No profiling_workdir and profiling_cmd arguments are provided."
         if rocprof_version is None:
-            return {
-                "output": "No ROCProf is installed. CAN NOT get profiling information.",
-                "returncode": 1,
-            }
+            return False, "rocprof-compute is not installed."
+
         use_profiling = Version(rocprof_version) < Version("3.3.1") and (
-            self.profiling_type == "roofline" or self.profiling_type == "profiling"
+            self.profiling_type in ("roofline", "profiling")
         )
-        if self.profiling_type == "profiling" or use_profiling or self.profiling_type == "profiler_analyzer":
+
+        if self.profiling_type in ("profiling", "profiler_analyzer") or use_profiling:
             make_cmd = [f"rocprof-compute profile -n {kernel_name} --path {self.output_path} -- {profiling_cmd}"]
         elif self.profiling_type == "roofline":
             make_cmd = [
                 f"rocprof-compute profile -n {kernel_name} --path {self.output_path} --roof-only -- {profiling_cmd}"
             ]
         else:
-            return {
-                "output": "No profiling information",
-                "returncode": 1,
-            }
+            return False, f"Unknown profiling_type: {self.profiling_type}"
+
+        env = os.environ | self._env_override if self._env_override else None
         result = subprocess.run(
-            make_cmd, shell=True, cwd=profiling_workdir, capture_output=True, text=True, timeout=3600 * 6
+            make_cmd, shell=True, cwd=profiling_workdir, capture_output=True, text=True, timeout=3600 * 6, env=env
         )
-        if result.returncode == 0:
-            if self.profiling_type == "profiling" or use_profiling:
-                analysis_cmd = [f"rocprof-compute analyze -p {self.output_path} -b 0 1 2 4 7 10 16 17"]
-            elif self.profiling_type == "roofline":
-                analysis_cmd = [f"rocprof-compute analyze -p {self.output_path} -b 4"]
-            elif self.profiling_type == "profiler_analyzer":
-                analysis_cmd = [f"rocprof-compute analyze -p {self.output_path} -b 0 1 2 4 7 10 11 16 17"]
-            else:
-                analysis_cmd = [f"rocprof-compute analyze -p {self.output_path} -b 0 1 2 4 7 10 16 17"]
-            result = subprocess.run(
-                analysis_cmd, shell=True, cwd=profiling_workdir, capture_output=True, text=True, timeout=3600 * 6
-            )
-            if result.returncode == 0:
-                if self.profiling_type == "profiler_analyzer" and self.model is not None:
-                    msg = profiler_prompt.format(profiler_output=result.stdout)
-                    prompt = [{"role": "user", "content": msg}]
-                    response = self.model.query(prompt)
-                    results = {
-                        "output": response["content"] if response["content"] else result.stdout,
-                        "returncode": 0,
-                    }
-                else:
-                    self.content = result.stdout
-                    analyzer = self.analyze()
-                    if use_profiling:
-                        results = {
-                            "output": analyzer["profiling"],
-                            "returncode": result.returncode,
-                        }
-                    elif self.profiling_type == "profiling":
-                        results = {
-                            "output": analyzer["roofline"] + analyzer["profiling"],
-                            "returncode": result.returncode,
-                        }
-                    elif self.profiling_type == "roofline":
-                        results = {
-                            "output": analyzer["roofline"],
-                            "returncode": result.returncode,
-                        }
-                    return results
-        return {
-            "output": result.stdout.strip() or result.stderr.strip(),
-            "returncode": 1,
-        }
+        if result.returncode != 0:
+            return False, result.stdout.strip() or result.stderr.strip()
+
+        if self.profiling_type == "profiling" or use_profiling:
+            analysis_cmd = [f"rocprof-compute analyze -p {self.output_path} -b 0 1 2 4 7 10 16 17"]
+        elif self.profiling_type == "roofline":
+            analysis_cmd = [f"rocprof-compute analyze -p {self.output_path} -b 4"]
+        elif self.profiling_type == "profiler_analyzer":
+            analysis_cmd = [f"rocprof-compute analyze -p {self.output_path} -b 0 1 2 4 7 10 11 16 17"]
+        else:
+            analysis_cmd = [f"rocprof-compute analyze -p {self.output_path} -b 0 1 2 4 7 10 16 17"]
+
+        result = subprocess.run(
+            analysis_cmd, shell=True, cwd=profiling_workdir, capture_output=True, text=True, timeout=3600 * 6, env=env
+        )
+        if result.returncode != 0:
+            return False, result.stdout.strip() or result.stderr.strip()
+
+        self.content = result.stdout
+        return True, None
+
+    def profile_structured(self, profiling_workdir: str, profiling_cmd: str) -> dict:
+        """Run rocprof-compute and return structured data instead of text.
+
+        Returns dict with keys: success, error (on failure),
+        or success + structured analysis data (on success).
+        """
+        success, error = self._run_rocprof(profiling_workdir, profiling_cmd)
+        if not success:
+            return {"success": False, "error": error}
+        return {"success": True, **self.analyze_structured()}
+
+    def __call__(self, profiling_workdir: str, profiling_cmd: str, *args, **kwds):
+        success, error = self._run_rocprof(profiling_workdir, profiling_cmd)
+        if not success:
+            return {"output": error, "returncode": 1}
+
+        if self.profiling_type == "profiler_analyzer" and self.model is not None:
+            msg = profiler_prompt.format(profiler_output=self.content)
+            prompt = [{"role": "user", "content": msg}]
+            response = self.model.query(prompt)
+            return {
+                "output": response["content"] if response["content"] else self.content,
+                "returncode": 0,
+            }
+
+        analyzer = self.analyze()
+        if self.profiling_type == "roofline":
+            return {"output": analyzer["roofline"], "returncode": 0}
+        return {"output": analyzer["roofline"] + analyzer["profiling"], "returncode": 0}

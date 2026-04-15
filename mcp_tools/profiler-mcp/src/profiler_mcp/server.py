@@ -16,7 +16,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastmcp import FastMCP
 
@@ -129,14 +129,14 @@ def _profile_with_rocprof(
         profiling_type: One of 'profiling' (full), 'roofline', 'profiler_analyzer'.
     """
     try:
-        from minisweagent.kernel_profile import _build_rocprof_result
+        from minisweagent.run.preprocess.kernel_profile import _build_rocprof_result
         from minisweagent.tools.profiling_tools import ProfilingAnalyzer
     except ImportError:
         _agent_root = Path(__file__).resolve().parent.parent.parent.parent.parent
         _src = _agent_root / "src"
         if str(_src) not in sys.path:
             sys.path.insert(0, str(_src))
-        from minisweagent.kernel_profile import _build_rocprof_result
+        from minisweagent.run.preprocess.kernel_profile import _build_rocprof_result
         from minisweagent.tools.profiling_tools import ProfilingAnalyzer
 
     # Empty HIP_VISIBLE_DEVICES hides all GPUs from ROCm.  We need to
@@ -208,7 +208,7 @@ def _warmup(command: str, warmup_runs: int) -> None:
 @mcp.tool()
 def profile_kernel(
     command: str,
-    backend: str = "metrix",
+    backend: Literal["metrix", "rocprof-compute"],
     workdir: str | None = None,
     profiling_type: str = "profiling",
     num_replays: int = 3,
@@ -222,8 +222,8 @@ def profile_kernel(
 
     Args:
         command: Command to execute (e.g. 'python3 kernel.py').
-        backend: 'metrix' for structured AMD Metrix profiling, or
-                 'rocprof-compute' for deep roofline/instruction analysis.
+        backend: Required. Either 'metrix' (structured AMD Metrix profiling) or
+                 'rocprof-compute' (roofline/instruction-level analysis).
         workdir: Working directory for the command.
         profiling_type: For rocprof-compute: 'profiling' (full), 'roofline', or
                         'profiler_analyzer'. Ignored for metrix.

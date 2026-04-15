@@ -6,7 +6,7 @@ which ones are in progress, and what results each produced.  The file is
 managed through the ``strategy_manager`` tool so the format stays
 consistent.
 
-On top of the base InteractiveAgent this class adds:
+On top of the base :class:`InteractiveAgent` / :class:`DefaultAgent` this class adds:
 
 1. **UI callbacks** -- every time the strategy list changes, the agent
    formats the update and calls ``notify_strategy_changed()``.
@@ -24,7 +24,6 @@ import logging
 import sys
 
 from minisweagent.agents.interactive import InteractiveAgent
-from minisweagent.tools.tools_runtime import ToolRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +45,7 @@ class StrategyAgent(InteractiveAgent):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+<<<<<<< HEAD
         # Recreate ToolRuntime with the configured tool_profile (default "swe").
         # DefaultAgent.__init__ already created one with profile="full";
         # we replace it here so the LLM only sees the intended tool set.
@@ -78,6 +78,8 @@ class StrategyAgent(InteractiveAgent):
             model_impl = getattr(self.model, "_impl", self.model)
             model_impl.tools = self.toolruntime.get_tools_schema()
 
+=======
+>>>>>>> 3ece2b07 (unified tools settings)
         logger.debug(
             "StrategyAgent initialized (profile=%s, strategy_file=%s)",
             self.config.tool_profile,
