@@ -79,16 +79,7 @@ def _profile_with_metrix(
     cwd: str | None = None,
 ) -> dict[str, Any]:
     """Profile using AMD Metrix API. Returns structured JSON."""
-    # Import MetrixTool from the installed metrix-mcp or in-tree copy
-    try:
-        from metrix_mcp.core import MetrixTool
-    except ImportError:
-        # Fallback: look in the agent package
-        _agent_root = Path(__file__).resolve().parent.parent.parent.parent
-        _metrix_src = _agent_root / "metrix-mcp" / "src"
-        if str(_metrix_src) not in sys.path:
-            sys.path.insert(0, str(_metrix_src))
-        from metrix_mcp.core import MetrixTool
+    from .core import MetrixTool
 
     tool = MetrixTool(gpu_devices=gpu_devices)
     try:

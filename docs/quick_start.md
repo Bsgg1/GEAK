@@ -23,7 +23,7 @@ AMD_LLM_API_KEY=<YOUR_KEY> bash scripts/run-docker.sh
 # Local
 pip install -e .
 
-# To also install the MCP tool servers (automated-test-discovery, metrix-mcp, profiler-mcp):
+# To also install the MCP tool servers (automated-test-discovery, profiler-mcp with Metrix):
 pip install -e '.[mcp]'
 # Or install everything at once:
 pip install -e '.[full]'

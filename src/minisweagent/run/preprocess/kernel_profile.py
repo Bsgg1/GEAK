@@ -23,7 +23,7 @@ from pathlib import Path
 
 from minisweagent.run.preprocess.repo_paths import ensure_preprocess_mcp_importable
 
-ensure_preprocess_mcp_importable("mcp_tools/profiler-mcp/src", "mcp_tools/metrix-mcp/src")
+ensure_preprocess_mcp_importable("mcp_tools/profiler-mcp/src")
 
 logger = logging.getLogger(__name__)
 
@@ -265,28 +265,6 @@ def _build_rocprof_result(structured: dict, gpu_device: str = "0") -> dict:
             }
         ],
     }
-
-
-# ---------------------------------------------------------------------------
-# Metrix backend
-# ---------------------------------------------------------------------------
-
-
-def _profile_with_metrix(command: str, gpu_devices, replays: int, quick: bool) -> dict:
-    """Profile using MetrixTool and return backend-neutral JSON."""
-    metrix_core = importlib.import_module("metrix_mcp.core")
-    MetrixTool = metrix_core.MetrixTool
-
-    tool = MetrixTool(gpu_devices=gpu_devices)
-    result = tool.profile(
-        command=command,
-        num_replays=replays,
-        kernel_filter=None,
-        auto_select=False,
-        quick=quick,
-    )
-    result["backend"] = "metrix"
-    return result
 
 
 # ---------------------------------------------------------------------------

@@ -57,7 +57,6 @@ dependencies = [
 # With pip, use `make install` or `make install-dev` instead.
 mcp = [
     "automated-test-discovery",
-    "metrix-mcp",
     "profiler-mcp",
     "cross-session-memory-mcp",
     "rag-mcp",
@@ -275,7 +274,6 @@ line-ending = "auto"
 
 [tool.uv.sources]
 automated-test-discovery = { path = "mcp_tools/automated-test-discovery", editable = true }
-metrix-mcp = { path = "mcp_tools/metrix-mcp", editable = true }
 profiler-mcp = { path = "mcp_tools/profiler-mcp", editable = true }
 cross-session-memory-mcp = { path = "mcp_tools/cross-session-memory-mcp", editable = true }
 rag-mcp = { path = "mcp_tools/rag-mcp", editable = true }
