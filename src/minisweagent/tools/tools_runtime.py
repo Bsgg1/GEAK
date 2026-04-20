@@ -177,17 +177,6 @@ class ToolRuntime:
             if name in ("query", "optimize"):
                 self._tool_table[name] = _wrap(self._tool_table[name])
 
-    @staticmethod
-    def _create_own_bridges() -> list:
-        """Create a fresh set of MCPToolBridge instances for this ToolRuntime."""
-        try:
-            from minisweagent.tools.mcp_bridge import _populate_mcp_bridges
-
-            return _populate_mcp_bridges()
-        except Exception as exc:
-            logger.warning("_create_own_bridges: MCP bridge creation failed: %s", exc)
-            return []
-
     def _register_profiler_mcp(self):
         """Register only the profiler-mcp tool."""
         for bridge in self._mcp_bridges:

@@ -12,7 +12,6 @@ install:
 install-full:
 	pip install '.[dev,langchain]' 'swe-rex>=1.4.0'
 	pip install mcp_tools/automated-test-discovery/ \
-	            mcp_tools/metrix-mcp/ \
 	            mcp_tools/profiler-mcp/ \
 	            mcp_tools/cross-session-memory-mcp/ \
 	            mcp_tools/rag-mcp/
