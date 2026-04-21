@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 from minisweagent import get_repo_root
 
 _MCP_TOOLS_ROOT = get_repo_root() / "mcp_tools"
+_sys_path_lock = threading.Lock()
 
 
 class MCPToolBridge:
@@ -125,9 +126,10 @@ class MCPToolBridge:
 
         src_str = str(src_dir)
         inserted = False
-        if src_str not in sys.path:
-            sys.path.insert(0, src_str)
-            inserted = True
+        with _sys_path_lock:
+            if src_str not in sys.path:
+                sys.path.insert(0, src_str)
+                inserted = True
         try:
             mod = importlib.import_module(f"{module_name}.server")
             app = getattr(mod, "mcp", None)
@@ -147,10 +149,11 @@ class MCPToolBridge:
             return _tool_catalog_to_wire_dicts(catalog)
         finally:
             if inserted:
-                try:
-                    sys.path.remove(src_str)
-                except ValueError:
-                    pass
+                with _sys_path_lock:
+                    try:
+                        sys.path.remove(src_str)
+                    except ValueError:
+                        pass
 
     async def _async_tool(self):
         if self._default_local_tool_list_eligible():
@@ -328,7 +331,7 @@ def _coerce_mcp_tool_list(raw: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _populate_mcp_bridges() -> None:
+def _populate_mcp_bridges() -> list[MCPToolBridge]:
     _mcp_bridges: list[MCPToolBridge] = []
     for name in _discover_mcp_server_names():
         try:

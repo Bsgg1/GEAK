@@ -1,7 +1,10 @@
 import copy
 import json
+import logging
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from minisweagent.tools.bash_command import BashCommand
 from minisweagent.tools.save_and_test import SaveAndTestTool
@@ -53,14 +56,15 @@ class ToolRuntime:
             boot_bridges, mcp_tools = collect_mcp_tools()
             del boot_bridges
             schemas = list(mcp_tools)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("MCP tool schema discovery failed; MCP tools will be unavailable: %s", exc)
 
         try:
             from minisweagent.tools.mcp_bridge import _populate_mcp_bridges
 
             bridges = _populate_mcp_bridges()
-        except Exception:
+        except Exception as exc:
+            logger.warning("MCP bridge creation failed; MCP dispatch will be unavailable: %s", exc)
             bridges = []
 
         return schemas, bridges
