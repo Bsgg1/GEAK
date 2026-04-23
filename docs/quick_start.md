@@ -9,7 +9,7 @@ Minimal steps to install GEAK and run the **`geak`** CLI against a kernel or rep
 - **GPU** and the stack your kernels use — e.g. **Triton**, **PyTorch**, **CUDA**, or compiled **HIP**.
 - **AMD Instinct / Radeon (ROCm):** install a normal **ROCm** user-space environment so tools like **`rocminfo`** / **`rocm-smi`** work when the agent inspects hardware. For **HIP C++** you also need **`hipcc`** (and friends). **`HIP_VISIBLE_DEVICES`** is often set by the scheduler or your shell when pinning a card.
 
-## 1. Install
+## 1. Installhttps://github.com/AMD-AGI/GEAK/pull/152/conflict?name=pyproject.toml&ancestor_oid=2cf72ab99e595fe4aa8239c03b3a2e3c2b8fa9b5&base_oid=be5f217f30390a138df32f1ecc2c8171524e9f3e&head_oid=e679e098ae4ca7c6a4c967d58fb7b3735dd9a5ea
 
 From the repository root:
 
@@ -22,14 +22,11 @@ AMD_LLM_API_KEY=<YOUR_KEY> bash scripts/run-docker.sh
 # (or)
 # Local
 pip install -e .
-
-# To also install the MCP tool servers (automated-test-discovery, profiler-mcp with Metrix):
-pip install -e '.[mcp]'
 # Or install everything at once:
 pip install -e '.[full]'
 ```
 
-> **Note:** `fastmcp` and `mcp[cli]` are included in the core dependencies and installed automatically with `pip install -e .`. The `[mcp]` extra installs the three GEAK-specific MCP server packages that live under `mcp_tools/` — these are not on PyPI and are not installed by default. Without them you will see `ModuleNotFoundError` errors when the agent tries to start the profiler or test-discovery servers.
+> **Note:** `fastmcp` and `mcp[cli]` are included in the core dependencies and installed automatically with `pip install -e .`. GEAK launches the shipped MCP servers from `mcp_tools/` directly from the repository, so there is no separate `.[mcp]` extra to install.
 
 ## 2. Configure the model
 In the case of docker-based setup, export the API key before running scripts/run-docker.sh.
