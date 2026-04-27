@@ -216,7 +216,8 @@ def run_heterogeneous_orchestrator(
         toolruntime.disable_tools(["query", "optimize"])
     else:
         try:
-            toolruntime.wrap_rag_tools_with_postprocessor(api_key=model.config.api_key)
+            model_config = preprocess_ctx.get("model_config")
+            toolruntime.wrap_rag_tools_with_postprocessor(model_config=model_config)
         except Exception as e:
             logger.warning("Failed to wrap RAG tools with RAG postprocessor: %s", e)
 

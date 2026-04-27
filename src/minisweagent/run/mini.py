@@ -552,6 +552,7 @@ def main(
             )
 
         preprocess_ctx["rag_enabled"] = rag_enabled
+        preprocess_ctx["model_config"] = config.get("model", {})
         report = run_orchestrator(
             preprocess_ctx=preprocess_ctx,
             gpu_ids=parsed_gpu_ids,
@@ -596,6 +597,7 @@ def main(
 
     agent_config = dict(config.get("agent", {}))
     agent_config["save_patch"] = True
+    agent_config["model_config"] = config.get("model", {})
     agent_config["test_command"] = test_command or config.get("patch", {}).get("test_command")
     agent_config["metric"] = metric
     agent_config["patch_output_dir"] = str(preprocess_output_dir)

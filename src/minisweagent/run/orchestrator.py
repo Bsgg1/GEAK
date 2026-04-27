@@ -240,6 +240,7 @@ def main() -> None:
         "baseline_metrics_path": preprocess_ctx.baseline_metrics_path,
         "profiling_path": preprocess_ctx.profiling_result_path,
         "discovery": preprocess_ctx.discovery,
+        "model_config": {},
     }
     if preprocess_ctx.commandment_path and Path(preprocess_ctx.commandment_path).exists():
         ctx["commandment"] = Path(preprocess_ctx.commandment_path).read_text()
