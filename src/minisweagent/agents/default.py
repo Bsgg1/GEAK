@@ -57,6 +57,7 @@ class AgentConfig:
     disabled_tools: list[str] = field(default_factory=list)
     source_file_paths: list[str] | None = None
     use_skills: bool = False
+    tool_profile: str = "full"
 
 
 # Unified observation truncation for both bash output and tool call results (head + tail).
@@ -134,6 +135,7 @@ class DefaultAgent:
             else ".optimization_strategies.md",
             on_strategy_change=self._get_strategy_callback(),
             patch_output_dir=self.config.patch_output_dir,
+            tool_profile=self.config.tool_profile,
         )
         if self.config.disabled_tools:
             self.toolruntime.disable_tools(self.config.disabled_tools)
