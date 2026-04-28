@@ -8,8 +8,7 @@ for downstream consumption.
 
 import copy
 import logging
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass, fields
 
 logger = logging.getLogger(__name__)
 
@@ -129,5 +128,6 @@ Instructions:
 
 def create_rag_postprocessor(**kwargs) -> RAGPostProcessor:
     """Convenience function to create a RAG postprocessor."""
-    config = RAGPostProcessorConfig(**{k: v for k, v in kwargs.items() if k in RAGPostProcessorConfig.__dataclass_fields__})
+    valid_keys = {f.name for f in fields(RAGPostProcessorConfig)}
+    config = RAGPostProcessorConfig(**{k: v for k, v in kwargs.items() if k in valid_keys})
     return RAGPostProcessor(config)
