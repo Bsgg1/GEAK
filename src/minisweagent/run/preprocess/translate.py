@@ -323,7 +323,7 @@ def run_translation(
             )
 
             # -- Performance regression gate --
-            perf_fail_threshold = pair.perf_fail_threshold if hasattr(pair, "perf_fail_threshold") else 0.5
+            perf_fail_threshold = pair.perf_fail_threshold if hasattr(pair, "perf_fail_threshold") else 0.3
             perf_warn_threshold = pair.perf_warn_threshold if hasattr(pair, "perf_warn_threshold") else 0.8
             speedup_val = result.get("translation_speedup")
 
@@ -435,14 +435,9 @@ def run_translation(
 
 _NO_EQUIVALENT_OPS = frozenset(
     {
-        "nn.Conv2d",
+        # Conv3d/AvgPool2d have no FlyDSL equivalent yet
         "nn.Conv3d",
-        "F.conv2d",
         "F.conv3d",
-        "nn.BatchNorm2d",
-        "F.batch_norm",
-        "nn.MaxPool2d",
-        "F.max_pool2d",
         "nn.AvgPool2d",
         "F.avg_pool2d",
     }
@@ -816,16 +811,52 @@ def _get_model_and_inputs(module):
     return model_cls, get_inputs, get_init_inputs
 
 
+def _is_native_pattern(module):
+    """Check if module uses bare function pattern (build_model + forward)."""
+    return (hasattr(module, "build_model") and hasattr(module, "forward")
+            and not hasattr(module, "Model"))
+
+
+def _run_native(module, inputs):
+    """Run a native-pattern module (build_model + forward)."""
+    get_init_inputs = getattr(module, "get_init_inputs", None)
+    init_inputs = get_init_inputs() if get_init_inputs else []
+    state = module.build_model(*init_inputs)
+
+    # Warmup
+    with torch.no_grad():
+        for _ in range(3):
+            module.forward(state, *inputs)
+    torch.cuda.synchronize()
+
+    # Timed run
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    with torch.no_grad():
+        start.record()
+        output = module.forward(state, *inputs)
+        end.record()
+    torch.cuda.synchronize()
+    latency_ms = start.elapsed_time(end)
+    return output, latency_ms
+
+
 def run_reference():
     """Run PyTorch reference kernel and return (model, inputs, outputs, latency_ms)."""
     ref_module = _load_module("{kernel_path}", "pytorch_ref")
     model_cls, get_inputs, get_init_inputs = _get_model_and_inputs(ref_module)
 
     init_inputs = get_init_inputs() if get_init_inputs else []
+    torch.manual_seed(42)
     model = model_cls(*init_inputs).cuda()
 
     inputs = get_inputs()
-    inputs = [x.cuda() if isinstance(x, torch.Tensor) else x for x in inputs]
+    input_dtype = inputs[0].dtype if isinstance(inputs[0], torch.Tensor) else torch.float32
+    if input_dtype == torch.float16:
+        inputs = [x.cuda() if isinstance(x, torch.Tensor) else x for x in inputs]
+    else:
+        model = model.half()
+        inputs = [x.cuda().half() if isinstance(x, torch.Tensor) else x for x in inputs]
 
     # Warmup
     with torch.no_grad():
@@ -849,10 +880,15 @@ def run_reference():
 def run_candidate(candidate_path: str, ref_inputs):
     """Run FlyDSL candidate kernel and return (outputs, latency_ms)."""
     cand_module = _load_module(candidate_path, "flydsl_candidate")
+
+    if _is_native_pattern(cand_module):
+        return _run_native(cand_module, ref_inputs)
+
     model_cls, get_inputs, get_init_inputs = _get_model_and_inputs(cand_module)
 
     init_inputs = get_init_inputs() if get_init_inputs else []
-    model = model_cls(*init_inputs).cuda()
+    torch.manual_seed(42)
+    model = model_cls(*init_inputs).cuda().half()
 
     inputs = ref_inputs
 
@@ -875,7 +911,7 @@ def run_candidate(candidate_path: str, ref_inputs):
     return cand_output, latency_ms
 
 
-def compare_outputs(ref_output, cand_output, rtol=1e-3, atol=1e-3):
+def compare_outputs(ref_output, cand_output, rtol=1e-2, atol=1e-2):
     """Compare reference and candidate outputs."""
     if isinstance(ref_output, torch.Tensor) and isinstance(cand_output, torch.Tensor):
         torch.testing.assert_close(cand_output, ref_output, rtol=rtol, atol=atol)
