@@ -43,7 +43,7 @@ Do NOT keep `nn.Linear` — replace it entirely:
 1. Extract weight and bias from the original model
 2. Store as `nn.Parameter` (raw tensors)
 3. Preshuffle weight once with `shuffle_weight(w, layout=(16, 16))`
-4. Compile GEMM once with `compile_preshuffle_gemm_a8(...)` — use fused epilogue if followed by activation
+4. Compile GEMM once with `compile_preshuffle_gemm_a8(...)`
 5. Call the compiled launcher in `forward()`
 
 ### Replacing nn.Conv2d with im2col + FlyDSL GEMM
@@ -69,12 +69,16 @@ See `flydsl_translation_conv_pool_bn.md` for the complete worked example.
 Write `@flyc.kernel` + `@flyc.jit` with layout algebra for element-wise ops
 and simple reductions.
 
-### Acceptable PyTorch fallbacks (minimal set)
+### Acceptable PyTorch usage (structural only)
 
-- `F.unfold` (im2col for Conv2d — structural, not compute)
-- `F.batch_norm` (MIOpen backend, no FlyDSL equivalent)
-- `torch.mm` (fp32 GEMM only — when fp16 preshuffle fails correctness)
-- `F.max_pool2d` (if custom FlyDSL maxpool kernel fails)
+- `F.unfold` (im2col for Conv2d — structural data rearrangement, not compute)
+- `F.pad` (padding for flash attention constraints)
+- Tensor reshaping: `.view()`, `.reshape()`, `.transpose()`, `.permute()`, `.contiguous()`
+- Tensor creation: `torch.empty`, `torch.zeros`, `torch.randn`, `torch.empty_like`
+
+Do NOT use any PyTorch compute ops as fallbacks: no `torch.mm`, `torch.bmm`,
+`torch.matmul`, `F.linear`, `nn.Linear`, `F.conv2d`, `nn.Conv2d`, `F.batch_norm`,
+`nn.BatchNorm2d`, `F.max_pool2d`, or `F.scaled_dot_product_attention`.
 
 ## Step 3: Element-wise Translation (Complete Example)
 
@@ -239,9 +243,10 @@ class Model(nn.Module):
         # Store weights as raw nn.Parameter (NOT nn.Linear)
         self.weight = nn.Parameter(torch.randn(out_features, in_features, dtype=torch.float16))
         self.bias = nn.Parameter(torch.randn(out_features, dtype=torch.float16))
-        # Preshuffle weight ONCE
-        self.w_shuffled = shuffle_weight(self.weight.data.contiguous(), layout=(16, 16))
-        # Compile GEMM ONCE — fuse bias+relu if needed
+        # Preshuffle weight ONCE — register_buffer so .cuda() moves it
+        self.register_buffer("w_shuffled",
+            shuffle_weight(self.weight.data.contiguous(), layout=(16, 16)))
+        # Compile GEMM ONCE
         N, K = out_features, in_features
         self.gemm_fn = compile_preshuffle_gemm_a8(
             M=0, N=N, K=K,
@@ -260,7 +265,9 @@ class Model(nn.Module):
             self.w_shuffled.view(-1), scale, scale, M, N,
             torch.cuda.current_stream(),
         )
-        return output + self.bias
+        # Add bias separately
+        output = output + self.bias.unsqueeze(0)
+        return output
 ```
 
 ### Flash Attention
@@ -307,11 +314,11 @@ class Model(nn.Module):
         # Conv weights as raw nn.Parameter (NOT nn.Conv2d)
         self.conv_weight = nn.Parameter(torch.randn(out_ch, K, dtype=torch.float16))
         self.conv_bias = nn.Parameter(torch.randn(out_ch, dtype=torch.float16))
-        self.w_shuffled = shuffle_weight(self.conv_weight.data.contiguous(), layout=(16, 16))
+        self.register_buffer("w_shuffled",
+            shuffle_weight(self.conv_weight.data.contiguous(), layout=(16, 16)))
         self.conv_gemm = compile_preshuffle_gemm_a8(
             M=0, N=out_ch, K=K, tile_m=64, tile_n=128, tile_k=128,
-            in_dtype="fp16", out_dtype="fp16", lds_stage=2,
-            epilogue="bias_relu")  # fuse bias + ReLU
+            in_dtype="fp16", out_dtype="fp16", lds_stage=2)
         self.kernel_size = kernel_size
 
     def forward(self, x):
@@ -347,26 +354,34 @@ What operation type?
 ├── LayerNorm / RMSNorm
 │   └── Use build_layernorm_module() / build_rmsnorm_module()
 ├── GEMM / Linear / torch.matmul
-│   ├── fp32 required? Check GEMM dtype table. No fp32 → use torch.mm
-│   └── fp16/bf16 → Use compile_preshuffle_gemm_a8() [NOT torch.matmul / F.linear]
+│   ├── fp32 inputs? Cast to fp16, use compile_preshuffle_gemm_a8() [NO torch.mm]
+│   └── fp16/bf16 → Use compile_preshuffle_gemm_a8() [NO torch.matmul / F.linear]
+├── Batched matmul (torch.bmm)
+│   ├── Attention pattern (Q@K^T) → Use build_flash_attn_func_module()
+│   ├── Shared B-matrix → reshape (B,M,K) to (B*M,K), single preshuffle GEMM
+│   └── Varying B → reshape batch into M dim, preshuffle GEMM [NO torch.bmm]
 ├── Attention (self-attention, SDPA, Flash)
-│   └── Use build_flash_attn_func_module() from kernels.flash_attn_func
-│       (fallback to decomposed GEMM+softmax if constraints not met)
+│   ├── Constraints met → Use build_flash_attn_func_module()
+│   ├── head_dim not %32 or <64 → Pad Q/K/V to next valid head_dim, flash attn, slice back
+│   ├── seq_len not %128 → Pad Q/K/V along seq dim, flash attn, slice back
+│   └── Both unmet → Decompose into preshuffle GEMM + build_softmax_module [NO F.scaled_dot_product_attention]
 ├── Conv2d
 │   ├── F.unfold (im2col) to get patches (B, K_patch, L)
 │   ├── Transpose+reshape to (B*L, K_patch) = A matrix
 │   ├── Weight (C_out, K_patch) → preshuffle once (fp16 cast)
 │   ├── compile_preshuffle_gemm_a8(fp16) → reshape output to NCHW
-│   └── If correctness fails → im2col + torch.mm fallback
+│   └── Do NOT fall back to torch.mm, torch.bmm, or F.conv2d
 ├── MaxPool2d
-│   └── Custom @flyc.kernel with arith.maximumf over window elements
+│   └── Custom @flyc.kernel with arith.maximumf over window [NO F.max_pool2d]
 ├── BatchNorm2d
-│   └── F.batch_norm (acceptable PyTorch fallback, MIOpen backend)
+│   └── Custom @flyc.kernel: pre-compute scale/shift in __init__, element-wise apply [NO F.batch_norm]
 └── Complex model (L2/L3)
-    └── FlyDSL for ALL ops; Conv2d via im2col+GEMM, MaxPool via custom kernel
+    └── FlyDSL for ALL ops — zero PyTorch compute
 ```
 
-**IMPORTANT**: Do NOT use `torch.matmul`, `F.linear`, `nn.Linear`, or
-`F.scaled_dot_product_attention` when FlyDSL pre-built kernels are available.
-Acceptable PyTorch fallbacks: `F.unfold` (im2col), `F.batch_norm`, `torch.mm`
-(fp32 GEMM only). Conv2d uses im2col + preshuffle GEMM, NOT `nn.Conv2d`.
+**IMPORTANT**: Do NOT use ANY PyTorch compute ops. No `nn.Linear`, `nn.Conv2d`,
+`nn.BatchNorm2d`, `torch.mm`, `torch.bmm`, `torch.matmul`, `F.linear`, `F.conv2d`,
+`F.batch_norm`, `F.max_pool2d`, or `F.scaled_dot_product_attention`. Replace ALL
+with FlyDSL kernels: `nn.Parameter` for weights, `compile_preshuffle_gemm_a8` /
+`build_*` for pre-built ops, custom `@flyc.kernel` for element-wise/reduction/pooling/batchnorm.
+Acceptable PyTorch usage (structural only): `F.unfold`, `F.pad`, tensor reshape/view/transpose.

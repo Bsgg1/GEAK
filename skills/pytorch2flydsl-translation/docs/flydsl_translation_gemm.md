@@ -95,6 +95,30 @@ scale_b = torch.empty(0, device=device, dtype=torch.float32)
 
 `tile_n`: 128. `tile_k`: 128 for fp16/bf16, 256 for fp8/int8. Use `lds_stage=2`.
 
+### Bias and Activation After GEMM
+
+`compile_preshuffle_gemm_a8` computes `C = A @ B` only. It does **not** support
+fused bias or activation epilogues. When the original PyTorch code includes
+bias addition or activation (e.g. `F.relu(F.linear(x, w, b))`), handle them
+as separate operations after the GEMM:
+
+- **Bias**: add via a simple `@flyc.kernel` or `torch.add`
+- **Activation**: apply via a `@flyc.kernel` (e.g. `arith.maximumf` for ReLU)
+- **Fused bias+activation**: write a single `@flyc.kernel` that computes
+  `output = max(0, gemm_output + bias)` in one pass
+
+### Alternative: hgemm_splitk (FP16 SplitK GEMM)
+
+For small M (e.g., batch_size=1 decode), standard tile configs may not
+fill the GPU. `hgemm_splitk` splits the K dimension across thread blocks:
+
+```python
+from kernels.hgemm_splitk import compile_hgemm_splitk
+```
+
+Use when M < tile_m and standard GEMM underperforms. Only available in
+newer FlyDSL versions — check availability before using.
+
 ### Constraints
 
 - `tile_k * elem_bytes` must be divisible by 64
@@ -144,9 +168,8 @@ class Model(nn.Module):
             M, N,
             torch.cuda.current_stream(),
         )
-
-        if self.bias is not None:
-            output = output + self.bias
+        # Add bias separately
+        output = output + self.bias.unsqueeze(0)
 
         return output
 
@@ -157,25 +180,157 @@ def get_init_inputs():
     return [4096, 4096]
 ```
 
-## When PyTorch Fallback is Acceptable
+## GEMM + Reduction Fusion: Replace GEMM with Custom Kernel
 
-Only fall back to PyTorch GEMM (`torch.matmul`, `F.linear`) when:
+When a GEMM is **immediately followed by a reduction** (e.g., `sum`, `mean`), the
+full computation can often be simplified mathematically and implemented as a single
+fused `@flyc.kernel`, completely eliminating the rocBLAS GEMM call.
 
-1. **Batched matmul** (`torch.bmm`) — no FlyDSL batched GEMM yet
-2. **Very small dimensions** where GEMM kernel overhead exceeds compute
-3. **fp32 precision required** — Check the dtype table above. If the kernel uses
-   fp32 GEMM and the table has no fp32 output type, use `torch.mm` directly.
-   Do not waste steps trying to make fp16 GEMM work — fp16 truncation in a large
-   GEMM (e.g. 8192×8192) feeding into a reduction will fail tolerance.
-   Use FlyDSL for all non-GEMM operations (reductions, element-wise).
+### When to Apply
 
-**Exception — Conv2d internal GEMM**: Conv2d uses im2col + preshuffle GEMM with
-fp16 cast, even when the original data is fp32. This is acceptable because
-BatchNorm after convolution absorbs small numerical differences from fp16.
-If the correctness check fails, fall back to im2col + `torch.mm` (fp32).
-Do NOT use `torch.bmm` for Conv2d — the weight matrix is shared across the
-batch (not per-batch), so fold B into M and use a single preshuffle GEMM call.
+Check for this pattern:
+```python
+# PyTorch original
+y = x @ W.T          # GEMM: (B, K) @ (K, N) -> (B, N)
+y = y / divisor       # element-wise
+y = y.sum(dim=1)      # reduction along N -> (B,)
+y = y * scale         # element-wise
+```
 
-**Do NOT use PyTorch fallback for standard `nn.Linear` or `torch.matmul(A, B)` —
-these should use `compile_preshuffle_gemm_a8`** (unless fp32 precision is required
-and the dtype table has no fp32 row).
+If the GEMM output is reduced along the N dimension, the entire sequence collapses
+to a **dot product per row** against a precomputed vector:
+
+```
+# Math simplification:
+# y[i] = sum_j( x[i,j] * W[j,:].sum() ) * (scale / divisor)
+# w_sum = W.sum(dim=0)  -- precompute once (constant)
+# y[i] = dot(x[i,:], w_sum) * fused_scale
+```
+
+### Implementation Pattern
+
+**In `__init__` / `build_model()` — precompute weight-side reduction:**
+```python
+w_sum = weight.sum(dim=0)  # (K,) -- done once, weight is constant
+fused_scale = scaling_factor / divisor  # fold scalar ops
+```
+
+**Replace GEMM + reduction with a custom `@flyc.kernel`:**
+```python
+@flyc.kernel
+def fused_dot_scale_kernel(X: fx.Tensor, W_sum: fx.Tensor, Out: fx.Tensor):
+    bid = fx.block_idx.x   # one block per row
+    tid = fx.thread_idx.x
+    # Each thread accumulates partial dot product using FMA
+    acc = arith.constant(0.0, type=T.f32)
+    for base in range_constexpr(0, K, BLOCK_THREADS):
+        idx = tid + base
+        x_val = ...  # load X[bid, idx]
+        w_val = ...  # load W_sum[idx]
+        acc = arith.fma(x_val, w_val, acc, fastmath=fast)
+    # Block-wide reduction (wave shuffle + shared memory)
+    total = block_reduce_sum(acc)
+    # Thread 0 writes: Out[bid] = total * fused_scale
+```
+
+### Why This Is Fast
+
+- **No rocBLAS launch**: Eliminates GEMM kernel launch overhead entirely
+- **No intermediate tensor**: The `(B, N)` GEMM output is never materialized
+- **Precomputed constants**: Weight reduction and scalar folding happen once at init
+- **FMA accumulation**: Numerically stable fused multiply-add in the inner loop
+- **Single kernel**: One launch per batch instead of GEMM + element-wise + reduction
+
+### Verified Results
+
+`14_Gemm_Divide_Sum_Scaling`: enriched achieved **15.7x** speedup (vs baseline 1.02x
+using `torch.matmul`) by fusing the entire GEMM + divide + sum + scale into a single
+`@flyc.kernel` with precomputed `w_sum`.
+
+### Applicability Limits
+
+- Only works when the reduction dimension matches the GEMM output dimension
+- Weight must be constant (not an activation) so the weight-side reduction is a one-time cost
+- If the GEMM output is used for multiple operations (not just reduction), keep the GEMM
+
+## No PyTorch GEMM Fallbacks
+
+Do NOT use `torch.mm`, `torch.bmm`, `torch.matmul`, `F.linear`, or `nn.Linear`.
+ALL matrix multiplications must use FlyDSL preshuffle GEMM.
+
+### fp32 inputs
+
+Cast to fp16 before calling `compile_preshuffle_gemm_a8`. FlyDSL preshuffle GEMM
+handles all GEMM operations. Do NOT use `torch.mm` for fp32 GEMM.
+
+### Batched matmul (replacing torch.bmm)
+
+- **Attention pattern (Q@K^T)**: Use `build_flash_attn_func_module()` — flash attention
+  handles the full Q@K^T → softmax → @V pipeline natively.
+- **Shared B-matrix**: reshape `(B, M, K)` to `(B*M, K)`, use single `compile_preshuffle_gemm_a8`,
+  then reshape back. B-matrix is preshuffled once.
+- **Varying B-matrix per batch**: reshape both operands so the batch is folded into the
+  M dimension. For `(B, M, K) @ (B, K, N)`: iterate over batch elements calling
+  preshuffle GEMM per element (each B-slice is preshuffled separately).
+  This is acceptable when flash attention does not apply.
+
+### Conv2d internal GEMM
+
+Conv2d uses im2col (`F.unfold`) + preshuffle GEMM with fp16 cast.
+Do NOT fall back to `torch.mm`, `torch.bmm`, or `F.conv2d` — always use preshuffle GEMM.
+The weight matrix is shared across the batch — fold B into M and call a single GEMM.
+
+### All other GEMM (nn.Linear, torch.matmul, F.linear)
+
+Replace entirely with `compile_preshuffle_gemm_a8` + `shuffle_weight`.
+Store weights as `nn.Parameter`, not `nn.Linear`.
+
+## Low-Level CuTe-Style Primitives (FlyDSL 0.1.4+)
+
+FlyDSL 0.1.4+ exposes low-level CuTe-style primitives that give fine-grained
+control over GEMM execution. These are useful when `compile_preshuffle_gemm_a8`
+is insufficient — for example, when you need fp32 output from a GEMM to avoid
+precision loss in multi-layer pipelines (e.g. Conv+BN chains where fp16
+truncation between layers compounds).
+
+### Available Primitives
+
+| Module | Primitive | Purpose |
+|--------|-----------|---------|
+| `rocdl.MFMA` | `mfma_f32_16x16x16f16` | Hardware MFMA: fp16 inputs, fp32 accumulator (16x16x16 tile) |
+| `rocdl.MFMA` | `mfma_f32_16x16x4f32` | Hardware MFMA: fp32 inputs, fp32 accumulator |
+| `fx` | `fx.make_mma_atom(...)` | Construct a CuTe MMA atom from an MFMA instruction |
+| `fx` | `fx.make_tiled_mma(...)` | Tile an MMA atom across thread blocks |
+| `fx` | `fx.gemm(...)` | Layout-aware GEMM building block using tiled MMA |
+| `fx` | `fx.copy(...)` / `rocdl.BufferCopy` | Async global→shared memory copy primitives |
+
+### When to Use
+
+- **Precision-sensitive pipelines**: When `compile_preshuffle_gemm_a8` (which
+  truncates fp32 accumulators to fp16 output) causes correctness failures in
+  multi-layer networks. A custom CuTe GEMM can write fp32 accumulators directly
+  to global memory, avoiding truncation.
+- **Non-standard data types**: When you need fp32-in/fp32-out GEMM or mixed
+  precision configurations not supported by the pre-built kernels.
+- **Custom tiling**: When the pre-built tile configurations don't match your
+  problem shape well.
+
+### Example: Custom fp32-Output GEMM Kernel
+
+```python
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr import arith
+from flydsl.expr.typing import T
+
+@flyc.kernel
+def gemm_fp32_out(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor, M: fx.Constexpr[int], ...):
+    # Use fx.make_mma_atom with mfma_f32_16x16x16f16
+    # Accumulate in fp32 registers
+    # Store fp32 result directly (no arith.trunc_f)
+    ...
+```
+
+Note: Writing a correct CuTe GEMM kernel requires understanding tiled MMA
+layouts, shared memory staging, and the MFMA instruction semantics. Prefer
+`compile_preshuffle_gemm_a8` when fp16 output precision is acceptable.
