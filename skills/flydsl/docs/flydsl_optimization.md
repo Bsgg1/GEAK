@@ -15,6 +15,7 @@ Parameter tuning alone yields marginal gains. **Prioritize structural optimizati
 2. Read the **`@flyc.jit` host wrapper** — count how many kernels are launched per call and what data each receives. Multiple kernels sharing data = fusion opportunity
 3. Read **any imported helper modules** (e.g. `flydsl.utils`, `flydsl.expr`) — they contain reusable building blocks and may reveal optimization opportunities
 4. Read the **test harness** — know what shapes, dtypes, and modes are benchmarked
+5. If you plan to rewrite loops or memory paths, quickly review the relevant FlyDSL semantics for `range_constexpr()` vs `range(..., init=...)`, `buffer_ops`, and `SmemAllocator` before editing
 
 ## Step 2: Classify the Bottleneck
 
@@ -22,6 +23,7 @@ Parameter tuning alone yields marginal gains. **Prioritize structural optimizati
 - **Memory-bound** → reduce data movement (fusion, LDS caching, vectorization)
 - **Compute-bound** → improve instruction throughput (MFMA selection, software pipelining)
 - **Latency-bound** (small shapes) → reduce kernel launch count (fusion)
+- **GEMM-like kernel** → if the next optimization question is mainly about `tile_m` / `tile_n` / `tile_k`, 2-stage LDS ping-pong, XOR swizzle, epilogue strategy, or MFMA-loop ISA counts, use this skill for generic prioritization and then switch to `gemm-optimization`
 
 ## Step 3: Optimize — High Impact First
 
@@ -33,6 +35,13 @@ Parameter tuning alone yields marginal gains. **Prioritize structural optimizati
 - **Redundant work elimination**: identify repeated loads, recomputed indices, or overlapping branches, and hoist/cache them
 - **Algorithm replacement**: if the current algorithm has unnecessary passes over data, restructure to reduce pass count (e.g. online softmax vs two-pass, fused attention vs separate Q×K then softmax then ×V)
 
+#### FlyDSL refactor guardrails
+
+- Use `range_constexpr()` only for compile-time unrolling. If the optimization needs runtime-carried state, use `range(..., init=...)` so FlyDSL lowers the loop to `scf.for`
+- For `scf.for` rewrites, loop bounds must be `arith.index()` values, not Python ints, and `init` / `yield` values must be raw MLIR `ir.Value`s
+- Keep loop-carried state positionally aligned across `init`, per-iteration `state`, `yield`, and post-loop results so each slot keeps the same semantic meaning and MLIR type through the whole loop
+- If an `SmemPtr` view created inside a loop body is reused in the epilogue, clear `_view_cache` before reusing it outside the loop to avoid SSA dominance errors
+
 ### Tier 2: Memory hierarchy (medium impact)
 
 - **LDS utilization**: if the kernel reads the same global data multiple times across threads, stage through LDS for reuse. Use `SmemAllocator` / `SmemPtr` from `flydsl.utils.smem_allocator`
@@ -41,6 +50,30 @@ Parameter tuning alone yields marginal gains. **Prioritize structural optimizati
 - **Pre-load across passes**: if the kernel makes multiple passes, load data needed in later passes during earlier ones to avoid redundant HBM reads
 - **Data layout / coalescing**: ensure memory access patterns are coalesced; restructure loop ordering if needed
 - **Register pressure management**: balance between keeping data in registers vs spilling to LDS
+
+#### FlyDSL prefetch rewrite pattern
+
+- Use prefetch when the loop has enough independent MFMA/ALU work, or a later barrier-heavy phase, to hide the next global load. If the body is already dominated by loads, prefetch alone is unlikely to help.
+- Follow a real loop-carried structure: prologue preloads iteration 0, `scf.for` carries the prefetched values, the loop body unpacks current state and issues next-iteration loads immediately, and the epilogue consumes the final carried values.
+- Carry every value needed to materialize the next iteration together — not just tensor payloads, but also block-table entries, page IDs, scale values, and running accumulators.
+- Keep the swap/prefetch path simple: unpack from `state`, issue the next loads as early as legality allows, and leave the load-to-consume distance for compute or barrier wait to hide.
+- If a later phase already spends time in `gpu.barrier()` or reduce synchronization, hoist the next phase's global loads into that region when legality allows; barrier wait is often the easiest place to hide VMEM latency.
+- Re-check register budget before adding prefetch buffers. Prefetch only helps when the extra carried state does not cause spills or unacceptable occupancy loss.
+
+#### Diagnose LDS bottlenecks before rewriting
+
+- Diagnose from trace shape, not intuition: high stall on `ds_read_*` / `ds_write_*` themselves points to bank conflicts; high `s_waitcnt lgkmcnt(0)` or barrier immediately after `ds_write` points to exposed write-read latency; barrier-heavy reduce chains point to cross-wave serialization.
+- On gfx942, think in 32 LDS banks; on gfx950, think in 64. A stride/layout that fully aliases banks on gfx942 may only partially conflict on gfx950, so swizzle masks and padding choices must be arch-aware.
+- Prefer XOR swizzle when you need zero LDS overhead and can keep read/write address transforms consistent. Use padding when swizzle is awkward to integrate and LDS headroom is available.
+- If the hotspot is write-read latency, increase the distance between `ds_write` and the dependent `ds_read` / wait by moving independent address computation, global loads, or MFMA work between them.
+- If the hotspot is barrier/reduce serialization, reduce unnecessary `gpu.barrier()` stages, merge LDS reduce phases when possible, or switch to cheaper cross-lane / cross-wave primitives before adding more LDS traffic.
+
+#### FlyDSL memory rewrite contracts
+
+- `buffer_ops.buffer_load` / `buffer_store` offsets are in **elements**, not bytes. Recompute address units whenever the rewrite changes `dtype`, packing, or vector width
+- If packed FP8/INT4 data is reinterpreted through `dtype=T.i32`, divide byte addresses by the new element width before loading
+- New or resized LDS allocations must still go through `SmemAllocator`, and `allocator.finalize()` must still happen in the GPU module body
+- Any change that moves `SmemPtr` views across loop or region boundaries should re-check cached-view lifetime and SSA dominance
 
 ### Tier 3: Compute (medium impact)
 
@@ -52,6 +85,13 @@ Parameter tuning alone yields marginal gains. **Prioritize structural optimizati
 ### Tier 4: Parameter tuning (low impact)
 
 - Block size, tile dimensions, unroll factors, `known_block_size` hints
+
+#### Tune after structure stabilizes
+
+- Do structural fixes first: control-flow rewrite, memory-path rewrite, LDS strategy, MFMA selection, and correctness
+- Only after semantics and codegen stabilize should you tune block size, tile shape, unroll factors, `known_*` hints, or expose knobs to `@autotune`
+- Treat old tuning conclusions as stale after codegen-affecting refactors
+- When varying `Constexpr` values across recompiles, prefer passing raw `torch.Tensor` objects rather than reusing cached `flyc.from_dlpack()` wrappers
 
 ## Modification Rules
 
@@ -73,12 +113,18 @@ Always verify after each patch — violations often cause silent corruption:
 
 1. Run correctness tests first — never sacrifice correctness for speed
 2. Confirm speedup across **all** tested shapes, not just one
-3. If speedup is marginal, move to the next structural strategy rather than re-tuning the same approach
+3. For structural rewrites, dump IR/ISA with `FLYDSL_DUMP_IR=1` and inspect the relevant `.mlir` stage plus `final_isa.s`
+4. Verify the specific effect you wanted: `scf.for` survives tracing/lowering, wide loads/stores stay vectorized, the MFMA variant matches the target dtype/arch, and the final loop shape reflects the intended schedule
+5. If the generated form did not change, assume the optimization did not land yet, even if the Python source looks right
+6. If speedup is marginal, move to the next structural strategy rather than re-tuning the same approach
 
 ## Key FlyDSL APIs
 
 - Device kernel: `@flyc.kernel` | Host launcher: `@flyc.jit`
+- Control flow: `range_constexpr()` | `range(..., init=...)` | `arith.index()`
 - Intrinsics: `flydsl.expr.rocdl` — MFMA, exp2, rcp, sched_barrier, sched_mfma
 - Shared memory: `SmemAllocator` / `SmemPtr` from `flydsl.utils.smem_allocator`
 - Types: `T.f16`, `T.bf16`, `T.f32`, `T.i32`, `T.vec(...)` from `flydsl.expr.typing`
-- Buffer ops: `fx.rocdl.make_buffer_tensor`, `fx.make_copy_atom`
+- Buffer ops: `fx.rocdl.make_buffer_tensor`, `fx.make_copy_atom`, `buffer_ops.buffer_load` / `buffer_store` (offsets are in elements)
+- IR/ISA inspection: `FLYDSL_DUMP_IR=1`, `FLYDSL_DUMP_DIR=...`, `final_isa.s`
+- Autotune: `flydsl.autotune.autotune`, `Config`, `do_bench`
