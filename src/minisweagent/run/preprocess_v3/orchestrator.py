@@ -834,7 +834,14 @@ class PreprocessOrchestratorAgent:
         for err in errors:
             text = err if isinstance(err, str) else str(err)
             stripped = text.lstrip()
-            if stripped.startswith("collect_baseline") or stripped.startswith("collect_profile"):
+            lower = stripped.lower()
+            if (
+                stripped.startswith("collect_baseline")
+                or stripped.startswith("collect_profile")
+                or stripped.startswith("PATH_A_PARTIAL_COVERAGE")
+                or "opaque" in lower
+                or "no harness_path available" in lower
+            ):
                 warnings.append(text)
             else:
                 real_errors.append(text)
