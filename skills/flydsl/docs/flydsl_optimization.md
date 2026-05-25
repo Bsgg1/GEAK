@@ -23,7 +23,7 @@ Parameter tuning alone yields marginal gains. **Prioritize structural optimizati
 - **Memory-bound** → reduce data movement (fusion, LDS caching, vectorization)
 - **Compute-bound** → improve instruction throughput (MFMA selection, software pipelining)
 - **Latency-bound** (small shapes) → reduce kernel launch count (fusion)
-- **GEMM-like kernel** → if the next optimization question is mainly about `tile_m` / `tile_n` / `tile_k`, 2-stage LDS ping-pong, XOR swizzle, epilogue strategy, or MFMA-loop ISA counts, use this skill for generic prioritization and then switch to `gemm-optimization`
+- **GEMM-like kernel** → if the next optimization question is mainly about `tile_m` / `tile_n` / `tile_k`, GEMM-specific LDS staging, epilogue strategy, or MFMA-loop ISA counts, use this guide for generic prioritization and then switch to `flydsl_gemm_optimization.md`
 
 ## Step 3: Optimize — High Impact First
 
@@ -67,6 +67,91 @@ Parameter tuning alone yields marginal gains. **Prioritize structural optimizati
 - Prefer XOR swizzle when you need zero LDS overhead and can keep read/write address transforms consistent. Use padding when swizzle is awkward to integrate and LDS headroom is available.
 - If the hotspot is write-read latency, increase the distance between `ds_write` and the dependent `ds_read` / wait by moving independent address computation, global loads, or MFMA work between them.
 - If the hotspot is barrier/reduce serialization, reduce unnecessary `gpu.barrier()` stages, merge LDS reduce phases when possible, or switch to cheaper cross-lane / cross-wave primitives before adding more LDS traffic.
+
+#### LDS quick architecture reference
+
+| Arch | LDS size per CU | Banks | Full-conflict stride heuristic |
+|------|------------------|-------|-------------------------------|
+| `gfx942` | 64 KB | 32 | multiples of 128 bytes often fully alias banks |
+| `gfx950` | 160 KB | 64 | multiples of 256 bytes often fully alias banks |
+
+Two practical consequences:
+
+- the same layout may conflict badly on `gfx942` but only partially on `gfx950`
+- padding choices that are too expensive on `gfx942` may be acceptable on `gfx950`
+
+#### Classify the LDS problem precisely
+
+Use the trace or ISA shape to separate these cases:
+
+- **Bank conflicts**: `ds_read_*` / `ds_write_*` instructions themselves carry the stall
+- **Write-read latency exposed**: `s_waitcnt lgkmcnt(0)` spikes immediately after `ds_write`
+- **Cross-wave serialization**: `s_barrier` dominates a reduce or broadcast region
+
+Treat these metrics in two stages:
+
+- **Before the rewrite**: use them to classify which LDS problem dominates
+- **After the rewrite**: use the same metrics to verify that the targeted bottleneck actually moved
+
+Do not treat all three as the same issue. Each one wants a different fix.
+
+#### Swizzle vs padding
+
+Use **XOR swizzle** when:
+
+- the read and write paths both use a regular logical row/column mapping
+- you need to reduce bank conflicts without increasing LDS footprint
+- the address transform is still easy to audit for correctness
+
+Use **padding** when:
+
+- the swizzle math would make the code materially harder to maintain
+- a small stride change breaks the conflict pattern cleanly
+- LDS headroom is available on the target arch
+
+For either strategy, keep producer and consumer paths consistent. A swizzled
+store paired with a linear load is a correctness bug.
+
+#### Increase write-read distance before adding more structure
+
+If the stall is on `lgkmcnt` immediately after `ds_write`, first try reordering
+useful work between the write and the dependent read:
+
+- next-phase global loads
+- address calculation for the next iteration
+- independent MFMA or ALU work
+- epilogue preparation that does not depend on the just-written LDS data
+
+At the FlyDSL level, the pattern is:
+
+```python
+# BEFORE: write is followed by an immediate barrier/read
+lds_ptr.store(data, [offset])
+fx.gpu.barrier()
+value = lds_ptr.load([offset])
+
+# AFTER: insert independent work before the synchronization point
+lds_ptr.store(data, [offset])
+next_offsets = compute_next_offsets()
+# For example, issue the next global load here if it does not depend on the LDS write.
+next_data = buffer_ops.buffer_load(next_rsrc, next_offsets, vec_width=4, dtype=fx.T.f32())
+fx.gpu.barrier()
+value = lds_ptr.load([offset])
+```
+
+Avoid inserting work that depends on the just-written LDS value, or extra LDS
+traffic that competes with the same bottleneck you are trying to hide.
+
+#### LDS verification checklist
+
+After an LDS-focused rewrite, verify all of these:
+
+- correctness still holds on the same benchmark shapes
+- `ds_read_*` / `ds_write_*` stall decreased if you targeted bank conflicts
+- `s_waitcnt lgkmcnt(0)` stall decreased if you targeted write-read latency
+- barrier count or barrier stall decreased if you targeted cross-wave serialization
+- total LDS bytes still fit the target arch budget
+- added address math or prefetch state did not create a register-pressure regression
 
 #### FlyDSL memory rewrite contracts
 
