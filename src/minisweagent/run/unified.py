@@ -574,6 +574,7 @@ def _run_unified_loop(ctx: PipelineContext, mode: Mode) -> Any:
             agent_class=OptimizationAgent,
             output_dir=output_dir,
             num_gpus=len(ctx.gpu_ids),
+            num_parallel=n_workers,
             rag_enabled=ctx.rag_enabled,
         )
 

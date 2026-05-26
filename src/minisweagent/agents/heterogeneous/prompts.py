@@ -321,7 +321,9 @@ Available GPUs: {{ num_gpus }}
 Generate enough tasks so the total num_gpus across all tasks is close to {{ num_gpus }}.
 It is acceptable to leave some GPUs idle rather than padding the batch with
 low-priority wrapper / dispatch work.
-Each task uses 1 GPU.
+Each task uses 1 GPU by default. If the kernel requires multi-GPU execution
+(e.g. cross-device reduce with torchrun nproc_per_node=2), set num_gpus to
+the number of GPUs the task needs.
 {% endif %}
 {% if base_task_context %}
 ## User-Provided Context
