@@ -765,6 +765,14 @@ class SaveAndTestTool:
                 # Build / compile caches
                 "__hip_fatbin/",
                 ".cache/",
+                # Vendored submodules — when slot worktrees are created via
+                # ``git worktree add`` without ``--recurse-submodules``, the
+                # submodule's own ``.git`` is missing under ``3rdparty/``.
+                # ``git diff`` then aborts with ``fatal: not a git repository:
+                # '3rdparty/<sub>/.git'``, returns no stdout, and the caller
+                # records an empty patch. Excluding the path keeps git diff
+                # scoped to files the agent is actually allowed to edit.
+                "3rdparty/",
                 *self._generated_helper_excludes(),
             ]
             exclude_args = " ".join(f"':(exclude){entry}'" for entry in excludes)
@@ -776,7 +784,21 @@ class SaveAndTestTool:
                 timeout=30,
                 shell=True,
             )
-            return result.stdout
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout
+            # Fall through to the diff -ruN backup branch below. Reasons we
+            # land here in practice:
+            #   * git diff aborted with non-zero exit (e.g. an uninitialised
+            #     submodule's ``.git`` is missing inside the worktree, even
+            #     after the explicit ``3rdparty/`` exclude above — git still
+            #     traverses submodule pointers before applying pathspecs in
+            #     some configurations);
+            #   * git diff returned cleanly but stdout was empty AND a
+            #     ``base_repo_path`` is available, in which case ``diff -ruN``
+            #     is a strict superset (it picks up genuinely-new files that
+            #     ``git add -N`` may have failed to register).
+            # If ``base_repo_path`` is not available we drop to the final
+            # ``return ""`` below, preserving today's behaviour for that case.
 
         if ctx.base_repo_path and ctx.base_repo_path.exists():
             excludes = [
@@ -800,6 +822,11 @@ class SaveAndTestTool:
                 "*.ncu-rep",
                 "__hip_fatbin",
                 ".cache",
+                # See git-branch comment above: vendored submodules confuse
+                # diff-on-worktrees the same way they confuse git diff. Pass
+                # the bare directory name (no trailing slash) because that's
+                # the form ``diff --exclude=`` accepts.
+                "3rdparty",
                 *self._generated_helper_excludes(),
             ]
             if ctx.patch_output_dir:
