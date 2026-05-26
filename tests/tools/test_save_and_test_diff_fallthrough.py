@@ -246,6 +246,48 @@ def test_git_branch_success_path_still_strips_jit_cache(tmp_path):
     )
 
 
+def test_diff_ruN_excludes_jit_cache_basenames(tmp_path):
+    """``diff -ruN`` must pre-exclude every JIT-cache directory basename.
+
+    Pins that ``_get_patch_content`` wires the shared
+    ``jit_cache_diff_basename_excludes()`` helper into the diff command,
+    so that JIT caches (e.g. ``flydsl_cache/``, ``.triton/``) are never
+    even scanned. The post-strip ``_strip_jit_cache_from_patch`` still
+    runs as defence-in-depth, but this guard pins the pre-filter so we
+    don't silently regress to a "post-strip only" world.
+    """
+    from minisweagent.run.utils.generated_artifacts import jit_cache_diff_basename_excludes
+
+    base_repo = tmp_path / "base"
+    base_repo.mkdir()
+    tool = _make_tool(tmp_path, base_repo=base_repo)
+
+    captured_args: list = []
+
+    def _capture(cmd, *args, **kwargs):  # noqa: ARG001
+        captured_args.append(cmd)
+        if isinstance(cmd, str):
+            return _git_diff_result("", returncode=0)
+        return _diff_ruN_result("", returncode=0)
+
+    with (
+        mock.patch.object(SaveAndTestTool, "_is_git_repo", return_value=True),
+        mock.patch(
+            "minisweagent.tools.save_and_test.subprocess.run",
+            side_effect=_capture,
+        ),
+    ):
+        tool._get_patch_content()
+
+    diff_ruN_cmd = next(c for c in captured_args if isinstance(c, list) and c[0] == "diff")
+    expected = jit_cache_diff_basename_excludes()
+    assert expected, "helper must return a non-empty list (test guards the contract)"
+    for basename in expected:
+        assert f"--exclude={basename}" in diff_ruN_cmd, (
+            f"diff -ruN must include --exclude={basename}; got: {diff_ruN_cmd}"
+        )
+
+
 def test_diff_ruN_excludes_3rdparty(tmp_path):
     """The diff -ruN backup branch must pass ``--exclude=3rdparty``."""
     base_repo = tmp_path / "base"

@@ -22,7 +22,11 @@ from minisweagent.run.postprocess.benchmark_parsing import (
     extract_latency_ms,
     parse_shape_latencies_ms,
 )
-from minisweagent.run.utils.generated_artifacts import generated_helper_excludes, strip_jit_cache_sections
+from minisweagent.run.utils.generated_artifacts import (
+    generated_helper_excludes,
+    jit_cache_diff_basename_excludes,
+    strip_jit_cache_sections,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -827,6 +831,14 @@ class SaveAndTestTool:
                 # the bare directory name (no trailing slash) because that's
                 # the form ``diff --exclude=`` accepts.
                 "3rdparty",
+                # JIT runtime caches (.aiter_jit, .triton, flydsl_cache,
+                # torch_compile_cache, triton_cache) are pre-excluded here so
+                # ``diff -ruN`` never scans them in the first place. The
+                # ``_strip_jit_cache_from_patch`` post-filter below still runs
+                # as defence-in-depth, but pre-excluding avoids walking
+                # potentially large cache trees and keeps the captured patch
+                # narrower from the start.
+                *jit_cache_diff_basename_excludes(),
                 *self._generated_helper_excludes(),
             ]
             if ctx.patch_output_dir:
