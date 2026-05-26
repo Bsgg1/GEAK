@@ -183,6 +183,20 @@ def run_homogeneous_agent(
             "best_speedup": speedup,
             "summary": best_result.llm_conclusion if best_result else "No best patch selected",
         }
+
+        # Snapshot the post-patch state of all files touched by the winner
+        # into <output_dir>/optimized_codes/ and embed the manifest. Failures
+        # here must never block report writing.
+        try:
+            from minisweagent.run.postprocess.optimized_codes import collect_optimized_codes
+
+            if report.get("best_patch"):
+                manifest = collect_optimized_codes(final_repo, report["best_patch"], final_output_dir)
+                if manifest:
+                    report["optimized_codes"] = manifest
+        except Exception as snapshot_exc:
+            logger.warning("optimized_codes snapshot failed: %s", snapshot_exc)
+
         report_path = final_output_dir / "final_report.json"
         report_path.write_text(json.dumps(report, indent=2, default=str))
         logger.info("Wrote final_report.json to %s", report_path)

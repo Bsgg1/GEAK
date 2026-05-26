@@ -22,7 +22,7 @@ from minisweagent.run.postprocess.benchmark_parsing import (
     extract_latency_ms,
     parse_shape_latencies_ms,
 )
-from minisweagent.run.utils.generated_artifacts import generated_helper_excludes
+from minisweagent.run.utils.generated_artifacts import generated_helper_excludes, strip_jit_cache_sections
 
 logger = logging.getLogger(__name__)
 
@@ -785,7 +785,7 @@ class SaveAndTestTool:
                 shell=True,
             )
             if result.returncode == 0 and result.stdout.strip():
-                return result.stdout
+                return self._strip_jit_cache_from_patch(result.stdout)
             # Fall through to the diff -ruN backup branch below. Reasons we
             # land here in practice:
             #   * git diff aborted with non-zero exit (e.g. an uninitialised
@@ -853,9 +853,31 @@ class SaveAndTestTool:
             # without choking on absolute paths like
             # ``--- /home/user/repo/.../kernel.py``. Otherwise eval fails
             # with "kernel.py: No such file or directory".
-            return _normalize_diff_ruN_to_git(result.stdout, ctx.base_repo_path, cwd)
+            normalized = _normalize_diff_ruN_to_git(result.stdout, ctx.base_repo_path, cwd)
+            return self._strip_jit_cache_from_patch(normalized)
 
         return ""
+
+    @staticmethod
+    def _strip_jit_cache_from_patch(patch_text: str) -> str:
+        """Drop any ``diff --git`` section whose path is a JIT runtime cache.
+
+        Layer A of the "no JIT pkls in final_report.optimized_codes" fix.
+        ``git add -N . && git diff`` can capture flydsl_cache placeholder pkls
+        when the harness imports the package. Post-strip the rendered patch;
+        Layer B (collect_optimized_codes) provides defence-in-depth.
+        """
+
+        if not patch_text:
+            return patch_text
+        sanitized, removed = strip_jit_cache_sections(patch_text)
+        if removed:
+            logger.info(
+                "save_and_test: stripped %d JIT-cache section(s) from captured patch (sample: %s)",
+                len(removed),
+                ", ".join(removed[:3]),
+            )
+        return sanitized
 
     # Evaluation infrastructure files that agents must never modify.
     # These are restored from git baseline before every test run.

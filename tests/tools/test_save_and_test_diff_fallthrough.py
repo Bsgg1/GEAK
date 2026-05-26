@@ -207,6 +207,45 @@ def test_git_diff_excludes_3rdparty(tmp_path):
     )
 
 
+def test_git_branch_success_path_still_strips_jit_cache(tmp_path):
+    """Composition guard: the fall-through fix and the JIT-cache strip must coexist.
+
+    PR #244 (this branch) and ``fix/final_report_optimized_codes`` both
+    rewrite the git-branch return statement. After merging both, the
+    successful git-branch return path must still apply
+    ``_strip_jit_cache_from_patch`` — otherwise we silently regress the
+    "no JIT pkls in final_report.optimized_codes" behaviour.
+    """
+    base_repo = tmp_path / "base"
+    base_repo.mkdir()
+    tool = _make_tool(tmp_path, base_repo=base_repo)
+
+    real_section = "diff --git a/kernel.py b/kernel.py\n@@ -1 +1 @@\n-old\n+new\n"
+    # Use the public helper to construct a JIT-cache section the stripper
+    # is guaranteed to recognise, so this test does not encode a private
+    # path convention from generated_artifacts.py.
+    jit_section = (
+        "diff --git a/flydsl_cache/abc.pkl b/flydsl_cache/abc.pkl\n"
+        "new file mode 100644\n"
+        "index 0000000..1111111\n"
+        "Binary files /dev/null and b/flydsl_cache/abc.pkl differ\n"
+    )
+
+    with (
+        mock.patch.object(SaveAndTestTool, "_is_git_repo", return_value=True),
+        mock.patch(
+            "minisweagent.tools.save_and_test.subprocess.run",
+            return_value=_git_diff_result(real_section + jit_section, returncode=0),
+        ),
+    ):
+        out = tool._get_patch_content()
+
+    assert "kernel.py" in out, "real kernel.py edit must survive"
+    assert "flydsl_cache" not in out, (
+        f"JIT-cache section must be stripped from the git-branch successful return; got: {out!r}"
+    )
+
+
 def test_diff_ruN_excludes_3rdparty(tmp_path):
     """The diff -ruN backup branch must pass ``--exclude=3rdparty``."""
     base_repo = tmp_path / "base"
