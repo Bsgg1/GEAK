@@ -37,7 +37,7 @@ fix/xxx     ──┘                                   hotfix ─────�
 ### 1. Before you start
 
 - Check existing issues and PRs to avoid duplicate work.
-- For any changes, you must **open an issue first** to describe current problem. For large changes, we must discuss the design.
+- For any non-documentation changes, please open an issue first to describe the current problem. For larger changes, we should discuss the design before implementation.
 
 ### 2. Fork and clone
 
