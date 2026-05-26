@@ -235,7 +235,7 @@ parameter containing a JSON array of task objects. Each task has:
 - "agent_type": "strategy_agent"
 - "agent_name": optional registered YAML subagent name when a specialized
   subagent should handle this task
-- "kernel_language": "python", "cpp", or "asm"
+- "kernel_language": "python", "cpp", "hip", or "asm"
 - "num_gpus": integer (default 1). Each task uses 1 GPU.
 - "task_prompt": detailed instructions for the sub-agent (specific
   optimization focus, which tools to use, what to measure). This is

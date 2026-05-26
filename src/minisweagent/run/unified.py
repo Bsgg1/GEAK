@@ -173,6 +173,7 @@ def _build_postprocess_ctx(pipeline_ctx: PipelineContext) -> dict[str, Any]:
         "repo_root": str(pipeline_ctx.repo or ""),
         "harness_path": str(pipeline_ctx.preprocess_ctx.get("harness_path", "")),
         "gpu_ids": list(pipeline_ctx.gpu_ids),
+        "num_parallel": pipeline_ctx.num_parallel,
         "kernel_path": str(pipeline_ctx.preprocess_ctx.get("kernel_path", "")),
         "baseline_metrics": pipeline_ctx.preprocess_ctx.get("baseline_metrics", {}),
         "model": pipeline_ctx.model,
@@ -472,7 +473,9 @@ def _run_unified_loop(ctx: PipelineContext, mode: Mode) -> Any:
     commandment_path = pp_dir / "COMMANDMENT.md"
     repo_root = str(ctx.repo or ctx.preprocess_ctx.get("repo_root", ""))
     harness_path = str(ctx.preprocess_ctx.get("harness_path", ""))
-    gpu_id = ctx.gpu_ids[0] if ctx.gpu_ids else 0
+    _n_par = ctx.num_parallel or len(ctx.gpu_ids) or 1
+    _gpus_per = max(1, len(ctx.gpu_ids) // _n_par)
+    eval_gpu_ids = ctx.gpu_ids[:_gpus_per]
 
     if repo_root and commandment_path.exists():
         try:
@@ -480,7 +483,7 @@ def _run_unified_loop(ctx: PipelineContext, mode: Mode) -> Any:
                 commandment_path,
                 repo_root,
                 harness_path,
-                gpu_id,
+                eval_gpu_ids,
                 output_dir=output_dir,
             )
         except Exception as exc:
