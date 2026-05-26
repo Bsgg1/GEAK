@@ -250,6 +250,8 @@ def _infer_kernel_language(kernel_path: Path, kernel_type: str) -> str:
         return "asm"
     if kernel_path.suffix == ".py":
         return "python"
+    if kernel_path.suffix in (".hip", ".cu"):
+        return "hip"
     return "cpp"
 
 
@@ -283,7 +285,7 @@ class DiscoveryResult:
             resolved_kernel_path = Path(kernel_info["file"]).resolve()
 
             _build_info: BuildInfo | None = None
-            if klang == "cpp":
+            if klang in ("cpp", "hip"):
                 _repo = kp.parent
                 while _repo != _repo.parent:
                     if (_repo / "setup.py").exists():
