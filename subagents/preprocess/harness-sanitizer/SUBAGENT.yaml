@@ -109,16 +109,19 @@ system_prompt: |
   - Do NOT touch the kernel source code or anything inside repo_root.
 
   Output contract
-  On your final turn, emit exactly one of:
+  When you are done, your LAST bash command must print the submit marker
+  on the first line, followed by your result. Use exactly this pattern:
 
   If changes were made (scripts were sanitized and command was rewritten):
-  ```
+  ```bash
+  echo "MINI_SWE_AGENT_FINAL_OUTPUT
   SANITIZED_COMMAND: <the full rewritten test command>
   SCRIPTS: <comma-separated list of sanitized script paths written>
-  CHANGES: <comma-separated short descriptions of what was changed>
+  CHANGES: <comma-separated short descriptions of what was changed>"
   ```
 
   If no changes needed (no scripts found, or scripts already use env vars):
-  ```
-  NO_CHANGES_NEEDED
+  ```bash
+  echo "MINI_SWE_AGENT_FINAL_OUTPUT
+  NO_CHANGES_NEEDED"
   ```

@@ -290,6 +290,36 @@ def _copy_untracked_files(repo_path: Path, worktree_path: Path, env: dict[str, s
         pass
 
 
+def _symlink_gitignored_so_files(repo_path: Path, worktree_path: Path, env: dict[str, str] | None = None) -> None:
+    """Symlink gitignored .so files from repo into worktree.
+
+    JIT-compiled shared objects are typically gitignored but required at
+    import time (e.g. aiter loads module_aiter_core.so on ``import aiter``).
+    Symlinks are used so agents that need to rebuild a specific .so can
+    ``rm`` the link and JIT-compile a fresh one from modified source.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--others", "--ignored", "--exclude-standard"],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    except subprocess.CalledProcessError:
+        return
+
+    for rel_path in (f.strip() for f in result.stdout.splitlines() if f.strip()):
+        if not rel_path.endswith(".so"):
+            continue
+        src = (repo_path / rel_path).resolve()
+        dst = worktree_path / rel_path
+        if src.is_file() and not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.symlink_to(src)
+
+
 def _apply_dirty_tracked_changes(repo_path: Path, worktree_path: Path, env: dict[str, str] | None = None) -> None:
     """Apply tracked-but-uncommitted repo changes to the fresh worktree.
 
@@ -454,6 +484,7 @@ def create_worktree(repo_path: Path, worktree_path: Path) -> Path:
     _ensure_safe_directory(worktree_path, git_env)
     _apply_dirty_tracked_changes(repo_path, worktree_path, git_env)
     _copy_untracked_files(repo_path, worktree_path, git_env)
+    _symlink_gitignored_so_files(repo_path, worktree_path, git_env)
     _copy_nested_git_repos(repo_path, worktree_path)
     # Neutralize .git dirs in copied nested repos so the worktree's git
     # treats their content as regular files (clean diffs, no gitlink noise).
@@ -544,6 +575,7 @@ def _create_worktree_clean(repo_path: Path, worktree_path: Path) -> Path:
         env=git_env,
     )
     _ensure_safe_directory(worktree_path, git_env)
+    _symlink_gitignored_so_files(repo_path, worktree_path, git_env)
     log.info("Clean-HEAD worktree created at %s (no dirty/untracked sync)", worktree_path)
     return worktree_path
 
