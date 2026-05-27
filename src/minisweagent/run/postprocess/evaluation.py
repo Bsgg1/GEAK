@@ -496,6 +496,10 @@ def run_correctness_and_benchmark(
     pp_dir: Path,
     round_eval: dict[str, Any],
     round_num: int,
+    *,
+    repo_root: str | None = None,
+    harness_path: str = "",
+    gpu_ids: "list[int] | int | None" = None,
 ) -> None:
     """Run CORRECTNESS then FULL_BENCHMARK, compute verified speedup.
 
@@ -556,6 +560,22 @@ def run_correctness_and_benchmark(
         _correctness_stdout = correctness_result.stdout
     else:
         logger.warning("No CORRECTNESS commands found in COMMANDMENT")
+
+    # If neither baseline file exists, try to recapture from the COMMANDMENT
+    # on the unpatched repo. This covers the case where preprocessing didn't
+    # produce a baseline (e.g. non-standard harness that failed validation).
+    _has_any_baseline = (pp_dir / "full_benchmark_baseline.txt").exists() or (
+        pp_dir / "benchmark_baseline.txt"
+    ).exists()
+    if not _has_any_baseline and repo_root:
+        logger.info("No baseline files found; attempting recapture from COMMANDMENT on unpatched repo")
+        recapture_commandment_baseline(
+            commandment_path,
+            repo_root,
+            harness_path,
+            gpu_ids if gpu_ids is not None else [0],
+            pp_dir,
+        )
 
     for baseline_section_name in ["FULL_BENCHMARK", "BENCHMARK"]:
         section_key = baseline_section_name.lower()
@@ -1119,7 +1139,10 @@ def evaluate_round_best(
         )
 
     try:
-        run_correctness_and_benchmark(eval_worktree, eval_env, commandment_path, pp_dir, round_eval, round_num)
+        run_correctness_and_benchmark(
+            eval_worktree, eval_env, commandment_path, pp_dir, round_eval, round_num,
+            repo_root=repo_root, harness_path=harness_path, gpu_ids=eval_gpu_ids,
+        )
         run_profile(eval_worktree, eval_env, commandment_path, pp_dir, round_eval, round_num, results_dir)
     finally:
         cleanup_eval_worktree(repo_root, eval_worktree)

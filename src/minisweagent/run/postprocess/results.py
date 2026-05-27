@@ -326,30 +326,35 @@ def post_round_evaluate(
         # Falling back to the agent's self-reported benchmark_speedup risks
         # promoting a hallucinated or inflated speedup as the global best.
         current = fb.verified_speedup if fb and fb.verified_speedup is not None else None
-        if current is None and _trust_agent:
-            # GEAK_AGENT_SELECT_PATCH=1: trust the agent-reported speedup
-            # for global best-patch tracking (no FULL_BENCHMARK was run).
-            current = round_eval.benchmark_speedup
-            logger.info(
-                "Round %d: GEAK_AGENT_SELECT_PATCH=1, using agent-reported speedup %.4fx for global best selection.",
-                round_num,
-                current,
-            )
         if current is None:
-            agent_speedup = round_eval.benchmark_speedup
-            note = (
-                f"No FULL_BENCHMARK verified speedup available; "
-                f"agent reported {agent_speedup:.4f}x (not used for global best selection)"
-            )
-            logger.warning("Round %d: %s", round_num, note)
-            eval_path = output_dir / f"round_{round_num}_evaluation.json"
-            try:
-                eval_dict = json.loads(eval_path.read_text())
-                eval_dict["verified_speedup_skipped"] = note
-                eval_path.write_text(json.dumps(eval_dict, indent=2, default=str))
-            except (json.JSONDecodeError, OSError):
-                pass
-        elif current >= ctx.get("_best_global_speedup", 0):
+            # No independently verified speedup — fall back to the
+            # agent-reported benchmark_speedup so that starting_patch
+            # still advances across rounds instead of staying stuck.
+            current = round_eval.benchmark_speedup
+            if _trust_agent:
+                logger.info(
+                    "Round %d: GEAK_AGENT_SELECT_PATCH=1, using agent-reported speedup %.4fx for global best selection.",
+                    round_num,
+                    current,
+                )
+            else:
+                logger.warning(
+                    "Round %d: No FULL_BENCHMARK verified speedup available; "
+                    "falling back to agent-reported %.4fx for starting_patch tracking.",
+                    round_num,
+                    current,
+                )
+                eval_path = output_dir / f"round_{round_num}_evaluation.json"
+                try:
+                    eval_dict = json.loads(eval_path.read_text())
+                    eval_dict["verified_speedup_skipped"] = (
+                        f"No FULL_BENCHMARK verified speedup; "
+                        f"agent-reported {current:.4f}x used for starting_patch tracking"
+                    )
+                    eval_path.write_text(json.dumps(eval_dict, indent=2, default=str))
+                except (json.JSONDecodeError, OSError):
+                    pass
+        if current is not None and current >= ctx.get("_best_global_speedup", 0):
             ctx["starting_patch"] = round_eval.best_patch
             ctx["_best_global_speedup"] = current
             logger.info(

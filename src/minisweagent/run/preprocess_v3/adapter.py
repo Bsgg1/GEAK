@@ -169,7 +169,7 @@ def run_preprocess_v3(
             "v3 preprocess failed: " + ("; ".join(result.errors) if result.errors else "no artefacts produced")
         )
 
-    return _preprocess_result_to_legacy_context(
+    legacy_ctx = _preprocess_result_to_legacy_context(
         result=result,
         repo_root=repo_root,
         output_dir=output_dir,
@@ -179,6 +179,20 @@ def run_preprocess_v3(
         correctness_command=correctness_command,
         performance_command=performance_command,
     )
+
+    # Sanitize hardcoded repo paths in user-provided test scripts
+    if legacy_ctx.get("test_command") and repo_root:
+        from minisweagent.run.preprocess_v3.harness_sanitizer import sanitize_test_harness
+
+        legacy_ctx["test_command"] = sanitize_test_harness(
+            legacy_ctx["test_command"],
+            repo_root,
+            str(output_dir),
+            model,
+            console=console,
+        )
+
+    return legacy_ctx
 
 
 # ---------------------------------------------------------------------------

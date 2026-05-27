@@ -158,22 +158,27 @@ def _ensure_safe_directory(repo_path: Path, env: dict[str, str] | None = None) -
 
 
 def _neutralize_nested_git_repos(root: Path) -> list[Path]:
-    """Rename ``.git`` dirs in nested repos to ``.git.bak``.
+    """Rename ``.git`` dirs/files in nested repos to ``.git.bak``.
 
     This turns nested git repos / submodules into plain directories so that
-    git treats their content as regular files.
+    git treats their content as regular files.  Handles both ``.git``
+    directories (standalone nested repos) and ``.git`` files (submodules
+    whose ``.git`` is a ``gitdir: …`` pointer).
     """
     root = root.resolve()
     renamed: list[Path] = []
-    for git_dir in root.rglob(".git"):
-        if git_dir.parent == root:
+    for git_entry in root.rglob(".git"):
+        if git_entry.parent == root:
             continue
-        if git_dir.is_dir():
-            backup = git_dir.parent / ".git.bak"
+        if git_entry.is_dir() or git_entry.is_file():
+            backup = git_entry.parent / ".git.bak"
             try:
                 if backup.exists():
-                    shutil.rmtree(backup)
-                git_dir.rename(backup)
+                    if backup.is_dir():
+                        shutil.rmtree(backup)
+                    else:
+                        backup.unlink()
+                git_entry.rename(backup)
                 renamed.append(backup)
             except Exception:
                 pass
