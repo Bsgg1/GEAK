@@ -117,7 +117,7 @@ Before any other action, read the task prompt and classify it into exactly ONE o
 **Case A — user provided explicit run instructions / commands.**
 Indicators: a literal command-line invocation (``python <script>``, ``pytest ... -k ...``, ``make ...``, shell script, existing custom harness command). The command is opaque: it may NOT support GEAK's four harness flags.
 
-Action: run ``run_discovery`` because it is the standard cheap deterministic front step, then call ``commandment_from_user_command`` with the extracted user command. Discovery/ATD is IRRELEVANT for this case: do not inspect it to alter the user command, and do not generate a harness.
+Action: **skip ``run_discovery``** — the user already told you what to run, so test discovery is unnecessary and wastes time. Go directly to ``commandment_from_user_command`` with the extracted user command. Do not generate a harness.
 
 **STRICT keyword-argument names for ``commandment_from_user_command``** (do NOT use synonyms — the tool will TypeError):
 
@@ -151,11 +151,13 @@ Action: run ``run_discovery`` and use its legacy ATD output as authoritative. Th
 
 # Common deterministic step
 
-## Step 1 — legacy discovery front half (deterministic, all cases)
+## Step 1 — legacy discovery front half (deterministic, Case B and C only)
 
 Call ``run_discovery`` with ``repo_root``, ``kernel_path``, and ``output_dir``. This reuses the legacy deterministic discovery pipeline: resolve kernel/repo, write ``CODEBASE_CONTEXT.md``, run automated-test-discovery, write ``discovery.json``, and write ``DISCOVERY_CONTEXT.md`` with the legacy UTA ``FILES YOU MUST READ`` block.
 
-Important: discovery/ATD has only two states: AUTHORITATIVE or IRRELEVANT. It is AUTHORITATIVE only in Case C. It is IRRELEVANT in Case A and Case B. Never treat discovery as an auxiliary hint in Case A or B.
+**Case A skips this step entirely** — the user already provided a test command, so discovery is unnecessary. Proceed directly to ``commandment_from_user_command``.
+
+For Case B and C: discovery/ATD has only two states: AUTHORITATIVE or IRRELEVANT. It is AUTHORITATIVE only in Case C. It is IRRELEVANT in Case B. Never treat discovery as an auxiliary hint in Case B.
 
 ## Step 2 — translate (conditional)
 
@@ -216,7 +218,7 @@ After ``finish_preprocess`` returns, the orchestrator loop terminates.
 
 # Available tools
 
-1. ``run_discovery`` — deterministic legacy discovery front half; always runs first, but its output is authoritative only in Case C and irrelevant in Cases A/B.
+1. ``run_discovery`` — deterministic legacy discovery front half; runs for Case B and C only (Case A skips it). Its output is authoritative only in Case C and irrelevant in Case B.
 2. ``codebase_explore`` — deterministic legacy codebase context only; compatibility fallback if ``run_discovery`` fails before writing context.
 3. ``translate_to_flydsl`` — deterministic; step 2 (conditional, Path B only).
 4. ``dispatch_subagent`` — LLM dispatch. ``name`` argument must be ``harness-generator`` or ``harness-verifier``. Path B steps 3a and 3b only.
@@ -226,7 +228,7 @@ After ``finish_preprocess`` returns, the orchestrator loop terminates.
 8. ``commandment_from_user_command`` — Path A short-circuit. Mutually exclusive with ``dispatch_subagent("harness-generator", ...)``.
 9. ``finish_preprocess`` — completion sentinel; terminates the loop only when final invariants pass.
 
-Begin by classifying the task into Case A, B, or C, then call ``run_discovery``. After discovery, follow the case-specific action above.
+Begin by classifying the task into Case A, B, or C. For Case A, skip discovery and go directly to ``commandment_from_user_command``. For Case B or C, call ``run_discovery`` first, then follow the case-specific action above.
 """
 
 
@@ -301,7 +303,7 @@ class PreprocessOrchestratorConfig:
         "- gpu_id: {{gpu_id}}\n\n"
         "## Task\n"
         "{{task}}\n\n"
-        "Classify the task into Case A, B, or C, then begin with run_discovery."
+        "Classify the task into Case A, B, or C. For Case A, skip discovery and go directly to commandment_from_user_command. For Case B or C, begin with run_discovery."
     )
 
 

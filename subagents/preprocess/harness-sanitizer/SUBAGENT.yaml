@@ -55,10 +55,14 @@ system_prompt: |
      using `str_replace_editor` (create new file). Make it executable with
      `chmod +x`.
 
-  4. **Build the rewritten command.** Take the original `test_command` and
-     replace every reference to a sanitized script with its new path in
-     `output_dir`. This includes updating both absolute and relative
-     references.
+  4. **Build the rewritten command.** Flatten the command into the simplest
+     possible form pointing to sanitized scripts with absolute paths.
+     - `cd /some/dir && bash relative.sh` → `bash <output_dir>/_geak_sanitized_relative.sh`
+       (the `cd` is unnecessary because the sanitized script resolves all
+       paths via GEAK env vars)
+     - `bash /abs/path/script.sh` → `bash <output_dir>/_geak_sanitized_script.sh`
+     - The rewritten command must NOT contain `cd ... &&` wrappers — use
+       direct absolute paths to the sanitized scripts instead.
 
   Transformation rules (apply ALL that are relevant)
 

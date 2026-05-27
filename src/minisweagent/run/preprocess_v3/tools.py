@@ -207,10 +207,15 @@ def _try_synthesize_shell_contract_harness(
         return None
     if not repo_root_str:
         return None
+    # Only split when the command has multiple meaningful segments, not
+    # when && is just directory navigation (e.g. "cd /dir && bash script.sh").
+    # A cd-only left half is not a correctness command.
     left, right = cmd.rsplit("&&", 1)
     correctness_shell = left.strip()
     performance_shell = right.strip()
     if not correctness_shell or not performance_shell:
+        return None
+    if correctness_shell.startswith("cd ") and "&&" not in correctness_shell:
         return None
     try:
         from minisweagent.run.preprocess.contract_normalize import (
@@ -1358,11 +1363,31 @@ def _make_tool_commandment_from_user_command(
             )
 
         cmd = run_command.strip()
-        # Extract the harness path from the original command (before
-        # ${GEAK_WORK_DIR} substitution) so collect_baseline/collect_profile
-        # can use the real filesystem path.
-        original_harness_path = _extract_harness_from_command(cmd)
         repo_root = str(agent.config.repo) if agent.config.repo else os.environ.get("GEAK_REPO_ROOT", "")
+        output_dir_str = (
+            str(agent._extra_template_vars.get("output_dir", ""))
+            if hasattr(agent, "_extra_template_vars")
+            else ""
+        )
+
+        # Sanitize scripts referenced by the command before rendering
+        # COMMANDMENT.md. The subagent discovers scripts (handling cd +
+        # relative paths, sourced scripts, etc.), rewrites hardcoded
+        # repo_root paths with GEAK env vars, and returns a command
+        # pointing to the sanitized copies.
+        if repo_root and output_dir_str:
+            from minisweagent.run.preprocess_v3.harness_sanitizer import sanitize_test_harness
+
+            cmd = sanitize_test_harness(
+                cmd,
+                repo_root,
+                output_dir_str,
+                agent.model,
+            )
+
+        # Extract the harness path from the (possibly sanitized) command
+        # so collect_baseline/collect_profile can use the real filesystem path.
+        original_harness_path = _extract_harness_from_command(cmd)
         # Fallback: if the user's command is a compound shell pipeline (e.g.
         # ``task_runner.py compile && correctness && performance``) without any
         # standard GEAK harness flag, synthesize a 4-mode wrapper harness using
