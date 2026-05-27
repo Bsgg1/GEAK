@@ -58,15 +58,17 @@ _DEFAULT_BACKEND = "metrix"
 _DEFAULT_NUM_REPLAYS = 3
 _DEFAULT_QUICK = False
 
-#: Per-mode subprocess timeouts (seconds). Match
-#: ``run/preprocess/run_harness.MODE_TIMEOUTS``.
-_BENCHMARK_TIMEOUT_S = 600
-_PROFILE_TIMEOUT_S = 120
-
-#: Short timeout for the correctness gate that runs before baseline collection.
-#: Goal: fail in ~5 s on a broken kernel rather than spending ~5 min running
-#: the full benchmark loop. Override via ``GEAK_CORRECTNESS_GATE_TIMEOUT``.
-_CORRECTNESS_GATE_TIMEOUT_S = int(os.environ.get("GEAK_CORRECTNESS_GATE_TIMEOUT", "120"))
+#: Per-mode subprocess timeouts (seconds). Override via environment variables:
+#:   GEAK_BENCH_TIMEOUT    — benchmark + correctness gate (each keeps its own default)
+#:   GEAK_PROFILE_TIMEOUT  — profiler-mcp invocation
+_BENCHMARK_TIMEOUT_S = int(os.environ.get("GEAK_BENCH_TIMEOUT", "600"))
+_PROFILE_TIMEOUT_S = int(os.environ.get("GEAK_PROFILE_TIMEOUT", "120"))
+_CORRECTNESS_GATE_TIMEOUT_S = int(
+    os.environ.get(
+        "GEAK_BENCH_TIMEOUT",
+        os.environ.get("GEAK_CORRECTNESS_GATE_TIMEOUT", "120"),
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -429,8 +431,11 @@ def _invoke_profiler_mcp(
     GPU hosts).
 
     Returns the structured profile result, or ``None`` if the
-    profiler is unavailable / raises.
+    profiler is unavailable / raises / times out.
     """
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FuturesTimeoutError
+
     try:
         ensure_preprocess_mcp_importable(
             "mcp_tools/profiler-mcp/src",
@@ -453,7 +458,12 @@ def _invoke_profiler_mcp(
         }
         if workdir is not None:
             kwargs["workdir"] = workdir
-        return profile_fn(**kwargs)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(profile_fn, **kwargs)
+            return future.result(timeout=_PROFILE_TIMEOUT_S)
+    except FuturesTimeoutError:
+        logger.warning("profiler-mcp timed out after %ds", _PROFILE_TIMEOUT_S)
+        return None
     except Exception as exc:
         logger.warning("profiler-mcp invocation failed: %s", exc, exc_info=True)
         return None

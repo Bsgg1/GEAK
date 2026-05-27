@@ -57,10 +57,14 @@ _COMMANDMENT_WRITE_RE = re.compile(
 )
 
 
+_BASH_TIMEOUT_S = int(os.environ.get("GEAK_BASH_TIMEOUT", "300"))
+
+
 class BashCommand:
     def __init__(self):
         self._env_override: dict[str, str] = {}
         self._cwd: str | None = None
+        self.timeout: int = _BASH_TIMEOUT_S
         self.blocklist: list[str] = [
             "vim",
             "vi",
@@ -138,14 +142,22 @@ class BashCommand:
             command = self._sandbox_command(command)
             env = os.environ | self._env_override if self._env_override else None
             cwd = self._cwd if self._cwd and Path(self._cwd).is_dir() else None
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=False,
-                env=env,
-                cwd=cwd,
-            )
+            try:
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=False,
+                    env=env,
+                    cwd=cwd,
+                    timeout=self.timeout,
+                )
+            except subprocess.TimeoutExpired:
+                return {
+                    "output": f"TIMEOUT: command exceeded {self.timeout}s limit. "
+                    "Override via GEAK_BASH_TIMEOUT env var.",
+                    "returncode": -1,
+                }
             output_text = _decode_captured_output(result.stdout, result.stderr)
 
             if "COMMANDMENT.md" in command:

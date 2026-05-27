@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -285,11 +286,13 @@ def _run_codebase_explore(
     prompt_path = _find_codebase_explore_prompt()
     system_prompt = prompt_path.read_text(encoding="utf-8")
 
+    _explore_timeout = int(os.environ.get("GEAK_EXPLORE_TIMEOUT", "600"))
     agent = PreprocessSubagent(
         model=model,
         system_prompt=system_prompt,
         tools=["bash"],
         step_limit=50,
+        wall_timeout=_explore_timeout,
         cwd=str(repo),
     )
 

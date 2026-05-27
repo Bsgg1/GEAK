@@ -1,13 +1,14 @@
-"""Sanitize hardcoded repo paths in user-provided test/eval scripts.
+"""Sanitize hardcoded repo paths in user-provided test/eval commands.
 
-When users supply ``--test-command "bash /path/to/run_eval.sh"``, the
-script may contain hardcoded absolute paths to the target repo (e.g.
-``/sgl-workspace/aiter``).  GEAK creates worktrees for each optimization
-agent, but if the script points to the original repo, the worktree's
-modifications are never tested.
+When users supply ``--test-command "cd /path && bash run_eval.sh"``, the
+referenced scripts may contain hardcoded absolute paths to the target repo
+(e.g. ``/sgl-workspace/aiter``).  GEAK creates worktrees for each
+optimization agent, but if the script points to the original repo, the
+worktree's modifications are never tested.
 
-This module detects hardcoded repo paths in referenced script files and
-invokes a subagent to rewrite them using GEAK env vars
+This module sends the entire test command to a subagent that discovers
+referenced scripts (handling ``cd`` + relative paths, sourced scripts,
+etc.), detects hardcoded repo paths, and rewrites them using GEAK env vars
 (``GEAK_WORK_DIR``, ``GEAK_GPU_DEVICE``, etc.).
 
 Only triggered when the user explicitly provides a test command.  Does
@@ -18,35 +19,11 @@ from __future__ import annotations
 
 import logging
 import re
-import shlex
 from pathlib import Path
 
 from minisweagent import Model
 
 logger = logging.getLogger(__name__)
-
-
-def _extract_script_paths(test_command: str) -> list[Path]:
-    """Extract file paths referenced in the test command that exist on disk."""
-    paths: list[Path] = []
-    try:
-        tokens = shlex.split(test_command)
-    except ValueError:
-        tokens = test_command.split()
-
-    for token in tokens:
-        if not token.startswith("/"):
-            continue
-        p = Path(token)
-        if p.is_file() and p.suffix in (".sh", ".py", ".bash"):
-            paths.append(p)
-    return paths
-
-
-def _has_hardcoded_repo_paths(content: str, repo_root: str) -> bool:
-    """Check if the script content contains the repo root as a literal path."""
-    normalized = repo_root.rstrip("/")
-    return normalized in content
 
 
 def sanitize_test_harness(
@@ -59,70 +36,43 @@ def sanitize_test_harness(
 ) -> str:
     """Sanitize hardcoded repo paths in scripts referenced by test_command.
 
-    Scans each script file referenced in ``test_command`` for hardcoded
-    ``repo_root`` paths.  If found, invokes the HarnessSanitizerAgent to
-    rewrite the script using GEAK env vars.  The sanitized script is
-    written to ``output_dir`` and the returned test_command is updated
-    to point to it.
+    Sends the full ``test_command`` and ``repo_root`` to the
+    harness-sanitizer subagent, which discovers referenced scripts,
+    checks them for hardcoded paths, rewrites them, and returns a
+    new test command pointing to the sanitized copies.
 
     Returns the (possibly updated) test_command string.
     """
     repo_root = str(Path(repo_root).resolve())
-    script_paths = _extract_script_paths(test_command)
-
-    if not script_paths:
-        logger.debug("harness_sanitizer: no script files found in test_command")
-        return test_command
-
-    scripts_to_sanitize: list[Path] = []
-    for sp in script_paths:
-        try:
-            content = sp.read_text()
-        except OSError:
-            continue
-        if _has_hardcoded_repo_paths(content, repo_root):
-            scripts_to_sanitize.append(sp)
-
-    if not scripts_to_sanitize:
-        logger.info("harness_sanitizer: no hardcoded repo paths found in referenced scripts")
-        return test_command
-
-    logger.info(
-        "harness_sanitizer: found hardcoded repo paths in %d script(s): %s",
-        len(scripts_to_sanitize),
-        [str(p) for p in scripts_to_sanitize],
-    )
-
-    updated_command = test_command
     out_dir = Path(output_dir)
 
-    for script_path in scripts_to_sanitize:
-        sanitized_name = f"_geak_sanitized_{script_path.name}"
-        output_path = out_dir / sanitized_name
+    logger.info(
+        "harness_sanitizer: sending test_command to subagent for analysis "
+        "(repo_root=%s, output_dir=%s)",
+        repo_root,
+        output_dir,
+    )
 
-        try:
-            sanitized_path = _run_sanitizer_agent(
-                script_path=script_path,
-                repo_root=repo_root,
-                output_path=output_path,
-                model=model,
-                log_dir=out_dir,
-            )
-        except Exception as exc:
-            logger.warning(
-                "harness_sanitizer: agent failed for %s: %s; using original",
-                script_path,
-                exc,
-            )
-            continue
+    try:
+        updated_command = _run_sanitizer_agent(
+            test_command=test_command,
+            repo_root=repo_root,
+            output_dir=out_dir,
+            model=model,
+        )
+    except Exception as exc:
+        logger.warning(
+            "harness_sanitizer: agent failed: %s; using original command",
+            exc,
+        )
+        return test_command
 
-        if sanitized_path and sanitized_path.is_file():
-            updated_command = updated_command.replace(str(script_path), str(sanitized_path))
-            logger.info("harness_sanitizer: %s → %s", script_path, sanitized_path)
-        else:
-            logger.info("harness_sanitizer: no changes needed for %s", script_path)
+    if updated_command is not None:
+        logger.info("harness_sanitizer: command rewritten → %s", updated_command)
+        return updated_command
 
-    return updated_command
+    logger.info("harness_sanitizer: no changes needed")
+    return test_command
 
 
 def _load_sanitizer_spec():
@@ -136,66 +86,58 @@ def _load_sanitizer_spec():
 
 def _run_sanitizer_agent(
     *,
-    script_path: Path,
+    test_command: str,
     repo_root: str,
-    output_path: Path,
+    output_dir: Path,
     model: Model,
-    log_dir: Path | None = None,
-) -> Path | None:
-    """Invoke the HarnessSanitizerAgent and return the sanitized script path.
+) -> str | None:
+    """Invoke the HarnessSanitizerAgent and return the sanitized command.
 
-    Uses the ``harness-sanitizer`` subagent definition from
-    ``subagents/preprocess/harness-sanitizer/SUBAGENT.yaml`` via
-    :class:`PreprocessSubagent`.
-
-    Returns ``output_path`` on success, ``None`` if no changes were needed.
+    Returns the rewritten test command on success, ``None`` if no changes
+    were needed.
     """
     from minisweagent.run.preprocess_v3.subagent import PreprocessSubagent
 
     spec = _load_sanitizer_spec()
 
-    log_path = None
-    if log_dir:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "harness_sanitizer.log"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "harness_sanitizer.log"
 
     agent = PreprocessSubagent(
         model=model,
         system_prompt=spec.system_prompt,
         tools=list(spec.tools) if spec.tools else ["bash", "str_replace_editor"],
         step_limit=spec.max_steps,
-        cwd=str(script_path.parent),
+        cwd=str(output_dir),
         log_path=log_path,
     )
 
     task = (
-        f"Sanitize hardcoded repo paths in a test script.\n\n"
-        f"script_path: {script_path}\n"
+        f"Sanitize hardcoded repo paths in a user-provided test command.\n\n"
+        f"test_command: {test_command}\n"
         f"repo_root: {repo_root}\n"
-        f"output_path: {output_path}\n\n"
-        f"Read the script, replace all hardcoded occurrences of '{repo_root}' "
-        f"with GEAK env var patterns, and write the result to '{output_path}'."
+        f"output_dir: {output_dir}\n\n"
+        f"Discover all scripts referenced by the test_command (handle cd + "
+        f"relative paths, sourced scripts, etc.), check each for hardcoded "
+        f"occurrences of '{repo_root}', rewrite them with GEAK env vars, "
+        f"write sanitized copies to '{output_dir}', and output the rewritten "
+        f"test command that uses the sanitized scripts."
     )
 
     exit_status, result = agent.run(task)
     if exit_status != "Submitted":
         logger.warning("HarnessSanitizerAgent did not finish successfully: %s", exit_status)
 
-    return _parse_sanitizer_output(result, output_path)
+    return _parse_sanitizer_output(result)
 
 
-def _parse_sanitizer_output(text: str, expected_output: Path) -> Path | None:
-    """Parse the agent's output for SANITIZED: or NO_CHANGES_NEEDED."""
+def _parse_sanitizer_output(text: str) -> str | None:
+    """Parse the agent's output for SANITIZED_COMMAND: or NO_CHANGES_NEEDED."""
     if "NO_CHANGES_NEEDED" in text:
         return None
 
-    match = re.search(r"SANITIZED:\s*(.+)\s*$", text.strip(), re.MULTILINE)
+    match = re.search(r"SANITIZED_COMMAND:\s*(.+)", text.strip(), re.MULTILINE)
     if match:
-        path = Path(match.group(1).strip())
-        if path.is_file():
-            return path
-
-    if expected_output.is_file():
-        return expected_output
+        return match.group(1).strip()
 
     return None

@@ -496,11 +496,28 @@ def main(
 
     kernel_target = kernel_url or parsed_config.get("kernel_url") or parsed_config.get("kernel_name")
 
+    # When kernel_target is missing but repo is available (CLI --repo or
+    # extracted from task), let the adapter's codebase-explore auto-discover
+    # the kernel — don't bail out here.
     if not kernel_target and repo is None:
-        logger.error(
-            "[red]Error: missing kernel target. Provide --kernel-url, --repo, or include kernel info in task.[/red]"
-        )
-        raise typer.Exit(1)
+        # Last-resort: scan the task text for an existing directory path that
+        # could serve as the repo root.  parse_task_info may miss it when the
+        # path is embedded in free-form text.
+        if task_content:
+            import re
+
+            for candidate in re.findall(r"(?:^|\s)(/\S+)", task_content):
+                p = Path(candidate.rstrip(",.;:"))
+                if p.is_dir():
+                    repo = p
+                    logger.info("Inferred repo from task text: %s", repo)
+                    break
+
+        if not kernel_target and repo is None:
+            logger.error(
+                "[red]Error: missing kernel target. Provide --kernel-url, --repo, or include kernel info in task.[/red]"
+            )
+            raise typer.Exit(1)
 
     parsed_gpu_ids = _parse_gpu_ids(gpu_ids)
 
