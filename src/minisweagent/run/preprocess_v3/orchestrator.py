@@ -133,7 +133,12 @@ commandment_from_user_command(
 
 **Important exception**: if the "Hints from the call site" section says the harness is **pre-validated** and supports the four standard modes (``--correctness``, ``--benchmark``, ``--full-benchmark``, ``--profile``), you MUST list all four modes in ``modes_covered`` when calling ``commandment_from_user_command``. The tool will substitute the correct flag for each COMMANDMENT section automatically. Do NOT put all modes in ``inferred_modes`` — use ``modes_covered``.
 
-**After ``commandment_from_user_command`` succeeds**: if the return value includes a ``harness_path`` (i.e. the command references a standard harness file), call ``collect_baseline(harness_path=<path>)`` and ``collect_profile(harness_path=<path>)`` before calling ``finish_preprocess``. These are fast deterministic subprocess calls (~30-60s total) and their output is required for downstream verified-speedup evaluation. If either call fails, proceed anyway — record the failure and call ``finish_preprocess``.
+**After ``commandment_from_user_command`` succeeds**, you **MUST** call ``collect_baseline`` before calling ``finish_preprocess``. Baseline is **required** for downstream verified-speedup evaluation:
+
+- If the return value includes a ``harness_path``, call ``collect_baseline(harness_path=<path>)`` and ``collect_profile(harness_path=<path>)``.
+- If ``harness_path`` is null/absent, call ``collect_baseline(eval_command="<eval_command from the return value>")`` — use the ``eval_command`` field from ``commandment_from_user_command``'s return value (NOT the original ``run_command`` you passed in, because the tool sanitizes the command to add GEAK metric markers). This runs the eval command directly and parses ``GEAK_METRIC`` / ``GEAK_RESULT_LATENCY_MS`` markers from stdout.
+
+If either call fails, proceed anyway — record the failure and call ``finish_preprocess``.
 
 **Case B — user provided explicit shapes/configs but no runnable command.**
 Indicators: the task names exact shapes, dims, dtype/config tuples, model-production configs, or says "use only this shape/config". The user's shapes/configs are authoritative.
@@ -222,7 +227,7 @@ After ``finish_preprocess`` returns, the orchestrator loop terminates.
 2. ``codebase_explore`` — deterministic legacy codebase context only; compatibility fallback if ``run_discovery`` fails before writing context.
 3. ``translate_to_flydsl`` — deterministic; step 2 (conditional, Path B only).
 4. ``dispatch_subagent`` — LLM dispatch. ``name`` argument must be ``harness-generator`` or ``harness-verifier``. Path B steps 3a and 3b only.
-5. ``collect_baseline`` — deterministic; step 4 (Path A when harness is available, and Path B).
+5. ``collect_baseline`` — deterministic; **MUST be called for both Path A and Path B**. Accepts either ``harness_path`` (runs ``python harness --benchmark``) or ``eval_command`` (runs the command directly). At least one is required.
 6. ``collect_profile`` — deterministic; step 4 (Path A when harness is available, and Path B).
 7. ``render_commandment`` — deterministic; Path B step 5.
 8. ``commandment_from_user_command`` — Path A short-circuit. Mutually exclusive with ``dispatch_subagent("harness-generator", ...)``.

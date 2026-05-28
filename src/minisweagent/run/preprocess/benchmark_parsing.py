@@ -1,13 +1,19 @@
 """Deterministic benchmark output parsing and patch selection.
 
-Provides regex-based extraction of latency metrics from harness output
+Provides regex-based extraction of benchmark metrics from harness output
 and a ``compute_best_patch()`` function that selects the best non-empty
 patch by comparing benchmark numbers -- no LLM involved.
 
+Supports two metric marker formats:
+
+* **New (generalized)**: ``GEAK_RESULT_METRIC=<float>``,
+  ``GEAK_RESULT_UNIT=<unit>``, ``GEAK_RESULT_DIRECTION=<lower_is_better|higher_is_better>``
+* **Legacy**: ``GEAK_RESULT_LATENCY_MS=<float>`` (implies ms, lower_is_better)
+
+Falls back to heuristic parsers when no explicit marker is present.
+
 Measurement methodology:
 - Uses ``benchmark_baseline.txt`` (the canonical unmodified baseline benchmark)
-- Prioritizes ``GEAK_RESULT_LATENCY_MS=<number>`` marker (standardized)
-- Falls back to legacy parsers and universal latency keyword scanner
 - Only reports speedups > 1.0 (genuine improvements over true baseline)
 - Clamps LLM-inflated results to 1.0 when no real improvement exists
 """
@@ -17,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -120,7 +127,7 @@ def parse_shape_latencies_ms(output: str) -> dict[str, float]:
     return parse_labeled_latencies_ms(output)
 
 
-def extract_benchmark_config_lines(output: str) -> list[str] | None:
+def extract_benchmark_config_lines(output: str) -> list[str]:
     """Extract benchmark config fingerprint lines from harness output.
 
     Captures the config/shape identifiers from each benchmark line,
@@ -137,35 +144,25 @@ def extract_benchmark_config_lines(output: str) -> list[str] | None:
         '(1, 16), k=2       0.0196ms   0.0335ms     0.58x'
         'Config (B=256,H=1024)   0.072ms  ...'
 
-    Returns a sorted list of config identifiers, or None if no configs found.
+    Returns a sorted list of config identifiers (empty list if none found).
     """
     configs: list[str] = []
-    # Match lines with at least one timing value: "0.0342ms", "0.0342 ms", or
-    # bare floats like "0.0342" in columns (common in table-formatted output).
-    timing_pattern = re.compile(r"\d+\.\d+(?:ms|us|µs|s|x)?")
+    timing_pattern = re.compile(r"\d+\.\d+\s*(?:ms|us|µs|s|x)")
     for line in output.splitlines():
         line = line.strip()
         if not line or line.startswith(("-", "=", "#", "Status", "Geometric", "GEAK_")):
             continue
         if not timing_pattern.search(line):
             continue
-        # Skip header/summary lines
         if any(kw in line.lower() for kw in ("comparing", "running", "warmup", "median", "geomean", "mean")):
             continue
-        # Extract config prefix: everything before the first timing value.
-        # Handles multiple output formats:
-        #   "M=128, N=16  0.0747  0.0474  1.58x"   → "M=128, N=16"
-        #   "B=1 H=32 ... 2.11ms 0.10ms 21.37x"    → "B=1 H=32 ..."
-        #   "(2, 4, 64): kernel=0.0411 ms | ref=..."→ "(2, 4, 64)"
-        # Split on: =<float>, :<whitespace><float>, or <whitespace><float>
         config_part = re.split(r"(?<=[=:])\s*\d+\.\d+|\s+\d+\.\d+", line)[0].strip()
-        # Clean trailing separators and labels that precede timing values
         config_part = re.sub(r"[\s:|]+$", "", config_part)
         config_part = re.sub(r"\s*\|\s*\w+$", "", config_part)
         config_part = re.sub(r":\s*\w+=$", "", config_part)
-        if config_part and len(config_part) > 3:
+        if config_part:
             configs.append(config_part)
-    return sorted(configs) if configs else None
+    return sorted(configs)
 
 
 def _universal_latency_fallback(text: str) -> float | None:
@@ -185,40 +182,118 @@ def _universal_latency_fallback(text: str) -> float | None:
     return candidates[-1] if candidates else None
 
 
-def _extract_latency(text: str) -> float | None:
-    """Extract latency from benchmark output.
+@dataclass(frozen=True)
+class BenchmarkMetric:
+    """Structured benchmark metric extracted from harness output.
+
+    Attributes:
+        value: Raw numeric value in the original unit.
+        unit: Unit string (``"ms"``, ``"us"``, ``"GB/s"``, ``"TFLOPS"``, …).
+        direction: ``"lower_is_better"`` for latency/time metrics,
+            ``"higher_is_better"`` for throughput/bandwidth metrics.
+    """
+
+    value: float
+    unit: str
+    direction: str  # "lower_is_better" | "higher_is_better"
+
+
+_HIGHER_IS_BETTER_UNITS = frozenset({
+    "gb/s", "tb/s", "mb/s",
+    "tflops", "gflops", "pflops",
+    "items/s", "ops/s", "samples/s",
+})
+
+_TIME_UNIT_TO_MS: dict[str, float] = {
+    "ms": 1.0,
+    "us": 0.001,
+    "µs": 0.001,
+    "ns": 0.000001,
+    "s": 1000.0,
+}
+
+
+def _metric_to_ms(metric: BenchmarkMetric) -> float:
+    """Convert a :class:`BenchmarkMetric` value to milliseconds.
+
+    For time-based units this is a direct conversion.  For throughput
+    units (higher-is-better) we return a synthetic inverse
+    (``1000 / value``) so that legacy callers comparing in ms-space
+    still get directionally correct results.
+    """
+    factor = _TIME_UNIT_TO_MS.get(metric.unit.lower())
+    if factor is not None:
+        return metric.value * factor
+    if metric.value > 0:
+        return 1000.0 / metric.value
+    return 0.0
+
+
+def extract_benchmark_metric(text: str) -> BenchmarkMetric | None:
+    """Extract a structured benchmark metric from harness output.
 
     Priority:
-    1. GEAK_RESULT_LATENCY_MS=<number> (standardized marker, always correct)
-    2. Legacy format parsers (TOTAL_KERNEL_TIME_MS, BENCHMARK_METRIC, etc.)
-    3. Universal fallback: last number near latency keywords in output
+    1. New generalized markers: ``GEAK_RESULT_METRIC=``, ``GEAK_RESULT_UNIT=``,
+       ``GEAK_RESULT_DIRECTION=``
+    2. Legacy ``GEAK_RESULT_LATENCY_MS=`` (implies ``ms``, ``lower_is_better``)
+    3. Heuristic legacy parsers (all assume ``ms``, ``lower_is_better``)
     """
-    m = re.search(r"GEAK_RESULT_LATENCY_MS=([\d.]+(?:e[+-]?\d+)?)", text)
-    if m:
-        return float(m.group(1))
+    m_val = re.search(r"GEAK_RESULT_METRIC=([\d.]+(?:e[+-]?\d+)?)", text)
+    if m_val:
+        value = float(m_val.group(1))
+        m_unit = re.search(r"GEAK_RESULT_UNIT=(\S+)", text)
+        m_dir = re.search(r"GEAK_RESULT_DIRECTION=(lower_is_better|higher_is_better)", text)
+        unit = m_unit.group(1) if m_unit else "ms"
+        direction = m_dir.group(1) if m_dir else (
+            "higher_is_better" if unit.lower() in _HIGHER_IS_BETTER_UNITS else "lower_is_better"
+        )
+        return BenchmarkMetric(value=value, unit=unit, direction=direction)
 
-    val = parse_total_kernel_time_ms(text)
-    if val is not None:
-        return val
-    val = _parse_benchmark_metric(text)
-    if val is not None:
-        return val
-    val = parse_median_latency_ms(text)
-    if val is not None:
-        return val
-    val = parse_google_benchmark_ms(text)
-    if val is not None:
-        return val
-    val = _labeled_latencies_geomean_ms(text)
-    if val is not None:
-        return val
+    m_legacy = re.search(r"GEAK_RESULT_LATENCY_MS=([\d.]+(?:e[+-]?\d+)?)", text)
+    if m_legacy:
+        return BenchmarkMetric(value=float(m_legacy.group(1)), unit="ms", direction="lower_is_better")
 
-    return _universal_latency_fallback(text)
+    for parser in (
+        parse_total_kernel_time_ms,
+        _parse_benchmark_metric,
+        parse_median_latency_ms,
+        parse_google_benchmark_ms,
+        _labeled_latencies_geomean_ms,
+        _universal_latency_fallback,
+    ):
+        val = parser(text)
+        if val is not None:
+            return BenchmarkMetric(value=val, unit="ms", direction="lower_is_better")
+
+    return None
 
 
 def extract_latency_ms(text: str) -> float | None:
-    """Public wrapper for standardized latency extraction."""
-    return _extract_latency(text)
+    """Extract a latency value in milliseconds from benchmark output.
+
+    Backward-compatible wrapper around :func:`extract_benchmark_metric`.
+    For throughput metrics the value is converted to a synthetic
+    ms-equivalent via :func:`_metric_to_ms`.
+    """
+    metric = extract_benchmark_metric(text)
+    if metric is None:
+        return None
+    return _metric_to_ms(metric)
+
+
+def compute_speedup(
+    baseline: float,
+    candidate: float,
+    direction: str = "lower_is_better",
+) -> float:
+    """Compute speedup ratio respecting metric direction.
+
+    Returns a value > 1.0 when the candidate is better than the baseline,
+    regardless of whether the metric is lower-is-better or higher-is-better.
+    """
+    if direction == "higher_is_better":
+        return candidate / baseline
+    return baseline / candidate
 
 
 def extract_reported_speedup(text: str) -> float | None:
@@ -246,6 +321,7 @@ def extract_reported_speedup(text: str) -> float | None:
 def compute_shape_speedups(
     baseline_shapes_ms: dict[str, float],
     candidate_shapes_ms: dict[str, float],
+    direction: str = "lower_is_better",
 ) -> dict[str, dict[str, float]]:
     """Compute per-shape speedups for the overlap between baseline and candidate."""
     results: dict[str, dict[str, float]] = {}
@@ -256,26 +332,28 @@ def compute_shape_speedups(
         results[shape] = {
             "baseline_ms": round(baseline_ms, 6),
             "candidate_ms": round(candidate_ms, 6),
-            "speedup": round(baseline_ms / candidate_ms, 6),
+            "speedup": round(compute_speedup(baseline_ms, candidate_ms, direction), 6),
         }
     return results
 
 
-def _find_original_baseline_ms(patch_dir: Path) -> float | None:
+def _find_original_baseline(patch_dir: Path) -> tuple[float, str] | None:
     """Walk up from patch_dir to find benchmark_baseline.txt (the canonical baseline).
 
     The preprocessing phase writes benchmark_baseline.txt at the kernel
     output root (e.g. patches/exp0/rope/benchmark_baseline.txt).  Task dirs
     are nested under results/round_N/strategy_name, so we walk upward.
+
+    Returns ``(latency_ms, direction)`` or ``None``.
     """
     d = patch_dir
     for _ in range(8):
         bl = d / "benchmark_baseline.txt"
         if bl.is_file():
             text = bl.read_text()
-            lat = _extract_latency(text)
-            if lat is not None and lat > 0:
-                return lat
+            metric = extract_benchmark_metric(text)
+            if metric is not None and metric.value > 0:
+                return _metric_to_ms(metric), metric.direction
         parent = d.parent
         if parent == d:
             break
@@ -290,13 +368,14 @@ def compute_best_patch(patch_dir: Path) -> dict[str, Any] | None:
     than ``patch_0_test.txt`` which is the agent's first attempt.  Only
     returns a result if a patch genuinely beats the true baseline (>1.0x).
     """
-    original_bl = _find_original_baseline_ms(patch_dir)
+    original_bl = _find_original_baseline(patch_dir)
+    direction = "lower_is_better"
 
     baseline_file = patch_dir / "patch_0_test.txt"
     baseline_text = ""
     baseline_shape_latencies: dict[str, float] = {}
     if original_bl is not None:
-        baseline_ms = original_bl
+        baseline_ms, direction = original_bl
         baseline_source = "benchmark_baseline.txt"
         baseline_file_path = next(
             (p for p in [patch_dir, *patch_dir.parents] if (p / "benchmark_baseline.txt").is_file()), None
@@ -306,7 +385,12 @@ def compute_best_patch(patch_dir: Path) -> dict[str, Any] | None:
             baseline_shape_latencies = parse_shape_latencies_ms(baseline_text)
     elif baseline_file.exists():
         baseline_text = baseline_file.read_text()
-        baseline_ms = _extract_latency(baseline_text)
+        metric = extract_benchmark_metric(baseline_text)
+        if metric is not None:
+            baseline_ms = _metric_to_ms(metric)
+            direction = metric.direction
+        else:
+            baseline_ms = None
         baseline_source = "patch_0_test.txt (FALLBACK)"
         baseline_shape_latencies = parse_shape_latencies_ms(baseline_text)
     else:
@@ -335,12 +419,12 @@ def compute_best_patch(patch_dir: Path) -> dict[str, Any] | None:
             continue
 
         candidate_text = test_file.read_text()
-        candidate_ms = _extract_latency(candidate_text)
+        candidate_ms = extract_latency_ms(candidate_text)
         if candidate_ms is None or candidate_ms <= 0:
             continue
         candidate_shape_latencies = parse_shape_latencies_ms(candidate_text)
 
-        speedup = baseline_ms / candidate_ms
+        speedup = compute_speedup(baseline_ms, candidate_ms, direction)
         if speedup > best_speedup:
             best_speedup = speedup
             best_candidate_ms = candidate_ms
@@ -349,7 +433,9 @@ def compute_best_patch(patch_dir: Path) -> dict[str, Any] | None:
             best_test_file = str(test_file)
             best_patch_size = psz
             best_candidate_shape_latencies = candidate_shape_latencies
-            best_shape_speedups = compute_shape_speedups(baseline_shape_latencies, candidate_shape_latencies)
+            best_shape_speedups = compute_shape_speedups(
+                baseline_shape_latencies, candidate_shape_latencies, direction
+            )
 
     if best_patch_id is None or best_speedup <= 1.0:
         return None
@@ -363,6 +449,7 @@ def compute_best_patch(patch_dir: Path) -> dict[str, Any] | None:
         "baseline_latency_ms": round(baseline_ms, 6),
         "candidate_latency_ms": round(best_candidate_ms, 6),
         "baseline_source": baseline_source,
+        "metric_direction": direction,
         "baseline_shape_latency_ms": baseline_shape_latencies,
         "candidate_shape_latency_ms": best_candidate_shape_latencies,
         "per_shape_speedups": best_shape_speedups,
@@ -383,7 +470,8 @@ def rewrite_best_results(patch_dir: Path) -> dict[str, Any] | None:
     """
     det = compute_best_patch(patch_dir)
     existing_path = patch_dir / "best_results.json"
-    original_bl = _find_original_baseline_ms(patch_dir)
+    original_bl_result = _find_original_baseline(patch_dir)
+    original_bl = original_bl_result[0] if original_bl_result else None
 
     if det is not None:
         existing_path.write_text(json.dumps(det, indent=2))

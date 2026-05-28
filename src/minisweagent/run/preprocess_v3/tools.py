@@ -792,19 +792,31 @@ def _schema_collect_baseline() -> dict[str, Any]:
         "name": "collect_baseline",
         "type": "function",
         "description": (
-            "Step 4 part 1 — deterministic. Run the harness in --benchmark mode "
-            "``repeats`` times, parse the latency markers, return the median + "
-            "samples + raw outputs."
+            "Step 4 part 1 — deterministic. MUST be called for both Path A and Path B. "
+            "Two modes: (1) pass ``harness_path`` to run ``python harness --benchmark``; "
+            "(2) pass ``eval_command`` to run the eval command directly (no --benchmark flag). "
+            "At least one of ``harness_path`` or ``eval_command`` is required."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "harness_path": {"type": "string", "description": "Absolute path to the verified harness."},
+                "harness_path": {
+                    "type": "string",
+                    "description": "Absolute path to the verified harness. Use when the harness supports --benchmark.",
+                },
+                "eval_command": {
+                    "type": "string",
+                    "description": (
+                        "Shell command to run directly (no --benchmark flag added). "
+                        "Use when commandment_from_user_command returned no harness_path. "
+                        "The command must emit GEAK_METRIC or GEAK_RESULT_LATENCY_MS markers."
+                    ),
+                },
                 "repeats": {"type": "integer", "description": "Number of benchmark invocations.", "default": 5},
                 "work_dir": {"type": "string", "description": "Working directory + PYTHONPATH prefix."},
                 "gpu_id": {"type": "integer", "description": "HIP_VISIBLE_DEVICES value.", "default": 0},
             },
-            "required": ["harness_path"],
+            "required": [],
         },
     }
 
@@ -1186,7 +1198,8 @@ def _make_tool_collect_baseline(
     agent: PreprocessOrchestratorAgent,
 ) -> Callable[..., dict[str, Any]]:
     def _impl(
-        harness_path: str,
+        harness_path: str | None = None,
+        eval_command: str | None = None,
         repeats: int = 5,
         work_dir: str | None = None,
         gpu_id: int | None = None,
@@ -1199,25 +1212,49 @@ def _make_tool_collect_baseline(
         # otherwise abort the whole baseline step.
         if _extra_ignored:
             logger.debug("collect_baseline ignored extra kwargs: %s", list(_extra_ignored))
+
+        if not harness_path and not eval_command:
+            return {"ok": False, "error": "collect_baseline requires either harness_path or eval_command"}
+
+        # Prefer the sanitized eval command (with GEAK markers injected)
+        # over whatever the LLM passed. The LLM often passes the original
+        # unsanitized user command which lacks GEAK_RESULT_METRIC markers.
+        if not harness_path:
+            saved_eval = agent._collected.get("eval_command_for_baseline")
+            if saved_eval:
+                eval_command = saved_eval
+
         resolved_gpu = gpu_id if gpu_id is not None else agent.config.gpu_id
         resolved_work_dir = Path(work_dir) if work_dir else None
-        baseline: BaselineMetrics = collect_baseline_metrics(
-            Path(harness_path),
-            repeats=repeats,
-            work_dir=resolved_work_dir,
-            gpu_id=resolved_gpu,
-        )
-        agent._collected["baseline"] = baseline
 
-        from minisweagent.run.preprocess_v3.baseline import capture_full_benchmark_stdout
+        if harness_path:
+            baseline: BaselineMetrics = collect_baseline_metrics(
+                Path(harness_path),
+                repeats=repeats,
+                work_dir=resolved_work_dir,
+                gpu_id=resolved_gpu,
+            )
+            agent._collected["baseline"] = baseline
 
-        fb_stdout = capture_full_benchmark_stdout(
-            Path(harness_path),
-            work_dir=resolved_work_dir,
-            gpu_id=resolved_gpu,
-        )
-        if fb_stdout:
-            agent._collected["full_benchmark_stdout"] = fb_stdout
+            from minisweagent.run.preprocess_v3.baseline import capture_full_benchmark_stdout
+
+            fb_stdout = capture_full_benchmark_stdout(
+                Path(harness_path),
+                work_dir=resolved_work_dir,
+                gpu_id=resolved_gpu,
+            )
+            if fb_stdout:
+                agent._collected["full_benchmark_stdout"] = fb_stdout
+        else:
+            from minisweagent.run.preprocess_v3.baseline import collect_baseline_from_eval_command
+
+            baseline = collect_baseline_from_eval_command(
+                eval_command,
+                repeats=repeats,
+                work_dir=resolved_work_dir,
+                gpu_id=resolved_gpu,
+            )
+            agent._collected["baseline"] = baseline
 
         return {
             "ok": baseline.success,
@@ -1410,6 +1447,9 @@ def _make_tool_commandment_from_user_command(
             original_harness_path = None
         if original_harness_path:
             agent._collected["harness_path"] = original_harness_path
+        # Preserve the sanitized command (with real paths) for
+        # collect_baseline before we replace repo_root with ${GEAK_WORK_DIR}.
+        eval_command_for_baseline = cmd
         # Rewrite hardcoded repo-root paths to ${GEAK_WORK_DIR} so the
         # COMMANDMENT references the agent's worktree at runtime.
         # Use the orchestrator's config.repo (available at preprocess time)
@@ -1480,11 +1520,13 @@ def _make_tool_commandment_from_user_command(
         )
         agent._collected["commandment_path"] = str(out_path_obj)
         agent._collected["run_instructions"] = instructions
+        agent._collected["eval_command_for_baseline"] = eval_command_for_baseline
 
         return {
             "ok": True,
             "commandment_path": str(out_path_obj),
             "harness_path": original_harness_path,
+            "eval_command": eval_command_for_baseline,
             "modes_emitted": modes_emitted,
             "warnings": warnings,
             "text_length": len(text),

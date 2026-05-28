@@ -24,7 +24,9 @@ from typing import Any
 
 from minisweagent.run.postprocess.benchmark_parsing import (
     compute_shape_speedups,
+    compute_speedup,
     extract_benchmark_config_lines,
+    extract_benchmark_metric,
     extract_latency_ms,
     parse_shape_count,
     parse_shape_latencies_ms,
@@ -679,19 +681,23 @@ def _compute_verified_speedup(
     measurement get distinct ``failure_reason`` strings, which then flow
     through to ``RoundEvaluation.full_benchmark.failure_reason``.
     """
+    baseline_metric = extract_benchmark_metric(baseline_text)
+    direction = baseline_metric.direction if baseline_metric else "lower_is_better"
+
     candidate_ms = extract_latency_ms(candidate_stdout)
     baseline_ms = extract_latency_ms(baseline_text)
 
     if candidate_ms is None or baseline_ms is None:
         candidate_shapes = parse_shape_latencies_ms(candidate_stdout)
         baseline_shapes = parse_shape_latencies_ms(baseline_text)
-        shape_speedups = compute_shape_speedups(baseline_shapes, candidate_shapes)
+        shape_speedups = compute_shape_speedups(baseline_shapes, candidate_shapes, direction)
         if shape_speedups:
             vals = [s["speedup"] for s in shape_speedups.values()]
             geomean = math.exp(sum(math.log(v) for v in vals) / len(vals))
             round_eval[section_key]["verified_speedup"] = round(geomean, 4)
             round_eval[section_key]["per_shape_speedups"] = shape_speedups
             round_eval[section_key]["speedup_method"] = "per_shape_geomean"
+            round_eval[section_key]["metric_direction"] = direction
             logger.info("  Verified speedup (per-shape geomean): %.4fx (%d shapes)", geomean, len(shape_speedups))
             return
         msg = f"latency parse failed (candidate_ms={candidate_ms}, baseline_ms={baseline_ms})"
@@ -711,10 +717,11 @@ def _compute_verified_speedup(
         round_eval[section_key]["baseline_ms"] = baseline_ms
         return
 
-    verified_speedup = baseline_ms / candidate_ms
+    verified_speedup = compute_speedup(baseline_ms, candidate_ms, direction)
     round_eval[section_key]["verified_speedup"] = round(verified_speedup, 4)
     round_eval[section_key]["candidate_ms"] = candidate_ms
     round_eval[section_key]["baseline_ms"] = baseline_ms
+    round_eval[section_key]["metric_direction"] = direction
     logger.info(f"  Verified speedup: {verified_speedup:.4f}x ({baseline_ms:.4f} ms -> {candidate_ms:.4f} ms)")
 
 
