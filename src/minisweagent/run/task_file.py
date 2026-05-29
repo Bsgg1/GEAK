@@ -185,6 +185,100 @@ def _neutralize_nested_git_repos(root: Path) -> list[Path]:
     return renamed
 
 
+def _demote_submodule_gitlinks(worktree_path: Path, env: dict[str, str] | None = None) -> None:
+    """Remove 160000 gitlink entries from the index and re-add content as regular files.
+
+    After ``_neutralize_nested_git_repos`` renames ``.git`` → ``.git.bak`` on
+    disk, the worktree index still carries the old ``160000`` (gitlink) entries.
+    ``git diff`` silently skips these paths, so agent edits inside former
+    submodule directories are invisible to ``save_and_test``.
+
+    This function:
+    1. Finds all gitlink paths in the index.
+    2. ``git rm --cached`` each one (+ ``.gitmodules`` if present).
+    3. ``git add`` the directories as regular files.
+    4. Commits a baseline so subsequent ``git diff`` only shows agent edits.
+    """
+    log = logging.getLogger(__name__)
+
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--stage"],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+    except subprocess.CalledProcessError:
+        return
+
+    gitlink_paths = []
+    for line in result.stdout.splitlines():
+        if line.startswith("160000 "):
+            # format: "160000 <sha> <stage>\t<path>"
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                gitlink_paths.append(parts[1])
+
+    if not gitlink_paths:
+        return
+
+    log.info("Demoting %d submodule gitlink(s) in worktree index: %s", len(gitlink_paths), gitlink_paths)
+
+    # Remove gitlink entries from the index
+    rm_paths = list(gitlink_paths)
+    gitmodules = worktree_path / ".gitmodules"
+    if gitmodules.exists():
+        rm_paths.append(".gitmodules")
+    subprocess.run(
+        ["git", "rm", "--cached", "-f", "--"] + rm_paths,
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    if gitmodules.exists():
+        gitmodules.unlink(missing_ok=True)
+
+    # Re-add former submodule directories as regular files
+    existing_dirs = [p for p in gitlink_paths if (worktree_path / p).is_dir()]
+    if existing_dirs:
+        subprocess.run(
+            ["git", "add", "--"] + existing_dirs,
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+
+    # Commit baseline so git diff only captures subsequent agent edits
+    subprocess.run(
+        ["git", "add", "-A"],
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c", "user.name=geak",
+            "-c", "user.email=geak@local",
+            "commit", "--allow-empty",
+            "-m", "GEAK worktree baseline (submodules demoted)",
+        ],
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+
 def _resolve_output_root(repo_path: Path, worktree_path: Path) -> Path | None:
     """Return the top-level GEAK output directory inside repo_path, if any.
 
@@ -489,6 +583,7 @@ def create_worktree(repo_path: Path, worktree_path: Path) -> Path:
     # Neutralize .git dirs in copied nested repos so the worktree's git
     # treats their content as regular files (clean diffs, no gitlink noise).
     _neutralize_nested_git_repos(worktree_path)
+    _demote_submodule_gitlinks(worktree_path, git_env)
     return worktree_path
 
 
@@ -576,6 +671,8 @@ def _create_worktree_clean(repo_path: Path, worktree_path: Path) -> Path:
     )
     _ensure_safe_directory(worktree_path, git_env)
     _symlink_gitignored_so_files(repo_path, worktree_path, git_env)
+    _neutralize_nested_git_repos(worktree_path)
+    _demote_submodule_gitlinks(worktree_path, git_env)
     log.info("Clean-HEAD worktree created at %s (no dirty/untracked sync)", worktree_path)
     return worktree_path
 
