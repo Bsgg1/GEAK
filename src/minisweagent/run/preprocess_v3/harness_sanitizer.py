@@ -47,8 +47,7 @@ def sanitize_test_harness(
     out_dir = Path(output_dir)
 
     logger.info(
-        "harness_sanitizer: sending test_command to subagent for analysis "
-        "(repo_root=%s, output_dir=%s)",
+        "harness_sanitizer: sending test_command to subagent for analysis (repo_root=%s, output_dir=%s)",
         repo_root,
         output_dir,
     )

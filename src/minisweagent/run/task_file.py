@@ -266,10 +266,14 @@ def _demote_submodule_gitlinks(worktree_path: Path, env: dict[str, str] | None =
     subprocess.run(
         [
             "git",
-            "-c", "user.name=geak",
-            "-c", "user.email=geak@local",
-            "commit", "--allow-empty",
-            "-m", "GEAK worktree baseline (submodules demoted)",
+            "-c",
+            "user.name=geak",
+            "-c",
+            "user.email=geak@local",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "GEAK worktree baseline (submodules demoted)",
         ],
         cwd=worktree_path,
         capture_output=True,

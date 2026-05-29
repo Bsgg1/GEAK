@@ -1402,9 +1402,7 @@ def _make_tool_commandment_from_user_command(
         cmd = run_command.strip()
         repo_root = str(agent.config.repo) if agent.config.repo else os.environ.get("GEAK_REPO_ROOT", "")
         output_dir_str = (
-            str(agent._extra_template_vars.get("output_dir", ""))
-            if hasattr(agent, "_extra_template_vars")
-            else ""
+            str(agent._extra_template_vars.get("output_dir", "")) if hasattr(agent, "_extra_template_vars") else ""
         )
 
         # Sanitize scripts referenced by the command before rendering

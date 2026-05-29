@@ -368,6 +368,7 @@ class PreprocessSubagent:
             raise _LimitsExceeded(f"cost_limit reached: ${cost:.2f} >= ${self.cost_limit:.2f}")
         if self.wall_timeout > 0 and self._wall_t0 is not None:
             import time
+
             elapsed = time.monotonic() - self._wall_t0
             if elapsed >= self.wall_timeout:
                 raise _LimitsExceeded(f"wall_timeout reached: {elapsed:.0f}s >= {self.wall_timeout:.0f}s")
@@ -507,6 +508,7 @@ class PreprocessSubagent:
         * Other terminating exception types surface as their class name.
         """
         import time
+
         self._state = _SubagentMessageState()
         self._wall_t0 = time.monotonic()
         self.extra_template_vars |= {"task": task, **template_kwargs}

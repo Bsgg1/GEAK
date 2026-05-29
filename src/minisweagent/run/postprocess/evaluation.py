@@ -1147,8 +1147,15 @@ def evaluate_round_best(
 
     try:
         run_correctness_and_benchmark(
-            eval_worktree, eval_env, commandment_path, pp_dir, round_eval, round_num,
-            repo_root=repo_root, harness_path=harness_path, gpu_ids=eval_gpu_ids,
+            eval_worktree,
+            eval_env,
+            commandment_path,
+            pp_dir,
+            round_eval,
+            round_num,
+            repo_root=repo_root,
+            harness_path=harness_path,
+            gpu_ids=eval_gpu_ids,
         )
         run_profile(eval_worktree, eval_env, commandment_path, pp_dir, round_eval, round_num, results_dir)
     finally:

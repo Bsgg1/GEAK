@@ -126,10 +126,7 @@ def _read_commandment_section(commandment_path: str, section: str) -> str | None
 
 def _strip_comment_lines(text: str) -> str:
     """Return *text* with shell comment lines removed (for dedup comparison)."""
-    return "\n".join(
-        line for line in text.splitlines()
-        if not line.lstrip().startswith("#")
-    )
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 
 
 def _commandment_test_command(commandment_path: str) -> str | None:

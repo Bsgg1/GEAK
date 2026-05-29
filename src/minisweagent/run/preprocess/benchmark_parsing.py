@@ -198,11 +198,19 @@ class BenchmarkMetric:
     direction: str  # "lower_is_better" | "higher_is_better"
 
 
-_HIGHER_IS_BETTER_UNITS = frozenset({
-    "gb/s", "tb/s", "mb/s",
-    "tflops", "gflops", "pflops",
-    "items/s", "ops/s", "samples/s",
-})
+_HIGHER_IS_BETTER_UNITS = frozenset(
+    {
+        "gb/s",
+        "tb/s",
+        "mb/s",
+        "tflops",
+        "gflops",
+        "pflops",
+        "items/s",
+        "ops/s",
+        "samples/s",
+    }
+)
 
 _TIME_UNIT_TO_MS: dict[str, float] = {
     "ms": 1.0,
@@ -244,8 +252,10 @@ def extract_benchmark_metric(text: str) -> BenchmarkMetric | None:
         m_unit = re.search(r"GEAK_RESULT_UNIT=(\S+)", text)
         m_dir = re.search(r"GEAK_RESULT_DIRECTION=(lower_is_better|higher_is_better)", text)
         unit = m_unit.group(1) if m_unit else "ms"
-        direction = m_dir.group(1) if m_dir else (
-            "higher_is_better" if unit.lower() in _HIGHER_IS_BETTER_UNITS else "lower_is_better"
+        direction = (
+            m_dir.group(1)
+            if m_dir
+            else ("higher_is_better" if unit.lower() in _HIGHER_IS_BETTER_UNITS else "lower_is_better")
         )
         return BenchmarkMetric(value=value, unit=unit, direction=direction)
 
@@ -433,9 +443,7 @@ def compute_best_patch(patch_dir: Path) -> dict[str, Any] | None:
             best_test_file = str(test_file)
             best_patch_size = psz
             best_candidate_shape_latencies = candidate_shape_latencies
-            best_shape_speedups = compute_shape_speedups(
-                baseline_shape_latencies, candidate_shape_latencies, direction
-            )
+            best_shape_speedups = compute_shape_speedups(baseline_shape_latencies, candidate_shape_latencies, direction)
 
     if best_patch_id is None or best_speedup <= 1.0:
         return None
