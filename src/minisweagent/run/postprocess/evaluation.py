@@ -204,7 +204,7 @@ def build_eval_env(
     work_dir: Path,
     repo_root: str,
     harness_path: str,
-    gpu_ids: "list[int] | int",
+    gpu_ids: list[int] | int,
     *,
     benchmark_iterations: int | None = None,
 ) -> dict[str, str]:
@@ -295,7 +295,7 @@ def resolve_eval_worktree(
     best_patch_file: str,
     harness_path: str,
     output_dir: Path,
-    gpu_ids: "list[int] | int",
+    gpu_ids: list[int] | int,
 ) -> tuple[Path, dict[str, str]]:
     """Create a clean evaluation worktree, apply the patch, build env dict.
 
@@ -315,7 +315,7 @@ def preflight_commandment_contract(
     commandment_path: Path,
     repo_root: str,
     harness_path: str,
-    gpu_ids: "list[int] | int",
+    gpu_ids: list[int] | int,
     *,
     output_dir: Path | None = None,
     timeout_s: int = 600,
@@ -438,7 +438,7 @@ def recapture_commandment_baseline(
     commandment_path: Path,
     repo_root: str,
     harness_path: str,
-    gpu_ids: "list[int] | int",
+    gpu_ids: list[int] | int,
     pp_dir: Path,
     *,
     timeout_s: int = 1200,
@@ -501,7 +501,7 @@ def run_correctness_and_benchmark(
     *,
     repo_root: str | None = None,
     harness_path: str = "",
-    gpu_ids: "list[int] | int | None" = None,
+    gpu_ids: list[int] | int | None = None,
 ) -> None:
     """Run CORRECTNESS then FULL_BENCHMARK, compute verified speedup.
 

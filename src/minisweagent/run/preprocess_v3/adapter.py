@@ -170,7 +170,7 @@ def run_preprocess_v3(
             "v3 preprocess failed: " + ("; ".join(result.errors) if result.errors else "no artefacts produced")
         )
 
-    legacy_ctx = _preprocess_result_to_legacy_context(
+    return _preprocess_result_to_legacy_context(
         result=result,
         repo_root=repo_root,
         output_dir=output_dir,
@@ -180,8 +180,6 @@ def run_preprocess_v3(
         correctness_command=correctness_command,
         performance_command=performance_command,
     )
-
-    return legacy_ctx
 
 
 # ---------------------------------------------------------------------------
