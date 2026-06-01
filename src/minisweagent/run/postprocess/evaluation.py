@@ -404,8 +404,26 @@ def preflight_commandment_contract(
         preflight_dir = (worktree_root / rel).resolve()
         cleanup_root = worktree_root
         cleanup_repo = str(toplevel)
+
+        # The COMMANDMENT references the sanitized harness via
+        # ``${GEAK_WORK_DIR}_logs/...`` (repo_root rewritten to GEAK_WORK_DIR
+        # in tools.py). Per-agent worktrees get a matching ``<worktree>_logs``
+        # sibling, but the bare worktree created here does not — so mirror the
+        # sanitized scripts into ``<preflight_dir>_logs`` so those references
+        # resolve. ``output_dir`` is the original ``<repo_root>_logs`` dir.
+        preflight_logs_dir = Path(str(preflight_dir) + "_logs")
+        try:
+            shutil.copytree(output_dir, preflight_logs_dir, dirs_exist_ok=True)
+        except (OSError, shutil.Error) as exc:
+            logger.warning(
+                "preflight_commandment_contract: could not mirror %s -> %s: %s",
+                output_dir,
+                preflight_logs_dir,
+                exc,
+            )
     else:
         preflight_dir = repo_root_path
+        preflight_logs_dir = None
 
     try:
         env = build_eval_env(preflight_dir, str(repo_root_path), harness_path, gpu_ids)
@@ -471,6 +489,8 @@ def preflight_commandment_contract(
     finally:
         if cleanup_root is not None and cleanup_repo is not None:
             cleanup_eval_worktree(cleanup_repo, cleanup_root)
+            if preflight_logs_dir is not None:
+                shutil.rmtree(preflight_logs_dir, ignore_errors=True)
 
 
 def recapture_commandment_baseline(
