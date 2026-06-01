@@ -94,6 +94,7 @@ Repository = "https://github.com/SWE-agent/mini-SWE-agent"
 [project.scripts]
 geak = "minisweagent.run.mini:app"
 geak-preprocess = "minisweagent.run.preprocess.preprocessor:main"
+geak-gemm-tuning = "minisweagent.run.gemm_tuning:app"
 kernel-profile = "minisweagent.run.preprocess.kernel_profile:main"
 commandment = "minisweagent.run.preprocess.commandment:main"
 validate-commandment = "minisweagent.tools.validate_commandment:main"
@@ -101,7 +102,6 @@ run-harness = "minisweagent.run.preprocess.run_harness:main"
 baseline-metrics = "minisweagent.run.preprocess.baseline:main"
 codebase-context = "minisweagent.run.preprocess.codebase_context:main"
 resolve-kernel-url = "minisweagent.run.preprocess.resolve_kernel_url:main"
-geak-orchestrate = "minisweagent.run.orchestrator:main"
 task-generator = "minisweagent.agents.heterogeneous.task_generator:main"
 
 [tool.setuptools]
@@ -117,6 +117,8 @@ include = ["minisweagent*"]
 [tool.setuptools.package-data]
 minisweagent = [
     "config/**/*",
+    "kernel_languages/**/*",
+    "pipeline_workers/**/*",
     "run/preprocess/config/**/*",
     "tools/*.json",
     "memory/cross_session/*.json",

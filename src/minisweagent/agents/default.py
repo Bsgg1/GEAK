@@ -48,6 +48,8 @@ class AgentConfig:
     metric: str | None = None
     # Strategy manager configuration
     use_strategy_manager: bool = False
+    tool_profile: str = "full"
+    """``ToolRuntime`` profile: ``\"full\"`` or ``\"swe\"`` (see ``tools_runtime``)."""
     strategy_file_path: str = ".optimization_strategies.md"
     profiling_type: str | None = None
     codebase_context: str | None = None
@@ -57,7 +59,7 @@ class AgentConfig:
     disabled_tools: list[str] = field(default_factory=list)
     source_file_paths: list[str] | None = None
     use_skills: bool = False
-    model_config: dict | None = None
+    tool_profile: str = "full"
 
 
 # Unified observation truncation for both bash output and tool call results (head + tail).
@@ -135,6 +137,7 @@ class DefaultAgent:
             else ".optimization_strategies.md",
             on_strategy_change=self._get_strategy_callback(),
             patch_output_dir=self.config.patch_output_dir,
+            tool_profile=self.config.tool_profile,
         )
         if self.config.disabled_tools:
             self.toolruntime.disable_tools(self.config.disabled_tools)
@@ -173,6 +176,13 @@ class DefaultAgent:
             )
         if self.config.codebase_context:
             self.toolruntime.set_codebase_context(self.config.codebase_context)
+        # Keep model tool schemas in sync with this agent's ToolRuntime (dispatch table).
+        if hasattr(self.model, "set_tools"):
+            self.model.set_tools(self.toolruntime.get_tools_list())
+        else:
+            impl = getattr(self.model, "_impl", None)
+            if impl is not None and hasattr(impl, "set_tools"):
+                impl.set_tools(self.toolruntime.get_tools_list())
         self.skillruntime = SkillRuntime()
 
     def _get_strategy_file(self) -> str:
@@ -195,7 +205,18 @@ class DefaultAgent:
         return
 
     def _setup_save_and_test_context(self):
-        """Setup context for save_and_test tool."""
+        """Setup context for save_and_test tool.
+
+        Idempotent and cheap to re-call. The parallel/heterogeneous helpers
+        rely on this: they construct the agent (which calls this for the
+        first time, *before* ``self._registry`` is set), then attach
+        ``agent._registry = registry`` and re-call this to rebuild the
+        ``SaveAndTestContext`` with the registry attached. If you ever add
+        per-agent state to the context that should *not* be reset by the
+        second call (e.g. a counter), gate it on ``self._save_and_test_context
+        is None``; otherwise the implicit "second init wipes the context"
+        coupling will silently regress.
+        """
         from minisweagent.tools.save_and_test import SaveAndTestContext
 
         cwd = getattr(self.env.config, "cwd", None) or os.getcwd()
@@ -217,6 +238,11 @@ class DefaultAgent:
             log_fn=self._log_message,
             patch_counter=self.patch_counter,
             source_file_paths=source_file_paths,
+            # Optional run-level ProcessRegistry. Set as a side-attribute on
+            # the agent by parallel_helpers / parallel_agent / homogeneous_agent
+            # when those wire ``registry`` through. Lets the budget watchdog
+            # SIGTERM/SIGKILL long-running test/benchmark subprocesses.
+            registry=getattr(self, "_registry", None),
         )
 
         save_and_test_tool = self.toolruntime._tool_table.get("save_and_test")
@@ -358,6 +384,15 @@ class DefaultAgent:
             0 < self.config.step_limit <= self.model.n_calls or 0 < self.config.cost_limit <= self.model.cost
         ):
             raise LimitsExceeded()
+
+        # Wall-clock soft-stop poll: if the run-level watchdog has fired,
+        # treat it the same as cost/step limits so the sub-agent stops
+        # spending tokens on new work and returns its last good state via
+        # the existing TerminatingException machinery.
+        _soft_stop = getattr(self, "_soft_stop", None)
+        if _soft_stop is not None and _soft_stop.is_set() and not self._allow_one_summary_step:
+            logger.info("DefaultAgent.query: SoftStop is set; raising LimitsExceeded to terminate this sub-agent")
+            raise LimitsExceeded("wall-clock soft-stop reached")
         if self._allow_one_summary_step:
             self._allow_one_summary_step = False
 

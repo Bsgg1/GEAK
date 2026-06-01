@@ -1,4 +1,6 @@
-"""Base class and shared configuration for AMD LLM models."""
+"""Abstract base for AMD LLM vendor implementations (OpenAI / Claude / Gemini)."""
+
+from __future__ import annotations
 
 import logging
 import os
@@ -6,28 +8,32 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from minisweagent.models import GLOBAL_MODEL_STATS
-from minisweagent.tools.tools_runtime import get_tools_list
 
 logger = logging.getLogger(__name__)
 
-# When ``profiling`` is false, strip both the built-in ``profiling`` tool and the
-# MCP ``profile_kernel`` tool (same pairing as ``mini.py`` / ``disabled_tools``).
-_PROFILING_TOOL_NAMES: frozenset[str] = frozenset({"profiling", "profile_kernel"})
 
+def get_amd_llm_user() -> str:
+    """Resolve the username to attach to AMD LLM gateway requests.
 
-def filter_tools_for_amd_config(
-    tools: list[dict[str, Any]],
-    *,
-    profiling: bool,
-    bash_tool: bool,
-) -> list[dict[str, Any]]:
-    """Drop tools gated by ``AmdLlmModelConfig.profiling`` / ``bash_tool``."""
-    out = tools
-    if not profiling:
-        out = [t for t in out if t.get("name") not in _PROFILING_TOOL_NAMES]
-    if not bash_tool:
-        out = [t for t in out if t.get("name") != "bash"]
-    return out
+    Order of resolution (first non-empty wins):
+      1. ``$GEAK_USER``  -- explicit override knob.
+      2. ``$USER``       -- conventional POSIX env var, forwarded into the
+         container by ``scripts/run-docker.sh``.
+      3. ``os.getlogin()`` -- bare-metal fallback when no env vars are set.
+      4. ``"unknown"``   -- last-resort sentinel.
+
+    Env-var lookups are checked before ``os.getlogin()`` because the latter
+    raises ``OSError`` under ``docker exec`` (no controlling utmp entry), so
+    it cannot be relied on inside the GEAK container.
+    """
+    for var in ("GEAK_USER", "USER"):
+        val = os.getenv(var)
+        if val:
+            return val
+    try:
+        return os.getlogin()
+    except OSError:
+        return "unknown"
 
 
 @dataclass
@@ -42,9 +48,6 @@ class AmdLlmModelConfig:
     set_cache_control: Literal["default_end"] | None = "default_end"
     tool_cache_control: bool = False
     reasoning: dict[str, Any] = field(default_factory=dict)
-    bash_tool: bool = True
-    profiling: bool = False
-    use_strategy_manager: bool = False
 
 
 class AmdLlmModelBase:
@@ -52,8 +55,8 @@ class AmdLlmModelBase:
 
     Subclasses must override:
         - ``_init_client``  – set up the vendor SDK client
-        - ``_query_api``    – send the request and return the raw response
-        - ``_parse_response`` – convert the raw response to a standard dict
+        - ``_query_api``    – send the query and return the raw vendor response
+        - ``_parse_response`` – convert the raw vendor response into a standard dict
         - ``format_messages`` – convert standard messages to vendor format
 
     The standard **response dict** returned by ``query`` has the shape::
@@ -81,11 +84,7 @@ class AmdLlmModelBase:
         self.config = config
         self.cost = 0.0
         self.n_calls = 0
-        self.tools = filter_tools_for_amd_config(
-            get_tools_list(use_strategy_manager=self.config.use_strategy_manager),
-            profiling=self.config.profiling,
-            bash_tool=self.config.bash_tool,
-        )
+        self.tools: list[dict[str, Any]] = []
         self._init_client()
 
     # ------------------------------------------------------------------
@@ -93,21 +92,24 @@ class AmdLlmModelBase:
     # ------------------------------------------------------------------
 
     def _get_api_key(self) -> str:
-        api_key = self.config.api_key or os.getenv("AMD_LLM_API_KEY") or os.getenv("LLM_GATEWAY_KEY")
+        api_key = (
+            self.config.api_key
+            or self.config.model_kwargs.get("api_key")
+            or os.getenv("AMD_LLM_API_KEY")
+            or os.getenv("LLM_GATEWAY_KEY")
+        )
         if not api_key:
             raise ValueError(
                 "API key not provided. Please set it via:\n"
                 "  1. VSCode settings (mini-swe-agent.apiKey), or\n"
-                "  2. Environment variable AMD_LLM_API_KEY, or\n"
-                "  3. Environment variable LLM_GATEWAY_KEY"
+                "  2. model_kwargs.api_key in the task config, or\n"
+                "  3. Environment variable AMD_LLM_API_KEY, or\n"
+                "  4. Environment variable LLM_GATEWAY_KEY"
             )
         return api_key
 
     def _get_user(self) -> str:
-        try:
-            return os.getlogin()
-        except OSError:
-            return os.getenv("USER", "unknown")
+        return get_amd_llm_user()
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -175,12 +177,7 @@ class AmdLlmModelBase:
         return content
 
     def set_tools(self, tools: list[dict[str, Any]]) -> None:
-        """Replace the active tool schema (used by strategy / heterogeneous agents)."""
-        self.tools = filter_tools_for_amd_config(
-            tools,
-            profiling=self.config.profiling,
-            bash_tool=self.config.bash_tool,
-        )
+        self.tools = list(tools)
 
     def get_template_vars(self):
         return asdict(self.config) | {"n_model_calls": self.n_calls, "model_cost": self.cost}

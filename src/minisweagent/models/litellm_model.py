@@ -25,9 +25,8 @@ from tenacity import (
 )
 
 from minisweagent.models import GLOBAL_MODEL_STATS
-from minisweagent.models.amd_base import AmdLlmModelConfig, filter_tools_for_amd_config
+from minisweagent.models.amd_base import AmdLlmModelConfig, get_amd_llm_user
 from minisweagent.models.utils.cache_control import set_cache_control
-from minisweagent.tools.tools_runtime import get_tools_list
 
 # ---------------------------------------------------------------------------
 # Logging — ``getLogger(...).setLevel()`` returns None; keep a real Logger.
@@ -37,6 +36,28 @@ logger = logging.getLogger("LiteLLM")
 logger.setLevel(logging.WARNING)
 
 CACHE_CONTROL_EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
+
+# AMD LLM gateway hostname prefixes.  The ``"user"`` request header is only
+# meaningful (and only consumed for request attribution) when the call is
+# routed through one of these gateways; attaching the local OS username to
+# arbitrary third-party providers (e.g. OpenAI direct, Anthropic direct) would
+# leak the operator's identity over the wire for no benefit.
+_AMD_LLM_GATEWAY_API_BASE_PREFIXES: tuple[str, ...] = (
+    "https://llm-api.amd.com/",
+    "https://llm-gateway-dev.apps.amdcloud.com/",
+)
+
+
+def _is_amd_llm_gateway_api_base(api_base: Any) -> bool:
+    """Return True if *api_base* points at an AMD LLM gateway endpoint.
+
+    Used by :class:`LitellmModel` to gate the ``"user"`` request header so
+    only gateway-routed traffic carries the operator identity.
+    """
+    if not isinstance(api_base, str) or not api_base:
+        return False
+    return any(api_base.startswith(p) for p in _AMD_LLM_GATEWAY_API_BASE_PREFIXES)
+
 
 # Parameters forwarded to ``litellm.completion`` (extend when providers add flags).
 LITELLM_COMPLETION_PARAM_KEYS: frozenset[str] = frozenset(
@@ -59,6 +80,7 @@ LITELLM_COMPLETION_PARAM_KEYS: frozenset[str] = frozenset(
         "reasoning",
         # Anthropic extended thinking (e.g. {"type": "enabled", "budget_tokens": 10000}).
         "thinking",
+        "text",
     }
 )
 
@@ -82,7 +104,7 @@ def convert_openai_tools_to_litellm(
         function: dict[str, Any] = {
             "name": name,
             "description": func.get("description", ""),
-            "input_schema": func.get(
+            "parameters": func.get(
                 "parameters",
                 {
                     "type": "object",
@@ -207,15 +229,6 @@ def _register_litellm_registry(path: Path | str | None) -> None:
         litellm.utils.register_model(json.loads(p.read_text(encoding="utf-8")))
 
 
-def _filter_default_tools(
-    tools: list[dict[str, Any]],
-    *,
-    profiling: bool,
-    bash_tool: bool,
-) -> list[dict[str, Any]]:
-    return filter_tools_for_amd_config(tools, profiling=profiling, bash_tool=bash_tool)
-
-
 @dataclass
 class LitellmModelConfig(AmdLlmModelConfig):
     """Configuration for :class:`NewLitellmModel`."""
@@ -265,21 +278,19 @@ class LitellmModel:
         _normalize_api_base_from_kwargs(kwargs)
 
         self.config = LitellmModelConfig(**kwargs)
-        self.tools = get_tools_list(use_strategy_manager=self.config.use_strategy_manager)
-        self.tools = _filter_default_tools(
-            self.tools,
-            profiling=self.config.profiling,
-            bash_tool=self.config.bash_tool,
-        )
+        # Populated by :meth:`set_tools`; :class:`~minisweagent.agents.default.DefaultAgent`
+        # passes ``toolruntime.get_tools_list()`` after constructing :class:`~minisweagent.tools.tools_runtime.ToolRuntime`.
+        self.tools: list[dict[str, Any]] = []
         _register_litellm_registry(self.config.litellm_model_registry)
 
     def set_tools(self, tools: list[dict[str, Any]]) -> None:
-        """Replace the active tool schema (used by strategy / heterogeneous agents)."""
-        self.tools = _filter_default_tools(
-            tools,
-            profiling=self.config.profiling,
-            bash_tool=self.config.bash_tool,
-        )
+        """Replace the active OpenAI-style tool definitions (no model-side filtering).
+
+        Use the same list as :meth:`ToolRuntime.get_tools_list
+        <minisweagent.tools.tools_runtime.ToolRuntime.get_tools_list>` from the
+        agent's runtime so tool names match :meth:`ToolRuntime.dispatch`.
+        """
+        self.tools = list(tools)
 
     @retry(
         stop=stop_after_attempt(int(os.getenv("MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT", "10"))),
@@ -303,6 +314,20 @@ class LitellmModel:
             self.tools,
             tool_cache_control=self.config.tool_cache_control,
         )
+        existing_headers = filtered.get("extra_headers") or {}
+        if existing_headers.get("user"):
+            # Caller-provided override wins regardless of provider — keep as-is.
+            filtered["extra_headers"] = dict(existing_headers)
+        elif _is_amd_llm_gateway_api_base(filtered.get("api_base")):
+            filtered["extra_headers"] = {
+                **existing_headers,
+                "user": get_amd_llm_user(),
+            }
+        else:
+            # Non-AMD-gateway provider: do NOT attach the local OS username
+            # as a request header. Preserve any other caller-supplied
+            # ``extra_headers`` verbatim.
+            filtered["extra_headers"] = dict(existing_headers)
         try:
             return litellm.completion(
                 model=self.config.model_name,
@@ -319,9 +344,9 @@ class LitellmModel:
             raise
 
     def query(self, messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
-        messages = normalize_messages_for_litellm_api(messages)
         if self.config.set_cache_control:
             messages = set_cache_control(messages, mode=self.config.set_cache_control)
+        messages = normalize_messages_for_litellm_api(messages)
 
         response = self._query(messages, **kwargs)
 
@@ -368,6 +393,8 @@ class LitellmModel:
 
 if __name__ == "__main__":
     # Quick smoke test
+    from minisweagent.tools.tools_runtime import ToolRuntime
+
     model_configs = [
         {
             "model_name": "openai/gpt-5",
@@ -402,5 +429,6 @@ if __name__ == "__main__":
     ]
     for model_config in model_configs:
         model = LitellmModel(**model_config)
+        model.set_tools(ToolRuntime.fetch_tools_list())
         response = model.query(messages)
         print(response)

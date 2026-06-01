@@ -14,16 +14,20 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
 from minisweagent.run.postprocess.benchmark_parsing import (
+    compute_shape_speedups,
     extract_benchmark_config_lines,
     extract_latency_ms,
     parse_shape_count,
+    parse_shape_latencies_ms,
     parse_total_kernel_time_ms,
 )
 from minisweagent.run.utils.generated_artifacts import (
@@ -38,6 +42,61 @@ class PatchApplyError(Exception):
     """Raised when a patch fails to apply to the evaluation worktree."""
 
     pass
+
+
+class CommandmentExecutionError(RuntimeError):
+    """Raised when a COMMANDMENT subprocess fails for a non-kernel-logic reason.
+
+    This signals that the evaluation contract itself is broken (e.g. the
+    harness rejects `--iterations`, a wrapper script is missing, the script
+    crashes before kernel logic runs, or the subprocess raises before
+    completion). The orchestrator treats this as a hard failure and aborts
+    the run rather than silently continuing with no validated speedup.
+
+    Distinguished from kernel-level correctness failures, which remain
+    recoverable per-round events (status="correctness_failed").
+    """
+
+    def __init__(self, section: str, returncode: int | None, detail: str) -> None:
+        self.section = section
+        self.returncode = returncode
+        self.detail = detail
+        super().__init__(f"COMMANDMENT {section} failed (rc={returncode}): {detail}")
+
+
+# Stderr signatures that indicate the harness/commandment itself is broken,
+# not the kernel under optimization. When any of these match a non-zero
+# subprocess exit, we raise CommandmentExecutionError instead of treating
+# the failure as a recoverable kernel-correctness miss.
+_CONTRACT_BROKEN_PATTERNS: tuple[str, ...] = (
+    "unrecognized arguments",
+    "the following arguments are required",
+    "argument --",
+    "Harness file not found",
+    "No such file or directory",
+    "ModuleNotFoundError",
+    "ImportError",
+    "command not found",
+    "Permission denied",
+    "Errno 2",
+)
+
+
+def _stderr_indicates_broken_contract(stderr: str) -> str | None:
+    """Return the first contract-broken signature found in *stderr*, or None."""
+    if not stderr:
+        return None
+    for pattern in _CONTRACT_BROKEN_PATTERNS:
+        if pattern in stderr:
+            return pattern
+    return None
+
+
+def _format_stderr_tail(stderr: str, *, max_lines: int = 20) -> str:
+    """Return the last *max_lines* of *stderr*, joined for log inclusion."""
+    if not stderr:
+        return ""
+    return "\n".join(stderr.strip().splitlines()[-max_lines:])
 
 
 def setup_eval_worktree(repo_root: str, patch_file: str, output_dir: Path) -> Path:
@@ -60,24 +119,17 @@ def setup_eval_worktree(repo_root: str, patch_file: str, output_dir: Path) -> Pa
         raise PatchApplyError(f"Patch file is empty: {patch_file}")
 
     eval_dir = (output_dir / "_eval_worktree").resolve()
-    if eval_dir.exists():
-        logger.warning("Removing existing evaluation worktree: %s", eval_dir)
-        shutil.rmtree(eval_dir, ignore_errors=True)
-
     repo = Path(repo_root).resolve()
     is_git = (repo / ".git").exists()
 
-    git_env = get_git_safe_env(output_dir)
     if is_git:
-        subprocess.run(
-            ["git", "worktree", "add", "--detach", str(eval_dir)],
-            cwd=str(repo),
-            capture_output=True,
-            text=True,
-            check=True,
-            env=git_env,
-        )
+        from minisweagent.run.task_file import create_worktree
+
+        create_worktree(repo, eval_dir)
     else:
+        if eval_dir.exists():
+            shutil.rmtree(eval_dir, ignore_errors=True)
+        git_env = get_git_safe_env(output_dir)
         shutil.copytree(str(repo), str(eval_dir), dirs_exist_ok=True)
         subprocess.run(["git", "init"], cwd=str(eval_dir), capture_output=True, text=True, check=True, env=git_env)
         subprocess.run(["git", "add", "."], cwd=str(eval_dir), capture_output=True, text=True, check=True, env=git_env)
@@ -91,6 +143,7 @@ def setup_eval_worktree(repo_root: str, patch_file: str, output_dir: Path) -> Pa
         )
         logger.warning("Initialised temporary git repo in non-git eval worktree: %s", eval_dir)
 
+    git_env = get_git_safe_env(output_dir)
     patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
     # errors="replace" is the Unicode error handling mode for str.decode()
 
@@ -160,6 +213,7 @@ def build_eval_env(
     the shared ``DEFAULT_EVAL_BENCHMARK_ITERATIONS`` is used.
     """
     from minisweagent.run.pipeline_helpers import DEFAULT_EVAL_BENCHMARK_ITERATIONS
+    from minisweagent.run.preprocess.harness_utils import harness_supports_iterations
 
     iters = benchmark_iterations or DEFAULT_EVAL_BENCHMARK_ITERATIONS
     env = os.environ.copy()
@@ -168,7 +222,19 @@ def build_eval_env(
     env["GEAK_HARNESS"] = harness_path
     env["GEAK_GPU_DEVICE"] = str(gpu_id)
     env["HIP_VISIBLE_DEVICES"] = str(gpu_id)
-    env["GEAK_BENCHMARK_EXTRA_ARGS"] = f"--iterations {iters}"
+    env["GEAK_BENCHMARK_ITERATIONS"] = str(iters)
+    if harness_supports_iterations(harness_path):
+        env["GEAK_BENCHMARK_EXTRA_ARGS"] = f"--iterations {iters}"
+    else:
+        # Harness doesn't declare ``--iterations``; passing it on the CLI
+        # would crash argparse with "unrecognized arguments". The harness
+        # can still honour the iteration count by reading the
+        # ``GEAK_BENCHMARK_ITERATIONS`` env var we set above.
+        logger.debug(
+            "build_eval_env: harness %s does not declare --iterations; relying on GEAK_BENCHMARK_ITERATIONS=%s only",
+            harness_path,
+            iters,
+        )
     pp_parts = [str(work_dir), repo_root]
     if "/tests/" in harness_path:
         try:
@@ -235,6 +301,186 @@ def resolve_eval_worktree(
     return eval_worktree, eval_env
 
 
+def preflight_commandment_contract(
+    commandment_path: Path,
+    repo_root: str,
+    harness_path: str,
+    gpu_id: int,
+    *,
+    output_dir: Path | None = None,
+    timeout_s: int = 600,
+) -> None:
+    """Smoke-test SETUP + CORRECTNESS once before fanning out sub-agents.
+
+    Runs the COMMANDMENT against the *unpatched* repo with
+    ``--iterations 1`` so a broken contract (e.g. a harness that rejects
+    ``--iterations``) is surfaced as a single ``CommandmentExecutionError``
+    instead of being burned into every sub-agent's iteration loop.
+
+    For git repos, the smoke test runs in a temporary worktree so that
+    side effects (``run.sh``, JIT caches) never dirty the original repo.
+
+    Skipped silently when ``GEAK_SKIP_COMMANDMENT_PREFLIGHT=1`` is set.
+
+    Raises
+    ------
+    CommandmentExecutionError
+        If the SETUP+CORRECTNESS script can't run, returns non-zero, or
+        prints a stderr matching the contract-broken signature set.
+    """
+    if os.environ.get("GEAK_SKIP_COMMANDMENT_PREFLIGHT", "").strip() == "1":
+        logger.info("preflight_commandment_contract: skipped (GEAK_SKIP_COMMANDMENT_PREFLIGHT=1)")
+        return
+
+    if not commandment_path.exists():
+        raise CommandmentExecutionError("PREFLIGHT", None, f"COMMANDMENT.md not found at {commandment_path}")
+
+    script = build_eval_script(str(commandment_path), ["SETUP", "CORRECTNESS"])
+    if not script:
+        logger.warning(
+            "preflight_commandment_contract: no SETUP/CORRECTNESS commands in %s; skipping",
+            commandment_path,
+        )
+        return
+
+    from minisweagent.run.preprocess.harness_utils import harness_supports_iterations
+
+    repo_root_path = Path(repo_root).resolve()
+    is_git = (repo_root_path / ".git").exists()
+
+    # For git repos, run in a temporary worktree so side effects (run.sh,
+    # JIT caches, profile artifacts) never dirty the original repo.
+    if is_git and output_dir is not None:
+        from minisweagent.run.task_file import create_worktree
+
+        preflight_dir = (Path(output_dir) / "_preflight_worktree").resolve()
+        create_worktree(repo_root_path, preflight_dir)
+    else:
+        preflight_dir = repo_root_path
+
+    try:
+        env = build_eval_env(preflight_dir, str(repo_root_path), harness_path, gpu_id)
+        env["GEAK_BENCHMARK_ITERATIONS"] = "1"
+        if harness_supports_iterations(harness_path):
+            env["GEAK_BENCHMARK_EXTRA_ARGS"] = "--iterations 1"
+        else:
+            env.pop("GEAK_BENCHMARK_EXTRA_ARGS", None)
+
+        logger.info(
+            "preflight_commandment_contract: smoke-testing COMMANDMENT against %s with iterations=1",
+            preflight_dir,
+        )
+        max_attempts = 3
+        last_result = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = subprocess.run(
+                    ["bash", script],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                    cwd=str(preflight_dir),
+                    env=env,
+                )
+            except Exception as exc:
+                raise CommandmentExecutionError(
+                    "PREFLIGHT", None, f"SETUP+CORRECTNESS subprocess failed to complete: {exc}"
+                ) from exc
+
+            if result.returncode == 0:
+                logger.info(
+                    "preflight_commandment_contract: PASS (attempt %d/%d)",
+                    attempt,
+                    max_attempts,
+                )
+                return
+
+            last_result = result
+            if attempt < max_attempts:
+                logger.warning(
+                    "preflight_commandment_contract: FAIL on attempt %d/%d (rc=%d), retrying in 5s...",
+                    attempt,
+                    max_attempts,
+                    result.returncode,
+                )
+                time.sleep(5)
+
+        stderr_tail = _format_stderr_tail(last_result.stderr)
+        broken = _stderr_indicates_broken_contract(last_result.stderr)
+        detail = (
+            f"contract-broken signature {broken!r}; stderr tail:\n{stderr_tail}"
+            if broken is not None
+            else f"non-zero exit after {max_attempts} attempts; stderr tail:\n{stderr_tail}"
+        )
+        logger.error(
+            "preflight_commandment_contract: FAILED after %d attempts (rc=%d):\n%s",
+            max_attempts,
+            last_result.returncode,
+            stderr_tail,
+        )
+        raise CommandmentExecutionError("PREFLIGHT", last_result.returncode, detail)
+    finally:
+        if preflight_dir != repo_root_path:
+            cleanup_eval_worktree(repo_root, preflight_dir)
+
+
+def recapture_commandment_baseline(
+    commandment_path: Path,
+    repo_root: str,
+    harness_path: str,
+    gpu_id: int,
+    pp_dir: Path,
+    *,
+    timeout_s: int = 1200,
+) -> bool:
+    """Re-capture baseline using COMMANDMENT sections for format parity.
+
+    Runs SETUP + FULL_BENCHMARK on the *unpatched* repo so the baseline
+    output format exactly matches what ``run_correctness_and_benchmark``
+    will produce for candidates.  Falls back to BENCHMARK if
+    FULL_BENCHMARK is absent.  Overwrites the preprocessed baseline files
+    only on success; returns True if baseline was recaptured.
+    """
+    repo_root_path = Path(repo_root).resolve()
+    env = build_eval_env(repo_root_path, repo_root, harness_path, gpu_id)
+
+    for section_name in ["FULL_BENCHMARK", "BENCHMARK"]:
+        script = build_eval_script(str(commandment_path), ["SETUP", section_name])
+        if not script:
+            continue
+        logger.info(
+            "recapture_commandment_baseline: running SETUP+%s on %s",
+            section_name,
+            repo_root_path,
+        )
+        try:
+            result = subprocess.run(
+                ["bash", script],
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                cwd=str(repo_root_path),
+                env=env,
+            )
+        except Exception as exc:
+            logger.warning("recapture_commandment_baseline: %s failed: %s", section_name, exc)
+            continue
+        if result.returncode != 0:
+            logger.warning("recapture_commandment_baseline: %s exited %d", section_name, result.returncode)
+            continue
+        stdout = result.stdout.strip()
+        if not stdout:
+            logger.warning("recapture_commandment_baseline: %s produced empty stdout", section_name)
+            continue
+        (pp_dir / "full_benchmark_baseline.txt").write_text(stdout)
+        (pp_dir / "benchmark_baseline.txt").write_text(stdout)
+        logger.info("recapture_commandment_baseline: recaptured (%d bytes)", len(stdout))
+        return True
+
+    logger.info("recapture_commandment_baseline: no benchmark section found; keeping preprocessed baseline")
+    return False
+
+
 def run_correctness_and_benchmark(
     eval_worktree: Path,
     eval_env: dict[str, str],
@@ -249,7 +495,10 @@ def run_correctness_and_benchmark(
     If correctness fails, the benchmark is skipped.
     Falls back to BENCHMARK if FULL_BENCHMARK baseline is not found.
     """
+    from minisweagent.run.dispatch import _read_commandment_section
+
     correctness_script = build_eval_script(str(commandment_path), ["SETUP", "CORRECTNESS"])
+    _correctness_stdout = None
     if correctness_script:
         logger.info("Running CORRECTNESS on best kernel from round %d...", round_num)
         try:
@@ -262,16 +511,32 @@ def run_correctness_and_benchmark(
                 env=eval_env,
             )
         except Exception as exc:
-            logger.warning("CORRECTNESS execution failed: %s", exc)
+            # The subprocess could not complete (timeout, OS error, etc.).
+            # This is a contract-level failure; record it on round_eval for
+            # any callers that catch the exception, then escalate.
             round_eval["correctness"] = {"error": str(exc)}
-            round_eval["status"] = "correctness_failed"
-            return
+            round_eval["status"] = "commandment_execution_failed"
+            raise CommandmentExecutionError("CORRECTNESS", None, f"subprocess failed to complete: {exc}") from exc
 
         round_eval["correctness"] = {
             "returncode": correctness_result.returncode,
             "success": correctness_result.returncode == 0,
         }
         if correctness_result.returncode != 0:
+            stderr_tail = _format_stderr_tail(correctness_result.stderr)
+            broken = _stderr_indicates_broken_contract(correctness_result.stderr)
+            if broken is not None:
+                round_eval["status"] = "commandment_execution_failed"
+                logger.error(
+                    "CORRECTNESS failed because the COMMANDMENT contract is broken (matched %r):\n%s",
+                    broken,
+                    stderr_tail,
+                )
+                raise CommandmentExecutionError(
+                    "CORRECTNESS",
+                    correctness_result.returncode,
+                    f"contract-broken signature {broken!r}; stderr tail:\n{stderr_tail}",
+                )
             logger.warning(
                 "CORRECTNESS failed (rc=%d): %s",
                 correctness_result.returncode,
@@ -280,6 +545,7 @@ def run_correctness_and_benchmark(
             round_eval["status"] = "correctness_failed"
             return
         logger.info("CORRECTNESS: PASS")
+        _correctness_stdout = correctness_result.stdout
     else:
         logger.warning("No CORRECTNESS commands found in COMMANDMENT")
 
@@ -294,36 +560,67 @@ def run_correctness_and_benchmark(
         baseline_text = baseline_path.read_text().strip()
         logger.info("%s baseline found: %s", section_key, baseline_path)
 
-        benchmark_script = build_eval_script(str(commandment_path), ["SETUP", baseline_section_name])
-        if not benchmark_script:
-            logger.warning("No %s commands found in COMMANDMENT", baseline_section_name)
-            continue
-
-        logger.info("Running %s on best kernel from round %d...", section_key, round_num)
-        try:
-            candidate_result = subprocess.run(
-                ["bash", benchmark_script],
-                capture_output=True,
-                text=True,
-                timeout=1800,
-                cwd=str(eval_worktree),
-                env=eval_env,
+        # Path-A dedup: reuse CORRECTNESS output when sections are identical
+        _corr_body = (
+            _read_commandment_section(str(commandment_path), "CORRECTNESS") if _correctness_stdout is not None else None
+        )
+        _bench_body = _read_commandment_section(str(commandment_path), baseline_section_name)
+        if _corr_body and _bench_body and _corr_body.strip() == _bench_body.strip():
+            logger.info(
+                "%s section identical to CORRECTNESS; reusing output (Path-A dedup)",
+                baseline_section_name,
             )
-        except Exception as exc:
-            logger.warning("%s execution failed: %s", section_key, exc)
-            round_eval[section_key] = {"error": str(exc)}
-            continue
+            candidate_stdout = _correctness_stdout
+        else:
+            benchmark_script = build_eval_script(str(commandment_path), ["SETUP", baseline_section_name])
+            if not benchmark_script:
+                logger.warning("No %s commands found in COMMANDMENT", baseline_section_name)
+                continue
 
-        if candidate_result.returncode != 0:
-            logger.warning("%s execution failed: %s", baseline_section_name, candidate_result.stderr)
-            round_eval[section_key] = {"error": candidate_result.stderr}
-            continue
+            logger.info("Running %s on best kernel from round %d...", section_key, round_num)
+            try:
+                candidate_result = subprocess.run(
+                    ["bash", benchmark_script],
+                    capture_output=True,
+                    text=True,
+                    timeout=1800,
+                    cwd=str(eval_worktree),
+                    env=eval_env,
+                )
+            except Exception as exc:
+                round_eval[section_key] = {"error": str(exc)}
+                round_eval["status"] = "commandment_execution_failed"
+                raise CommandmentExecutionError(
+                    baseline_section_name, None, f"subprocess failed to complete: {exc}"
+                ) from exc
 
-        candidate_stdout = candidate_result.stdout
+            if candidate_result.returncode != 0:
+                stderr_tail = _format_stderr_tail(candidate_result.stderr)
+                round_eval[section_key] = {
+                    "error": candidate_result.stderr,
+                    "returncode": candidate_result.returncode,
+                }
+                round_eval["status"] = "commandment_execution_failed"
+                broken = _stderr_indicates_broken_contract(candidate_result.stderr)
+                detail = (
+                    f"contract-broken signature {broken!r}; stderr tail:\n{stderr_tail}"
+                    if broken is not None
+                    else f"non-zero exit; stderr tail:\n{stderr_tail}"
+                )
+                logger.error(
+                    "%s execution failed (rc=%d) -- treating as COMMANDMENT failure:\n%s",
+                    baseline_section_name,
+                    candidate_result.returncode,
+                    stderr_tail,
+                )
+                raise CommandmentExecutionError(baseline_section_name, candidate_result.returncode, detail)
+
+            candidate_stdout = candidate_result.stdout
+
         round_eval[section_key] = {
             "stdout": candidate_stdout,
-            "returncode": candidate_result.returncode,
-            "success": candidate_result.returncode == 0,
+            "returncode": 0,
+            "success": True,
             "baseline": baseline_text,
         }
 
@@ -345,12 +642,45 @@ def _compute_verified_speedup(
     round_eval: dict[str, Any],
     section_key: str,
 ) -> None:
-    """Compute verified speedup from latency measurements."""
+    """Compute verified speedup from latency measurements.
+
+    Falsy-check pitfall: ``not candidate_ms`` collapses ``0.0`` and ``None``,
+    so a real ``0.0`` candidate latency (e.g. divide-by-zero shortcut, broken
+    benchmark loop) used to silently look identical to "couldn't parse". Use
+    explicit ``is None`` / ``<= 0`` so an unparseable result and a degenerate
+    measurement get distinct ``failure_reason`` strings, which then flow
+    through to ``RoundEvaluation.full_benchmark.failure_reason``.
+    """
     candidate_ms = extract_latency_ms(candidate_stdout)
     baseline_ms = extract_latency_ms(baseline_text)
 
-    if not candidate_ms or not baseline_ms or baseline_ms <= 0:
-        logger.warning("Could not extract latency: candidate_ms=%s, baseline_ms=%s", candidate_ms, baseline_ms)
+    if candidate_ms is None or baseline_ms is None:
+        candidate_shapes = parse_shape_latencies_ms(candidate_stdout)
+        baseline_shapes = parse_shape_latencies_ms(baseline_text)
+        shape_speedups = compute_shape_speedups(baseline_shapes, candidate_shapes)
+        if shape_speedups:
+            vals = [s["speedup"] for s in shape_speedups.values()]
+            geomean = math.exp(sum(math.log(v) for v in vals) / len(vals))
+            round_eval[section_key]["verified_speedup"] = round(geomean, 4)
+            round_eval[section_key]["per_shape_speedups"] = shape_speedups
+            round_eval[section_key]["speedup_method"] = "per_shape_geomean"
+            logger.info("  Verified speedup (per-shape geomean): %.4fx (%d shapes)", geomean, len(shape_speedups))
+            return
+        msg = f"latency parse failed (candidate_ms={candidate_ms}, baseline_ms={baseline_ms})"
+        logger.warning("Could not extract latency: %s", msg)
+        round_eval[section_key]["failure_reason"] = msg
+        return
+    if baseline_ms <= 0:
+        msg = f"baseline latency non-positive (baseline_ms={baseline_ms})"
+        logger.warning("%s", msg)
+        round_eval[section_key]["failure_reason"] = msg
+        return
+    if candidate_ms <= 0:
+        msg = f"candidate latency non-positive (candidate_ms={candidate_ms}); rejecting as broken measurement"
+        logger.warning("%s", msg)
+        round_eval[section_key]["failure_reason"] = msg
+        round_eval[section_key]["candidate_ms"] = candidate_ms
+        round_eval[section_key]["baseline_ms"] = baseline_ms
         return
 
     verified_speedup = baseline_ms / candidate_ms
@@ -414,6 +744,16 @@ def run_profile(
     and builds a comparison against ``baseline_metrics.json``.
     Mutates ``round_eval["profile_comparison"]`` in place.
     """
+    # Path-A dedup: skip PROFILE if identical to CORRECTNESS (opaque commands
+    # won't produce profile.json anyway)
+    from minisweagent.run.dispatch import _read_commandment_section
+
+    _profile_body = _read_commandment_section(str(commandment_path), "PROFILE")
+    _corr_body = _read_commandment_section(str(commandment_path), "CORRECTNESS")
+    if _profile_body and _corr_body and _profile_body.strip() == _corr_body.strip():
+        logger.info("PROFILE section identical to CORRECTNESS; skipping redundant run (Path-A dedup)")
+        return
+
     profile_script = build_eval_script(str(commandment_path), ["SETUP", "PROFILE"])
     if not profile_script:
         logger.warning("No PROFILE commands found in COMMANDMENT")
@@ -421,7 +761,7 @@ def run_profile(
 
     logger.info("Running PROFILE on best kernel from round %d...", round_num)
     try:
-        subprocess.run(
+        profile_result = subprocess.run(
             ["bash", profile_script],
             capture_output=True,
             text=True,
@@ -430,9 +770,29 @@ def run_profile(
             env=eval_env,
         )
     except Exception as exc:
-        logger.warning("PROFILE execution failed: %s", exc)
         round_eval["profile_comparison"] = {"error": str(exc)}
-        return
+        round_eval["status"] = "commandment_execution_failed"
+        raise CommandmentExecutionError("PROFILE", None, f"subprocess failed to complete: {exc}") from exc
+
+    if profile_result.returncode != 0:
+        stderr_tail = _format_stderr_tail(profile_result.stderr)
+        round_eval["profile_comparison"] = {
+            "error": profile_result.stderr,
+            "returncode": profile_result.returncode,
+        }
+        round_eval["status"] = "commandment_execution_failed"
+        broken = _stderr_indicates_broken_contract(profile_result.stderr)
+        detail = (
+            f"contract-broken signature {broken!r}; stderr tail:\n{stderr_tail}"
+            if broken is not None
+            else f"non-zero exit; stderr tail:\n{stderr_tail}"
+        )
+        logger.error(
+            "PROFILE execution failed (rc=%d) -- treating as COMMANDMENT failure:\n%s",
+            profile_result.returncode,
+            stderr_tail,
+        )
+        raise CommandmentExecutionError("PROFILE", profile_result.returncode, detail)
 
     profile_output = eval_worktree / "profile.json"
     if not profile_output.exists():
@@ -448,6 +808,14 @@ def run_profile(
         profile_result = json.loads(dest.read_text())
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Failed to parse profile output: %s", exc)
+        return
+
+    if not profile_result.get("success", True):
+        logger.warning(
+            "Profiler reported failure for round %d — skipping profile comparison: %s",
+            round_num,
+            profile_result.get("error", "unknown error"),
+        )
         return
 
     baseline_metrics_path = pp_dir / "baseline_metrics.json"
@@ -515,6 +883,12 @@ def write_eval_results(
             failure = f"config mismatch: {fb_raw.get('config_mismatch_detail', '')}"
         elif not fb_raw.get("success", True) and fb_raw.get("returncode", 0) != 0:
             failure = f"benchmark failed (exit code {fb_raw.get('returncode')})"
+        elif fb_raw.get("failure_reason"):
+            # Set by ``_compute_verified_speedup`` when latency parsing failed
+            # despite a clean exit; without this propagation a return-code-0
+            # benchmark with unparseable output looked like "everything passed
+            # but no verified speedup" with no diagnostic.
+            failure = str(fb_raw["failure_reason"])
         fb_typed = FullBenchmarkResult(
             verified_speedup=fb_raw.get("verified_speedup"),
             baseline_ms=fb_raw.get("baseline_ms"),
@@ -676,6 +1050,17 @@ def evaluate_round_best(
         round_eval["baseline_shape_latency_ms"] = best["baseline_shape_latency_ms"]
     if best.get("candidate_shape_latency_ms"):
         round_eval["candidate_shape_latency_ms"] = best["candidate_shape_latency_ms"]
+
+    # --- GEAK_AGENT_SELECT_PATCH: trust agent-reported speedup, skip eval ---
+    if os.environ.get("GEAK_AGENT_SELECT_PATCH", "").strip() == "1":
+        logger.info(
+            "GEAK_AGENT_SELECT_PATCH=1: trusting agent-selected patch for round %d "
+            "(skipping CORRECTNESS, FULL_BENCHMARK, PROFILE).",
+            round_num,
+        )
+        round_eval["status"] = "agent_selected"
+        round_eval["speedup_source"] = "agent-reported (GEAK_AGENT_SELECT_PATCH=1)"
+        return write_eval_results(round_eval, output_dir, round_num)
 
     # --- Validate required context ---
     commandment_path = pp_dir / "COMMANDMENT.md"

@@ -1,7 +1,7 @@
 """Shared helpers for the GEAK preprocessing and orchestration pipelines.
 
-All CLI entry points (``geak``, ``geak-preprocess``, ``geak-orchestrate``,
-``run-tasks``, ``task-generator``) import from this module so that harness
+All CLI entry points (``geak``, ``geak-preprocess``, ``run-tasks``,
+``task-generator``) import from this module so that harness
 extraction, validation, profiling, model loading, agent filtering, and
 pipeline-context injection are always identical regardless of entry point.
 """
@@ -15,20 +15,26 @@ import logging
 import os
 import re
 import shlex
-import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
 from minisweagent import get_repo_root
+from minisweagent.run.utils.gpu_arch import (
+    detect_gpu_arch,
+    is_wmma_capable,
+    rdna_arch_context,
+    rdna_compute_bound_guidance,
+)
 
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT = get_repo_root()
 
 REQUIRED_HARNESS_FLAGS = ("--profile", "--correctness", "--benchmark", "--full-benchmark")
-
-MAX_HARNESS_RETRIES = 2
+# ``--iterations`` is RECOMMENDED, not required. See
+# ``minisweagent.run.preprocess.harness_utils`` for the canonical contract.
+RECOMMENDED_HARNESS_FLAGS = ("--iterations",)
 
 # Use one canonical benchmark definition everywhere. The legacy
 # GEAK_AGENT_BENCHMARK_ITERATIONS split is intentionally ignored so
@@ -37,6 +43,111 @@ DEFAULT_EVAL_BENCHMARK_ITERATIONS = int(os.getenv("GEAK_EVAL_BENCHMARK_ITERATION
 DEFAULT_AGENT_BENCHMARK_ITERATIONS = DEFAULT_EVAL_BENCHMARK_ITERATIONS
 DEFAULT_PIPELINE_OUTPUT_DIR = "geak_output"
 DEFAULT_HETEROGENEOUS = False
+
+# Modes accepted by ``--mode``. See ``run/budget.py`` and ``run.budgets`` /
+# ``run.presets`` in ``geak.yaml``.
+RUN_MODES: tuple[str, ...] = ("quick", "full")
+DEFAULT_RUN_MODE: str = "full"
+
+PIPELINE_MODES: tuple[str, ...] = ("fixed", "planned", "mixed")
+DEFAULT_PIPELINE_MODE: str = "mixed"
+
+
+def apply_mode_presets(config: dict, mode: str) -> dict:
+    """Deep-merge ``config["run"]["presets"][mode]`` into *config*.
+
+    Mode controls only ``orchestrator.max_rounds`` (and any other future
+    non-env knobs); step / cost / iteration limits intentionally remain
+    user-controlled to avoid silent overrides of ``GEAK_*_STEP_LIMIT`` etc.
+    that users may have set in their shell.
+
+    Precedence:
+      - For ``max_rounds``: CLI ``--max-rounds`` > mode preset > ``GEAK_MAX_ROUNDS``
+        env > built-in default. Mode wins over env because that is its job.
+      - For step/cost limits: CLI > YAML ``agent.*`` > ``GEAK_*`` env > default.
+        Mode is *not* in this chain.
+      - For ``total_s`` / ``finalize_grace_s`` / preprocess caps: CLI override
+        flag > mode preset > built-in default. No env vars participate.
+
+    Returns the same dict (mutated) for caller convenience.
+    """
+    if mode not in RUN_MODES:
+        raise ValueError(f"Unknown run mode {mode!r}; expected one of {RUN_MODES}")
+
+    presets = (((config.get("run") or {}).get("presets")) or {}).get(mode) or {}
+    if not presets:
+        logger.debug("apply_mode_presets: no presets defined for mode=%s", mode)
+        return config
+
+    # Snapshot the leaf values that *will* change under deep-merge so the
+    # log line reflects the actual config delta instead of the preset tree.
+    # Walking the preset tree alone would, e.g., claim we "injected" a dict
+    # at a key where ``_deep_merge`` actually replaced a non-dict scalar
+    # with a fresh dict subtree.
+    def _collect_preset_changes(base: dict, override: dict, prefix: str = "") -> list[tuple[str, Any, Any]]:
+        changes: list[tuple[str, Any, Any]] = []
+        for k, v in override.items():
+            key = f"{prefix}.{k}" if prefix else k
+            base_v = base.get(k) if isinstance(base, dict) else None
+            if isinstance(v, dict) and isinstance(base_v, dict):
+                changes.extend(_collect_preset_changes(base_v, v, key))
+            else:
+                changes.append((key, base_v, v))
+        return changes
+
+    deltas = _collect_preset_changes(config, presets)
+
+    def _deep_merge(base: dict, override: dict) -> dict:
+        for k, v in override.items():
+            if isinstance(v, dict) and isinstance(base.get(k), dict):
+                _deep_merge(base[k], v)
+            else:
+                base[k] = copy.deepcopy(v)
+        return base
+
+    _deep_merge(config, presets)
+
+    parts: list[str] = []
+    for key, before, after in deltas:
+        if before is None:
+            parts.append(f"+{key}={after}")
+        elif before == after:
+            parts.append(f"={key}={after}")
+        else:
+            parts.append(f"{key}: {before}->{after}")
+    logger.info("apply_mode_presets: mode=%s applied %s", mode, ", ".join(parts) if parts else "(no changes)")
+    return config
+
+
+def resolve_max_rounds(
+    *,
+    cli_max_rounds: int | None,
+    config: dict | None = None,
+    default: int = 5,
+) -> tuple[int, str]:
+    """Resolve ``max_rounds`` per the documented precedence chain.
+
+    Returns ``(value, source)`` where ``source`` is one of
+    ``"cli"``, ``"mode"``, ``"env"``, ``"default"`` and is suitable for
+    surfacing in the budget banner so users can tell that ``--mode`` overrode
+    ``GEAK_MAX_ROUNDS`` (or did not).
+    """
+    if cli_max_rounds is not None:
+        return int(cli_max_rounds), "cli"
+
+    if config is not None:
+        mode_val = (config.get("orchestrator") or {}).get("max_rounds")
+        if mode_val is not None:
+            return int(mode_val), "mode"
+
+    env_val = os.environ.get("GEAK_MAX_ROUNDS")
+    if env_val:
+        try:
+            return int(env_val), "env"
+        except ValueError:
+            logger.warning("GEAK_MAX_ROUNDS=%r is not an integer; falling back to default", env_val)
+
+    return int(default), "default"
 
 
 # ── agent filtering ──────────────────────────────────────────────────
@@ -146,7 +257,6 @@ def _ensure_mcp_importable() -> None:
     """Add MCP tool source directories to sys.path if not already present."""
     for sub in (
         "mcp_tools/profiler-mcp/src",
-        "mcp_tools/metrix-mcp/src",
         "mcp_tools/automated-test-discovery/src",
     ):
         p = str(_REPO_ROOT / sub)
@@ -182,131 +292,6 @@ def extract_harness_path(test_command: str) -> str:
     return tokens[-1] if tokens else test_command
 
 
-def _preferred_harness_path(log_dir: Path, kernel_path: Path | None) -> Path:
-    if kernel_path is not None:
-        stem = kernel_path.stem or "kernel"
-        return log_dir / f"test_{stem}_harness.py"
-    return log_dir / "geak_test_harness.py"
-
-
-def _materialized_harness_bootstrap(
-    *,
-    repo_root: Path,
-    kernel_path: Path | None,
-) -> str:
-    kernel_dir = kernel_path.resolve().parent if kernel_path is not None else None
-    rel_kernel_dir: Path | None = None
-    if kernel_dir is not None:
-        try:
-            rel_kernel_dir = kernel_dir.relative_to(repo_root.resolve())
-        except ValueError:
-            rel_kernel_dir = None
-
-    rel_kernel_dir_text = str(rel_kernel_dir).replace("\\", "/") if rel_kernel_dir is not None else ""
-    original_kernel_dir = str(kernel_dir) if kernel_dir is not None else ""
-    return (
-        "# GEAK materialized harness bootstrap\n"
-        "def _resolve_geak_kernel_dir():\n"
-        "    candidates = []\n"
-        '    work_dir = os.environ.get("GEAK_WORK_DIR", "").strip()\n'
-        "    if work_dir:\n"
-        "        candidates.append(work_dir)\n"
-        '    repo_root = os.environ.get("GEAK_REPO_ROOT", "").strip()\n'
-        f"    rel_kernel_dir = {rel_kernel_dir_text!r}\n"
-        "    if repo_root and rel_kernel_dir:\n"
-        "        candidates.append(os.path.join(repo_root, rel_kernel_dir))\n"
-        f"    original_kernel_dir = {original_kernel_dir!r}\n"
-        "    if original_kernel_dir:\n"
-        "        candidates.append(original_kernel_dir)\n"
-        "    for candidate in candidates:\n"
-        '        if candidate and os.path.isfile(os.path.join(candidate, "kernel.py")):\n'
-        "            return candidate\n"
-        "    return original_kernel_dir or os.getcwd()\n"
-        "\n"
-        "_KERNEL_DIR = _resolve_geak_kernel_dir()\n"
-        "if _KERNEL_DIR not in sys.path:\n"
-        "    sys.path.insert(0, _KERNEL_DIR)\n"
-    )
-
-
-def _rewrite_materialized_harness_source(
-    source_text: str,
-    *,
-    repo_root: Path,
-    kernel_path: Path | None,
-) -> str:
-    bootstrap = _materialized_harness_bootstrap(
-        repo_root=repo_root,
-        kernel_path=kernel_path,
-    )
-    legacy_patterns = [
-        re.compile(
-            r"(?ms)^# Ensure the kernel directory is importable\n"
-            r"_KERNEL_DIR = os\.path\.dirname\(os\.path\.abspath\(__file__\)\)\n"
-            r"if _KERNEL_DIR not in sys\.path:\n"
-            r"\s+sys\.path\.insert\(0, _KERNEL_DIR\)\n"
-        ),
-        re.compile(
-            r"(?ms)^_KERNEL_DIR = os\.path\.dirname\(os\.path\.abspath\(__file__\)\)\n"
-            r"if _KERNEL_DIR not in sys\.path:\n"
-            r"\s+sys\.path\.insert\(0, _KERNEL_DIR\)\n"
-        ),
-    ]
-    for pattern in legacy_patterns:
-        if pattern.search(source_text):
-            return pattern.sub(bootstrap, source_text, count=1)
-
-    import_block = re.compile(r"(?ms)\A((?:from __future__ import annotations\n)?(?:import .+\n|from .+ import .+\n)+)")
-    match = import_block.match(source_text)
-    if match:
-        return source_text[: match.end()] + "\n" + bootstrap + source_text[match.end() :]
-    return bootstrap + "\n" + source_text
-
-
-def _materialize_validated_harness(
-    *,
-    test_command: str,
-    harness_path: str,
-    repo_root: Path,
-    log_dir: Path | None,
-    kernel_path: Path | None,
-    gpu_id: int,
-) -> tuple[str, str, list[dict[str, Any]]] | None:
-    if log_dir is None:
-        return None
-
-    source_harness = Path(harness_path).resolve()
-    target_dir = log_dir.resolve()
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_harness = _preferred_harness_path(target_dir, kernel_path)
-    if source_harness == target_harness:
-        return None
-
-    rewritten_text = _rewrite_materialized_harness_source(
-        source_harness.read_text(),
-        repo_root=repo_root,
-        kernel_path=kernel_path,
-    )
-    target_harness.write_text(rewritten_text)
-    shutil.copymode(source_harness, target_harness)
-
-    materialized_command = test_command.replace(str(source_harness), str(target_harness))
-    valid, static_errors = validate_harness(str(target_harness))
-    if not valid:
-        raise RuntimeError("Materialized harness static validation failed: " + "; ".join(static_errors))
-
-    exec_ok, exec_errors, harness_results = execute_harness_validation(
-        str(target_harness),
-        repo_root=str(repo_root),
-        gpu_id=gpu_id,
-    )
-    if not exec_ok:
-        raise RuntimeError(
-            "Materialized harness runtime validation failed: " + "; ".join(e.splitlines()[0] for e in exec_errors)
-        )
-    return materialized_command, str(target_harness), harness_results
-
-
 # ── harness validation ───────────────────────────────────────────────
 
 
@@ -319,17 +304,17 @@ _GPU_ALLOC_IN_PROFILE_RE = re.compile(
 def validate_harness(harness_path: str) -> tuple[bool, list[str]]:
     """Static-analyse a harness script to verify it supports required CLI flags.
 
-    Checks that the harness uses an argument-parsing library (argparse, click,
-    or typer) and defines all four required flags: ``--correctness``,
-    ``--profile``, ``--benchmark``, and ``--full-benchmark``.  Also checks
-    that the ``run_profile`` function (if present) does not allocate tensors
-    directly on CUDA, which would pollute the profiler trace with GPU RNG /
-    memset kernels.
-
-    Returns ``(valid, errors)`` where *errors* is empty when *valid* is True.
+    Mirror of :func:`minisweagent.run.preprocess.harness_utils.validate_harness`
+    -- see that docstring for the contract. The two copies exist because of
+    the deliberate decoupling between ``run/`` and ``run/preprocess/``;
+    helpers like ``_strip_python_comments`` are imported from
+    ``harness_utils`` so the comment-stripping behaviour stays in lockstep.
     """
+    from minisweagent.run.preprocess.harness_utils import _strip_python_comments
+
     harness = Path(harness_path)
     errors: list[str] = []
+    warnings: list[str] = []
 
     if not harness.is_file():
         return False, [f"Harness file not found: {harness}"]
@@ -343,9 +328,25 @@ def validate_harness(harness_path: str) -> tuple[bool, list[str]]:
             "CLI flags like --profile and --correctness will be silently ignored"
         )
 
+    # Strip comments before substring-checking required flags so that a
+    # ``# --iterations N not yet supported`` comment does not falsely
+    # satisfy the validator. Must mirror the equivalent helper in
+    # ``preprocess/harness_utils.py``.
+    code_only_source = _strip_python_comments(source)
     for flag in REQUIRED_HARNESS_FLAGS:
-        if flag not in source:
+        if flag not in code_only_source:
             errors.append(f"Harness source does not define '{flag}' flag")
+
+    for flag in RECOMMENDED_HARNESS_FLAGS:
+        if flag not in code_only_source:
+            msg = (
+                f"Harness {harness} does not define recommended flag '{flag}'; "
+                f"GEAK will skip passing it on the harness CLI and rely on "
+                f"GEAK_BENCHMARK_ITERATIONS only. Have your harness honour "
+                f"that env var if you want to control iteration counts."
+            )
+            logger.warning(msg)
+            warnings.append(msg)
 
     # Check for GPU-side tensor allocation inside the profile function.
     # rocprofv3 captures ALL GPU kernels, so torch.randn(..., device='cuda')
@@ -367,7 +368,8 @@ def validate_harness(harness_path: str) -> tuple[bool, list[str]]:
             )
             break  # one warning is enough
 
-    return len(errors) == 0, errors
+    valid = len(errors) == 0
+    return valid, (warnings if valid else errors)
 
 
 # ── harness runtime execution ─────────────────────────────────────────
@@ -439,135 +441,16 @@ def execute_harness_validation(
     return ok, errors, results
 
 
-# ── validated harness creation (UnitTestAgent + retry) ───────────────
-
-
-def create_validated_harness(
-    *,
-    model: Any,
-    repo: Path,
-    kernel_name: str,
-    log_dir: Path | None,
-    kernel_path: Path | None,
-    discovery_context: str,
-    max_retries: int = MAX_HARNESS_RETRIES,
-    gpu_id: int = 0,
-) -> tuple[str, list[dict]]:
-    """Run UnitTestAgent with static + runtime validation and retry loop.
-
-    After the agent produces a harness:
-      1. :func:`validate_harness` performs static analysis (argparse,
-         ``--profile``, ``--correctness`` flags, GPU allocation patterns).
-      2. :func:`execute_harness_validation` actually runs the harness in
-         all four modes (correctness, profile, benchmark, full-benchmark)
-         to catch import errors, shape mismatches, OOM, etc.
-
-    If either step fails the errors are fed back into the discovery context
-    and the agent is re-invoked, up to *max_retries* additional attempts.
-
-    Returns ``(test_command, harness_results)`` on success where
-    *harness_results* is the list of per-mode result dicts.
-
-    Raises
-    ------
-    RuntimeError
-        If validation still fails after all retries.
-    """
-    from minisweagent.run.preprocess.unit_test_agent import run_unit_test_agent
-
-    max_attempts = max_retries + 1
-    harness_errors: list[str] = []
-
-    for attempt in range(1, max_attempts + 1):
-        ctx = discovery_context
-        if harness_errors:
-            ctx += (
-                f"\n\nHARNESS VALIDATION FAILED (attempt {attempt}/{max_attempts}):\n"
-                + "\n".join(f"- {e}" for e in harness_errors)
-                + "\n\nYou MUST fix the harness so that ALL modes work: "
-                "--correctness, --profile, --benchmark, --full-benchmark. "
-                "See src/minisweagent/run/preprocess/INSTRUCTIONS.md sections 1a and 1b."
-            )
-
-        test_command = run_unit_test_agent(
-            model=model,
-            repo=repo,
-            kernel_name=kernel_name,
-            log_dir=log_dir,
-            preferred_harness_path=_preferred_harness_path(log_dir, kernel_path) if log_dir else None,
-            kernel_path=kernel_path,
-            discovery_context=ctx,
-        )
-        logger.info("UnitTestAgent test_command (attempt %d): %s", attempt, test_command)
-
-        harness = extract_harness_path(test_command)
-
-        # Phase 1: static analysis
-        valid, harness_errors = validate_harness(harness)
-        if not valid:
-            logger.warning(
-                "Harness static validation failed (attempt %d/%d): %s",
-                attempt,
-                max_attempts,
-                harness_errors,
-            )
-            if attempt == max_attempts:
-                raise RuntimeError(
-                    f"Harness validation failed after {max_attempts} attempts: " + "; ".join(harness_errors)
-                )
-            continue
-
-        logger.info("Harness static validation: OK")
-
-        # Phase 2: runtime execution of all modes
-        repo_root = str(repo) if repo else None
-        exec_ok, exec_errors, harness_results = execute_harness_validation(
-            harness,
-            repo_root=repo_root,
-            gpu_id=gpu_id,
-        )
-        if exec_ok:
-            try:
-                materialized = _materialize_validated_harness(
-                    test_command=test_command,
-                    harness_path=harness,
-                    repo_root=repo,
-                    log_dir=log_dir,
-                    kernel_path=kernel_path,
-                    gpu_id=gpu_id,
-                )
-            except Exception as exc:
-                harness_errors = [str(exc)]
-                logger.warning(
-                    "Harness materialization failed (attempt %d/%d): %s",
-                    attempt,
-                    max_attempts,
-                    harness_errors,
-                )
-                if attempt == max_attempts:
-                    raise RuntimeError(f"Harness materialization failed after {max_attempts} attempts: {exc}")
-                continue
-            if materialized is not None:
-                test_command, harness, harness_results = materialized
-                logger.info("Materialized harness to %s", harness)
-            logger.info("Harness runtime validation: ALL MODES PASSED")
-            return test_command, harness_results
-
-        harness_errors = exec_errors
-        logger.warning(
-            "Harness runtime validation failed (attempt %d/%d): %s",
-            attempt,
-            max_attempts,
-            [e.splitlines()[0] for e in exec_errors],
-        )
-
-        if attempt == max_attempts:
-            raise RuntimeError(
-                f"Harness runtime validation failed after {max_attempts} attempts: "
-                + "; ".join(e.splitlines()[0] for e in exec_errors)
-            )
-
-    raise AssertionError("unreachable")  # pragma: no cover
+# The ``create_validated_harness`` function previously lived here as an
+# in-file copy of the legacy chain in
+# :mod:`minisweagent.run.preprocess.harness_utils`.  On the modular pipeline
+# ``HarnessPhase._layer6_unit_test_agent`` calls the canonical
+# :func:`~minisweagent.run.preprocess.harness_utils.create_validated_harness`
+# directly, so the duplicate is gone.  Same for its private helpers
+# ``_preferred_harness_path``, ``_materialized_harness_bootstrap``,
+# ``_rewrite_materialized_harness_source``, and
+# ``_materialize_validated_harness`` -- all moved to/owned by
+# ``harness_utils`` now.
 
 
 # ── bottleneck-specific optimization guidance ────────────────────────
@@ -693,7 +576,7 @@ def _search_workload_guidance(metrics: dict) -> list[str]:
     ]
 
 
-def _bottleneck_guidance(bottleneck: str, metrics: dict) -> list[str]:
+def _bottleneck_guidance(bottleneck: str, metrics: dict, arch: str = "") -> list[str]:
     """Return actionable optimization guidance lines based on bottleneck type."""
     bn_lower = bottleneck.lower().strip()
     bn_aliases = {
@@ -705,6 +588,8 @@ def _bottleneck_guidance(bottleneck: str, metrics: dict) -> list[str]:
     bn_lower = bn_aliases.get(bn_lower, bn_lower)
     for key, text in _BOTTLENECK_GUIDANCE.items():
         if key in bn_lower:
+            if key == "compute-bound" and is_wmma_capable(arch):
+                text = rdna_compute_bound_guidance()
             lines = text.strip().splitlines()
             lines.extend(_search_workload_guidance(metrics))
             lines.append("")
@@ -749,6 +634,9 @@ def _gpu_arch_context(profiling_path: str) -> list[str]:
     hbm_bw = gpu_info.get("peak_hbm_bandwidth_gbps", gpu_info.get("hbm_bandwidth", "?"))
     lds_per_cu = gpu_info.get("lds_per_cu_kb", 64)
     vgprs = gpu_info.get("vgprs_per_cu", 512)
+    rdna_ctx = rdna_arch_context(gpu_info, arch)
+    if rdna_ctx is not None:
+        return rdna_ctx
 
     return [
         f"## GPU Architecture: {name} ({arch})",
@@ -832,7 +720,7 @@ def inject_pipeline_context(
                 )
         ctx.append("")
 
-        ctx.extend(_bottleneck_guidance(str(bn), baseline_metrics))
+        ctx.extend(_bottleneck_guidance(str(bn), baseline_metrics, arch=detect_gpu_arch()))
 
     if profiling_path and Path(profiling_path).exists():
         ctx.append(f"PROFILING DATA: {profiling_path}")

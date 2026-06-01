@@ -69,6 +69,9 @@ class ParallelAgent(DefaultAgent):
     def run(self, task: str, **kwargs) -> BestPatchResult | None:
         num_parallel = self.config.num_parallel or 1
         console = kwargs.get("console")
+        deadline = kwargs.get("deadline")
+        soft_stop = kwargs.get("soft_stop")
+        registry = kwargs.get("registry")
 
         # Validate repo path (required for worktree management)
         if not self.config.repo:
@@ -109,6 +112,9 @@ class ParallelAgent(DefaultAgent):
             console=console,
             agent_specs=self.config.agent_specs,
             tasks=self.config.tasks,
+            deadline=deadline,
+            soft_stop=soft_stop,
+            registry=registry,
         )
 
         metric = (
@@ -138,17 +144,22 @@ class ParallelAgent(DefaultAgent):
         model = model_factory()
         _, best_patch_id = run_select_patch(base_patch_dir, num_parallel, metric, model)
 
-        # Override with deterministic benchmark parsing when possible
-        from minisweagent.run.postprocess.benchmark_parsing import rewrite_best_results
+        # Only call rewrite_best_results when patch_*_test.txt files exist
+        # directly in base_patch_dir (heterogeneous flat layout).  In
+        # homogeneous/parallel mode the files live in subdirectories
+        # (parallel_0/, parallel_1/) so compute_best_patch cannot find them
+        # and the fallback would incorrectly clamp the LLM's speedup to 1.0.
+        if list(base_patch_dir.glob("patch_*_test.txt")):
+            from minisweagent.run.postprocess.benchmark_parsing import rewrite_best_results
 
-        det_result = rewrite_best_results(base_patch_dir)
-        if det_result:
-            best_patch_id = det_result.get("best_patch_id", best_patch_id)
-            logger.info(
-                "Deterministic override: %s (%sx)",
-                best_patch_id,
-                det_result.get("best_patch_speedup", "?"),
-            )
+            det_result = rewrite_best_results(base_patch_dir)
+            if det_result:
+                best_patch_id = det_result.get("best_patch_id", best_patch_id)
+                logger.info(
+                    "Deterministic override: %s (%sx)",
+                    best_patch_id,
+                    det_result.get("best_patch_speedup", "?"),
+                )
 
         if not best_patch_id:
             logger.warning("SelectPatchAgent did not produce best_results.json.")
@@ -350,6 +361,27 @@ class ParallelAgent(DefaultAgent):
             text,
         )
 
+    @staticmethod
+    def _gpu_groups_for_homogeneous_parallel(gpu_ids: list[int], num_parallel: int) -> list[list[int]]:
+        """Partition ``gpu_ids`` into ``num_parallel`` contiguous groups (sizes differ by at most one).
+
+        - One parallel agent receives every ID (e.g. TP across all listed GPUs).
+        - ``N`` agents split the list in order: ``[0,1,2,3]`` with ``N==2`` → ``[[0,1],[2,3]]``.
+        """
+        if num_parallel <= 0:
+            return []
+        n = len(gpu_ids)
+        if n == 0:
+            return [[] for _ in range(num_parallel)]
+        base, rem = divmod(n, num_parallel)
+        groups: list[list[int]] = []
+        idx = 0
+        for i in range(num_parallel):
+            sz = base + (1 if i < rem else 0)
+            groups.append(gpu_ids[idx : idx + sz])
+            idx += sz
+        return groups
+
     @classmethod
     def run_parallel(
         cls,
@@ -369,13 +401,22 @@ class ParallelAgent(DefaultAgent):
         console=None,
         agent_specs: list | None = None,
         tasks: list | None = None,
+        deadline=None,
+        soft_stop=None,
+        registry=None,
     ) -> list[tuple[int, Any, Any, Any]]:
         """Run multiple parallel agents and return their results.
 
         Supports three modes (checked in priority order):
         - Pool (preferred): pass tasks (list[AgentTask]) for M tasks on N GPUs.
         - Heterogeneous (legacy): pass agent_specs (list[AgentSpec]).
-        - Homogeneous (default): num_parallel identical agents, each with 1 GPU.
+        - Homogeneous (default): num_parallel identical agents; ``gpu_ids`` are split
+          into that many contiguous groups (one agent → all IDs visible; two agents
+          on four IDs → two pairs, etc.).
+
+        ``deadline`` / ``soft_stop`` / ``registry`` are forwarded to the
+        chosen helper so spawned subprocesses are tracked and the dispatch
+        loop can short-circuit on SoftStop.
         """
         # Pool mode: M tasks on N GPU slots (preferred)
         if tasks:
@@ -393,6 +434,9 @@ class ParallelAgent(DefaultAgent):
                 redirect_output_fn=redirect_output_fn,
                 save_traj_fn=save_traj_fn,
                 console=console,
+                deadline=deadline,
+                soft_stop=soft_stop,
+                registry=registry,
             )
 
         # Heterogeneous mode: use agent_specs if provided (legacy)
@@ -410,6 +454,9 @@ class ParallelAgent(DefaultAgent):
                 redirect_output_fn=redirect_output_fn,
                 save_traj_fn=save_traj_fn,
                 console=console,
+                deadline=deadline,
+                soft_stop=soft_stop,
+                registry=registry,
             )
 
         # Homogeneous mode (original behavior)
@@ -439,13 +486,23 @@ class ParallelAgent(DefaultAgent):
 
         if gpu_ids and len(gpu_ids) < num_parallel:
             logger.warning(
-                "Only %d GPU IDs for %d parallel agents; some agents will not have GPU isolation.",
+                "Fewer GPU IDs (%d) than parallel agents (%d); some agents get an empty GPU group "
+                "(no HIP_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES override).",
                 len(gpu_ids),
                 num_parallel,
             )
 
+        agent_gpu_groups: list[list[int]] | None = (
+            cls._gpu_groups_for_homogeneous_parallel(gpu_ids, num_parallel) if gpu_ids else None
+        )
+
         def run_single_agent(agent_id: int):
             """Run a single parallel agent instance."""
+            # Defense in depth: SoftStop may have fired between submit and start.
+            if soft_stop is not None and soft_stop.is_set():
+                logger.info("run_single_agent[%d]: SoftStop set before start; skipping", agent_id)
+                return agent_id, None, "SoftStop", "skipped before start"
+
             # All repos use git worktree (non-git repos are initialized as git above)
             worktree_path = create_worktree(repo_path, worktree_base / f"slot_{agent_id}")
             worktree_path_str = str(worktree_path.resolve())
@@ -481,17 +538,19 @@ class ParallelAgent(DefaultAgent):
             new_env[repo_path_str] = worktree_path_str
             new_env["GEAK_WORK_DIR"] = worktree_path_str
             new_env["GEAK_REPO_ROOT"] = repo_path_str
-            if gpu_ids and agent_id < len(gpu_ids):
-                gpu_id = gpu_ids[agent_id]
-                new_env["HIP_VISIBLE_DEVICES"] = str(gpu_id)
-                new_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-                new_env["GEAK_GPU_DEVICE"] = str(gpu_id)
-                logger.debug("Parallel agent %d assigned GPU %d", agent_id, gpu_id)
-                if console:
-                    with _stdout_lock:
-                        console.print(f"[bold green]Parallel agent {agent_id} using GPU {gpu_id}[/bold green]")
-                        if hasattr(sys.stdout, "flush"):
-                            sys.stdout.flush()
+            if agent_gpu_groups is not None and agent_id < len(agent_gpu_groups):
+                grp = agent_gpu_groups[agent_id]
+                if grp:
+                    devs = ",".join(str(g) for g in grp)
+                    new_env["HIP_VISIBLE_DEVICES"] = devs
+                    new_env["CUDA_VISIBLE_DEVICES"] = devs
+                    new_env["GEAK_GPU_DEVICE"] = devs
+                    logger.debug("Parallel agent %d assigned GPU(s) %s", agent_id, devs)
+                    if console:
+                        with _stdout_lock:
+                            console.print(f"[bold green]Parallel agent {agent_id} using GPU(s) {devs}[/bold green]")
+                            if hasattr(sys.stdout, "flush"):
+                                sys.stdout.flush()
             env_config_dict["env"] = new_env
             parallel_env = type(base_env)(**env_config_dict)
 
@@ -510,6 +569,15 @@ class ParallelAgent(DefaultAgent):
                     agent._setup_save_and_test_context()
             if hasattr(agent, "log_file"):
                 agent.log_file = log_file
+            # Wall-clock soft-stop -> sub-agent step loop.
+            if soft_stop is not None:
+                agent._soft_stop = soft_stop
+            # Run-level ProcessRegistry -> save_and_test inner subprocess.run
+            # so the budget watchdog can SIGTERM/SIGKILL stuck benchmarks.
+            if registry is not None:
+                agent._registry = registry
+                if hasattr(agent, "_setup_save_and_test_context"):
+                    agent._setup_save_and_test_context()  # rebuild ctx with registry attached
 
             with open(log_file, "w", encoding="utf-8") as f:
                 f.write(f"Agent {agent_id} Conversation Log\n")
@@ -600,15 +668,56 @@ class ParallelAgent(DefaultAgent):
         _progress_thread = threading.Thread(target=_report_progress, daemon=True)
         _progress_thread.start()
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_parallel) as executor:
-            futures = {executor.submit(run_single_agent, i): i for i in range(num_parallel)}
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    agent_id = futures[future]
-                    logger.error("Error in parallel agent %d: %s", agent_id, e, exc_info=True)
+        # Use poll loop so SoftStop is observed mid-dispatch. Manual executor
+        # lifecycle (no ``with`` block) so we can detach via shutdown(wait=False,
+        # cancel_futures=True) on SoftStop instead of blocking on stuck workers.
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_parallel)
+        soft_stop_observed = False
+        try:
+            futures: dict[concurrent.futures.Future, int] = {}
+            for i in range(num_parallel):
+                if registry is not None:
+                    with registry.lock:
+                        if soft_stop is not None and soft_stop.is_set():
+                            soft_stop_observed = True
+                            break
+                        fut = executor.submit(run_single_agent, i)
+                        registry.register_future(fut)
+                else:
+                    if soft_stop is not None and soft_stop.is_set():
+                        soft_stop_observed = True
+                        break
+                    fut = executor.submit(run_single_agent, i)
+                futures[fut] = i
+
+            pending = set(futures.keys())
+            while pending:
+                if soft_stop is not None and soft_stop.is_set():
+                    logger.warning(
+                        "ParallelAgent.run_parallel (homogeneous): SoftStop set; cancelling %d in-flight",
+                        len(pending),
+                    )
+                    if registry is not None:
+                        registry.terminate_all()
+                    for f in pending:
+                        f.cancel()
+                    soft_stop_observed = True
+                    break
+                done, pending = concurrent.futures.wait(pending, timeout=2.0)
+                for f in done:
+                    agent_id = futures[f]
+                    try:
+                        result = f.result()
+                        results.append(result)
+                    except concurrent.futures.CancelledError:
+                        logger.info("Homogeneous parallel agent %d cancelled", agent_id)
+                    except Exception as e:
+                        logger.error("Error in parallel agent %d: %s", agent_id, e, exc_info=True)
+        finally:
+            if soft_stop_observed:
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True)
 
         _progress_stop.set()
         _progress_thread.join(timeout=2)

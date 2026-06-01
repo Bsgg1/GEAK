@@ -16,11 +16,41 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastmcp import FastMCP
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# GPU arch detection (kept inline; profiler-mcp must not depend on minisweagent)
+# ---------------------------------------------------------------------------
+
+
+def _detect_gpu_arch() -> str:
+    """Return the GFX architecture string (e.g. 'gfx942', 'gfx1201') or '' on failure."""
+    try:
+        out = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=10)
+        for line in out.stdout.splitlines():
+            if "gfx" in line.lower() and "name:" in line.lower():
+                for p in line.split():
+                    if p.startswith("gfx"):
+                        return p
+    except Exception:
+        pass
+    return ""
+
+
+def _guard_rocprof_compute(backend: str) -> tuple[str, str]:
+    """If *backend* is 'rocprof-compute' on RDNA, return ('metrix', arch). Otherwise (backend, '')."""
+    if backend != "rocprof-compute":
+        return backend, ""
+    arch = _detect_gpu_arch()
+    if arch.startswith(("gfx10", "gfx11", "gfx12")):
+        return "metrix", arch
+    return backend, ""
+
 
 mcp = FastMCP(
     name="profiler",
@@ -79,16 +109,7 @@ def _profile_with_metrix(
     cwd: str | None = None,
 ) -> dict[str, Any]:
     """Profile using AMD Metrix API. Returns structured JSON."""
-    # Import MetrixTool from the installed metrix-mcp or in-tree copy
-    try:
-        from metrix_mcp.core import MetrixTool
-    except ImportError:
-        # Fallback: look in the agent package
-        _agent_root = Path(__file__).resolve().parent.parent.parent.parent
-        _metrix_src = _agent_root / "metrix-mcp" / "src"
-        if str(_metrix_src) not in sys.path:
-            sys.path.insert(0, str(_metrix_src))
-        from metrix_mcp.core import MetrixTool
+    from .core import MetrixTool
 
     tool = MetrixTool(gpu_devices=gpu_devices)
     try:
@@ -129,14 +150,14 @@ def _profile_with_rocprof(
         profiling_type: One of 'profiling' (full), 'roofline', 'profiler_analyzer'.
     """
     try:
-        from minisweagent.kernel_profile import _build_rocprof_result
+        from minisweagent.run.preprocess.kernel_profile import _build_rocprof_result
         from minisweagent.tools.profiling_tools import ProfilingAnalyzer
     except ImportError:
         _agent_root = Path(__file__).resolve().parent.parent.parent.parent.parent
         _src = _agent_root / "src"
         if str(_src) not in sys.path:
             sys.path.insert(0, str(_src))
-        from minisweagent.kernel_profile import _build_rocprof_result
+        from minisweagent.run.preprocess.kernel_profile import _build_rocprof_result
         from minisweagent.tools.profiling_tools import ProfilingAnalyzer
 
     # Empty HIP_VISIBLE_DEVICES hides all GPUs from ROCm.  We need to
@@ -148,14 +169,16 @@ def _profile_with_rocprof(
     if os.environ.get("HIP_VISIBLE_DEVICES") == "":
         _hip_removed = os.environ.pop("HIP_VISIBLE_DEVICES")
 
-    analyzer = ProfilingAnalyzer(profiling_type=profiling_type)
+    # HIP env save/restore stays in this OUTER try/finally; the analyzer
+    # ``with`` block only owns analyzer lifecycle. The two concerns are
+    # independent and must not be collapsed.
     try:
-        raw = analyzer.profile_structured(
-            profiling_workdir=workdir or str(Path.cwd()),
-            profiling_cmd=command,
-        )
+        with ProfilingAnalyzer(profiling_type=profiling_type) as analyzer:
+            raw = analyzer.profile_structured(
+                profiling_workdir=workdir or str(Path.cwd()),
+                profiling_cmd=command,
+            )
     finally:
-        analyzer.cleanup()
         if _hip_removed is not None:
             os.environ["HIP_VISIBLE_DEVICES"] = _hip_removed
 
@@ -208,7 +231,7 @@ def _warmup(command: str, warmup_runs: int) -> None:
 @mcp.tool()
 def profile_kernel(
     command: str,
-    backend: str = "metrix",
+    backend: Literal["metrix", "rocprof-compute"],
     workdir: str | None = None,
     profiling_type: str = "profiling",
     num_replays: int = 3,
@@ -222,8 +245,8 @@ def profile_kernel(
 
     Args:
         command: Command to execute (e.g. 'python3 kernel.py').
-        backend: 'metrix' for structured AMD Metrix profiling, or
-                 'rocprof-compute' for deep roofline/instruction analysis.
+        backend: Required. Either 'metrix' (structured AMD Metrix profiling) or
+                 'rocprof-compute' (roofline/instruction-level analysis).
         workdir: Working directory for the command.
         profiling_type: For rocprof-compute: 'profiling' (full), 'roofline', or
                         'profiler_analyzer'. Ignored for metrix.
@@ -244,6 +267,13 @@ def profile_kernel(
         }
     """
     logger.info("Profiler MCP: backend=%s, command=%s", backend, command)
+
+    backend, rdna_arch = _guard_rocprof_compute(backend)
+    if rdna_arch:
+        logger.warning(
+            "rocprof-compute does not support RDNA (%s). Falling back to metrix backend.",
+            rdna_arch,
+        )
 
     command = _normalize_command(command)
 

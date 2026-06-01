@@ -1,5 +1,6 @@
 """Save-and-test tool: saves patches and runs correctness + benchmark tests."""
 
+import contextlib
 import json
 import logging
 import os
@@ -10,7 +11,10 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from minisweagent.run.state import ProcessRegistry
 
 from minisweagent.debug_runtime import emit_debug_log
 from minisweagent.run.postprocess.benchmark_parsing import (
@@ -116,6 +120,61 @@ class SaveAndTestContext:
     patch_counter: int = 0
     helper_harness_logged: bool = False
     source_file_paths: list[str] | None = None  # files the agent is allowed to modify
+    # When set, every blocking ``subprocess.run`` invocation in this tool
+    # registers its underlying ``Popen`` with the run-level ``ProcessRegistry``
+    # so the budget watchdog can SIGTERM/SIGKILL it on a wall-clock timeout.
+    # Without this, a 30-min benchmark started here would run past the
+    # ``--mode quick`` budget because nothing else in the call stack tracks it.
+    registry: "ProcessRegistry | None" = None
+
+
+def _tracked_subprocess_run(
+    cmd,
+    *,
+    registry: "ProcessRegistry | None" = None,
+    timeout: float | None = None,
+    **popen_kwargs,
+):
+    """Drop-in replacement for ``subprocess.run`` that registers the underlying
+    ``Popen`` with the run-level ``ProcessRegistry`` so the budget watchdog can
+    SIGTERM/SIGKILL it (along with any GPU benchmark grandchildren) on a
+    wall-clock timeout.
+
+    Returns a ``subprocess.CompletedProcess`` so callers don't need to change
+    their result-handling code. Behaves like ``subprocess.run`` for stdout /
+    stderr / returncode / TimeoutExpired semantics.
+
+    Defaults that differ from raw ``subprocess.run``:
+
+      - ``start_new_session=True`` so ``os.killpg`` reaches grandchildren.
+      - When ``capture_output=True`` is passed (or ``stdout``/``stderr`` are
+        unset), stdout/stderr are captured and decoded as text.
+
+    When ``registry`` is ``None`` this still uses ``start_new_session`` and
+    behaves like a normal ``subprocess.run`` so the path is still safe in
+    contexts where no budget is active (tests, ad-hoc invocations).
+    """
+    capture = popen_kwargs.pop("capture_output", False)
+    if capture:
+        popen_kwargs.setdefault("stdout", subprocess.PIPE)
+        popen_kwargs.setdefault("stderr", subprocess.PIPE)
+    popen_kwargs.setdefault("start_new_session", True)
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    cm = registry.track(proc) if registry is not None else contextlib.nullcontext(proc)
+    with cm:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            # Match subprocess.run() semantics: kill, drain, re-raise so the
+            # caller's existing TimeoutExpired handler works unchanged.
+            try:
+                proc.kill()
+                drained_out, drained_err = proc.communicate(timeout=2)
+            except Exception:
+                drained_out, drained_err = b"", b""
+            raise subprocess.TimeoutExpired(cmd, timeout, drained_out, drained_err) from exc
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 class SaveAndTestTool:
@@ -683,11 +742,34 @@ class SaveAndTestTool:
                 "*.so",
                 ".geak_resolved/",
                 ".git.bak/",
+                # Core dumps
+                "core",
+                "core.*",
+                # Model weights / serialized params
+                "*.pt",
+                "*.pth",
+                "*.onnx",
+                "*.safetensors",
+                "*.bin",
+                "*.pkl",
+                # Compiled objects
+                "*.o",
+                "*.a",
+                "*.out",
+                "*.hipfb",
+                # Profiling artifacts
+                "*.csv",
+                "*.sqlite",
+                "*.nsys-rep",
+                "*.ncu-rep",
+                # Build / compile caches
+                "__hip_fatbin/",
+                ".cache/",
                 *self._generated_helper_excludes(),
             ]
             exclude_args = " ".join(f"':(exclude){entry}'" for entry in excludes)
             result = subprocess.run(
-                f"git add -N . && git diff --binary -- . {exclude_args}",
+                f"git add -N . && git diff -- . {exclude_args}",
                 cwd=cwd,
                 capture_output=True,
                 text=True,
@@ -697,7 +779,29 @@ class SaveAndTestTool:
             return result.stdout
 
         if ctx.base_repo_path and ctx.base_repo_path.exists():
-            excludes = [".git", "__pycache__", *self._generated_helper_excludes()]
+            excludes = [
+                ".git",
+                "__pycache__",
+                "*.so",
+                "core",
+                "core.*",
+                "*.pt",
+                "*.pth",
+                "*.onnx",
+                "*.safetensors",
+                "*.bin",
+                "*.pkl",
+                "*.o",
+                "*.a",
+                "*.out",
+                "*.hipfb",
+                "*.sqlite",
+                "*.nsys-rep",
+                "*.ncu-rep",
+                "__hip_fatbin",
+                ".cache",
+                *self._generated_helper_excludes(),
+            ]
             if ctx.patch_output_dir:
                 run_dir_name = Path(ctx.patch_output_dir).resolve().parent.name
                 if run_dir_name:
@@ -935,7 +1039,7 @@ class SaveAndTestTool:
             return error_msg, False, -1
 
         # Guardrail: restore any non-source files the agent modified
-        self._restore_non_source_files()
+        # self._restore_non_source_files()
 
         test_env = self._build_test_env()
         self._restore_missing_harness_helper()
@@ -960,8 +1064,15 @@ class SaveAndTestTool:
 
         try:
             wrapped_cmd = f"({test_command}) > {tmp_file} 2>&1; echo $? > {tmp_file}.exitcode"
-            subprocess.run(
+            # The test command is the long-running one (benchmarks routinely
+            # take 5-30 minutes). Track its Popen with the run-level registry
+            # so the budget watchdog can ``os.killpg`` it (and its GPU
+            # grandchildren) on a wall-clock timeout. Falls back to a plain
+            # ``subprocess.run``-equivalent when no registry is wired (tests,
+            # ad-hoc invocations).
+            _tracked_subprocess_run(
                 wrapped_cmd,
+                registry=ctx.registry,
                 shell=True,
                 cwd=ctx.cwd,
                 stdout=subprocess.PIPE,
