@@ -60,6 +60,7 @@ class AgentConfig:
     source_file_paths: list[str] | None = None
     use_skills: bool = False
     tool_profile: str = "full"
+    model_config: dict | None = None
 
 
 # Unified observation truncation for both bash output and tool call results (head + tail).
