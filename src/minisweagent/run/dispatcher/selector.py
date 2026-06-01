@@ -52,12 +52,16 @@ class Dispatcher:
             )
             while len(items) < n:
                 idx = len(items)
+                base_fixed = fixed[0] if fixed else None
                 items.append(
                     DispatchPlanItem(
                         label=f"fixed-pad-{idx}",
-                        task=fixed[0].body if fixed else "",
+                        task=base_fixed.body if base_fixed else "",
                         kind="fixed",
+                        agent_name=base_fixed.agent_name if base_fixed else "general-kernel-optimization",
                         priority=5,
+                        kernel_language=base_fixed.kernel_language if base_fixed else "python",
+                        num_gpus=base_fixed.num_gpus if base_fixed else 1,
                     )
                 )
             items = items[:n]

@@ -158,26 +158,129 @@ def _ensure_safe_directory(repo_path: Path, env: dict[str, str] | None = None) -
 
 
 def _neutralize_nested_git_repos(root: Path) -> list[Path]:
-    """Rename ``.git`` dirs in nested repos to ``.git.bak``.
+    """Rename ``.git`` dirs/files in nested repos to ``.git.bak``.
 
     This turns nested git repos / submodules into plain directories so that
-    git treats their content as regular files.
+    git treats their content as regular files.  Handles both ``.git``
+    directories (standalone nested repos) and ``.git`` files (submodules
+    whose ``.git`` is a ``gitdir: …`` pointer).
     """
     root = root.resolve()
     renamed: list[Path] = []
-    for git_dir in root.rglob(".git"):
-        if git_dir.parent == root:
+    for git_entry in root.rglob(".git"):
+        if git_entry.parent == root:
             continue
-        if git_dir.is_dir():
-            backup = git_dir.parent / ".git.bak"
+        if git_entry.is_dir() or git_entry.is_file():
+            backup = git_entry.parent / ".git.bak"
             try:
                 if backup.exists():
-                    shutil.rmtree(backup)
-                git_dir.rename(backup)
+                    if backup.is_dir():
+                        shutil.rmtree(backup)
+                    else:
+                        backup.unlink()
+                git_entry.rename(backup)
                 renamed.append(backup)
             except Exception:
                 pass
     return renamed
+
+
+def _demote_submodule_gitlinks(worktree_path: Path, env: dict[str, str] | None = None) -> None:
+    """Remove 160000 gitlink entries from the index and re-add content as regular files.
+
+    After ``_neutralize_nested_git_repos`` renames ``.git`` → ``.git.bak`` on
+    disk, the worktree index still carries the old ``160000`` (gitlink) entries.
+    ``git diff`` silently skips these paths, so agent edits inside former
+    submodule directories are invisible to ``save_and_test``.
+
+    This function:
+    1. Finds all gitlink paths in the index.
+    2. ``git rm --cached`` each one (+ ``.gitmodules`` if present).
+    3. ``git add`` the directories as regular files.
+    4. Commits a baseline so subsequent ``git diff`` only shows agent edits.
+    """
+    log = logging.getLogger(__name__)
+
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--stage"],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+    except subprocess.CalledProcessError:
+        return
+
+    gitlink_paths = []
+    for line in result.stdout.splitlines():
+        if line.startswith("160000 "):
+            # format: "160000 <sha> <stage>\t<path>"
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                gitlink_paths.append(parts[1])
+
+    if not gitlink_paths:
+        return
+
+    log.info("Demoting %d submodule gitlink(s) in worktree index: %s", len(gitlink_paths), gitlink_paths)
+
+    # Remove gitlink entries from the index
+    rm_paths = list(gitlink_paths)
+    gitmodules = worktree_path / ".gitmodules"
+    if gitmodules.exists():
+        rm_paths.append(".gitmodules")
+    subprocess.run(
+        ["git", "rm", "--cached", "-f", "--"] + rm_paths,
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    if gitmodules.exists():
+        gitmodules.unlink(missing_ok=True)
+
+    # Re-add former submodule directories as regular files
+    existing_dirs = [p for p in gitlink_paths if (worktree_path / p).is_dir()]
+    if existing_dirs:
+        subprocess.run(
+            ["git", "add", "--"] + existing_dirs,
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+
+    # Commit baseline so git diff only captures subsequent agent edits
+    subprocess.run(
+        ["git", "add", "-A"],
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=geak",
+            "-c",
+            "user.email=geak@local",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "GEAK worktree baseline (submodules demoted)",
+        ],
+        cwd=worktree_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
 
 
 def _resolve_output_root(repo_path: Path, worktree_path: Path) -> Path | None:
@@ -283,6 +386,36 @@ def _copy_untracked_files(repo_path: Path, worktree_path: Path, env: dict[str, s
                 shutil.copy2(src, dst)
     except subprocess.CalledProcessError:
         pass
+
+
+def _symlink_gitignored_so_files(repo_path: Path, worktree_path: Path, env: dict[str, str] | None = None) -> None:
+    """Symlink gitignored .so files from repo into worktree.
+
+    JIT-compiled shared objects are typically gitignored but required at
+    import time (e.g. aiter loads module_aiter_core.so on ``import aiter``).
+    Symlinks are used so agents that need to rebuild a specific .so can
+    ``rm`` the link and JIT-compile a fresh one from modified source.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--others", "--ignored", "--exclude-standard"],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    except subprocess.CalledProcessError:
+        return
+
+    for rel_path in (f.strip() for f in result.stdout.splitlines() if f.strip()):
+        if not rel_path.endswith(".so"):
+            continue
+        src = (repo_path / rel_path).resolve()
+        dst = worktree_path / rel_path
+        if src.is_file() and not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.symlink_to(src)
 
 
 def _apply_dirty_tracked_changes(repo_path: Path, worktree_path: Path, env: dict[str, str] | None = None) -> None:
@@ -449,10 +582,12 @@ def create_worktree(repo_path: Path, worktree_path: Path) -> Path:
     _ensure_safe_directory(worktree_path, git_env)
     _apply_dirty_tracked_changes(repo_path, worktree_path, git_env)
     _copy_untracked_files(repo_path, worktree_path, git_env)
+    _symlink_gitignored_so_files(repo_path, worktree_path, git_env)
     _copy_nested_git_repos(repo_path, worktree_path)
     # Neutralize .git dirs in copied nested repos so the worktree's git
     # treats their content as regular files (clean diffs, no gitlink noise).
     _neutralize_nested_git_repos(worktree_path)
+    _demote_submodule_gitlinks(worktree_path, git_env)
     return worktree_path
 
 
@@ -539,6 +674,9 @@ def _create_worktree_clean(repo_path: Path, worktree_path: Path) -> Path:
         env=git_env,
     )
     _ensure_safe_directory(worktree_path, git_env)
+    _symlink_gitignored_so_files(repo_path, worktree_path, git_env)
+    _neutralize_nested_git_repos(worktree_path)
+    _demote_submodule_gitlinks(worktree_path, git_env)
     log.info("Clean-HEAD worktree created at %s (no dirty/untracked sync)", worktree_path)
     return worktree_path
 

@@ -437,13 +437,13 @@ def run_heterogeneous_orchestrator(
         _preflight_repo_root = str(preprocess_ctx.get("repo_root") or "")
         _preflight_harness = str(preprocess_ctx.get("harness_path") or "")
         _preflight_commandment = preprocess_dir / "COMMANDMENT.md"
-        _preflight_gpu = gpu_ids[0] if gpu_ids else 0
+        _preflight_gpus = gpu_ids if gpu_ids else [0]
         if _preflight_repo_root and _preflight_harness and _preflight_commandment.exists():
             preflight_commandment_contract(
                 _preflight_commandment,
                 _preflight_repo_root,
                 _preflight_harness,
-                _preflight_gpu,
+                _preflight_gpus,
                 output_dir=output_dir,
             )
         else:

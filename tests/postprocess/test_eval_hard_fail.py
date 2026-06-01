@@ -235,7 +235,7 @@ class TestPreflight:
                     cm,
                     repo_root=str(tmp_path),
                     harness_path=str(tmp_path / "h.py"),
-                    gpu_id=0,
+                    gpu_ids=0,
                 )
         assert exc_info.value.section == "PREFLIGHT"
         assert "unrecognized arguments" in exc_info.value.detail
@@ -249,7 +249,7 @@ class TestPreflight:
             tmp_path / "missing.md",
             repo_root=str(tmp_path),
             harness_path=str(tmp_path / "h.py"),
-            gpu_id=0,
+            gpu_ids=0,
         )
 
     def test_preflight_pass(self, tmp_path, monkeypatch):
@@ -270,7 +270,7 @@ class TestPreflight:
                 cm,
                 repo_root=str(tmp_path),
                 harness_path=str(tmp_path / "h.py"),
-                gpu_id=0,
+                gpu_ids=0,
             )
 
     def test_preflight_missing_commandment_raises(self, tmp_path, monkeypatch):
@@ -282,5 +282,5 @@ class TestPreflight:
                 tmp_path / "missing.md",
                 repo_root=str(tmp_path),
                 harness_path=str(tmp_path / "h.py"),
-                gpu_id=0,
+                gpu_ids=0,
             )

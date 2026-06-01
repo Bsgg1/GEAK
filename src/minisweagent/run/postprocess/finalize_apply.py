@@ -192,6 +192,12 @@ def _validate_apply_preconditions(  # pylint: disable=too-many-return-statements
     if result is None:
         logger.warning("[geak apply] Skipping: no BestPatchResult produced by the run.")
         return False
+    if result.best_speedup is not None and result.best_speedup < 1.0:
+        logger.warning(
+            "[geak apply] Skipping: speedup %.4fx is below 1.0; not applying a regression.",
+            result.best_speedup,
+        )
+        return False
     if not result.best_patch_file:
         logger.warning("[geak apply] Skipping: BestPatchResult has no best_patch_file.")
         return False

@@ -124,6 +124,11 @@ def _read_commandment_section(commandment_path: str, section: str) -> str | None
     return "\n".join(lines) if lines else None
 
 
+def _strip_comment_lines(text: str) -> str:
+    """Return *text* with shell comment lines removed (for dedup comparison)."""
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
 def _commandment_test_command(commandment_path: str) -> str | None:
     """Build a test command that executes SETUP then CORRECTNESS then BENCHMARK.
 
@@ -154,7 +159,7 @@ def _commandment_test_command(commandment_path: str) -> str | None:
     if setup:
         lines.append(setup)
     lines.append(correctness)
-    if benchmark:
+    if benchmark and _strip_comment_lines(benchmark) != _strip_comment_lines(correctness):
         lines.append(benchmark)
     script_body = "\n".join(lines) + "\n"
 

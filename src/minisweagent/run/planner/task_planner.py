@@ -49,6 +49,7 @@ class TaskPlanner:
         agent_class: type,
         output_dir: Path | None = None,
         num_gpus: int = 1,
+        num_parallel: int = 1,
         rag_enabled: bool = False,
     ) -> CandidatePool:
         """Produce a ``CandidatePool`` of M tasks for the current round.
@@ -75,12 +76,13 @@ class TaskPlanner:
             agent_name="general-kernel-optimization",
             priority=5,
             kernel_language=kernel_language,
+            num_gpus=num_gpus,
         )
 
-        if mode == "fixed" or num_gpus <= 1:
+        if mode == "fixed" or num_parallel <= 1:
             logger.info(
                 "TaskPlanner: %s — skipping LLM planner, single canonical entry",
-                "fixed mode" if mode == "fixed" else f"single GPU (num_gpus={num_gpus})",
+                "fixed mode" if mode == "fixed" else f"single worker (num_parallel={num_parallel})",
             )
             return CandidatePool(round_num=round_num, items=(canonical_fixed,))
 

@@ -414,18 +414,12 @@ def main(
             task_extracted_mode = pipeline_params["mode"]
             logger.info("Task-extracted run mode: %s.", task_extracted_mode)
 
-        # Prompt for missing required params (kernel_url) — only if not already set
-        if kernel_url is None:
-            from minisweagent.run.utils.config_editor import prompt_missing_pipeline_params
-
-            logger.info("Prompting for missing pipeline parameters.")
-            pipeline_params, should_use_pipeline = prompt_missing_pipeline_params(pipeline_params, console, yolo)
-            logger.info("pipeline_params: %s, should_use_pipeline: %s", pipeline_params, should_use_pipeline)
-
-            if should_use_pipeline:
-                if pipeline_params.get("kernel_url"):
-                    kernel_url = pipeline_params["kernel_url"]
-                    logger.info("Using kernel URL: %s.", kernel_url)
+        # When kernel_url is already set from CLI / pipeline_params, use it.
+        # Otherwise skip the interactive prompt and let codebase-explore
+        # auto-discover the kernel from the repo.
+        if kernel_url is None and pipeline_params.get("kernel_url"):
+            kernel_url = pipeline_params["kernel_url"]
+            logger.info("Using kernel URL from pipeline params: %s.", kernel_url)
 
     # Finalize mode precedence: CLI --mode > task-extracted mode > YAML
     # run.mode > built-in default. Apply presets exactly once. We do this
@@ -494,13 +488,30 @@ def main(
         output = Path(parsed_config["output_dir"])
         logger.info("Using output_dir from task content: %s", output)
 
-    kernel_target = kernel_url or parsed_config.get("kernel_url") or parsed_config.get("kernel_name")
+    kernel_target = kernel_url or parsed_config.get("kernel_url")
 
+    # When kernel_target is missing but repo is available (CLI --repo or
+    # extracted from task), let the adapter's codebase-explore auto-discover
+    # the kernel — don't bail out here.
     if not kernel_target and repo is None:
-        logger.error(
-            "[red]Error: missing kernel target. Provide --kernel-url, --repo, or include kernel info in task.[/red]"
-        )
-        raise typer.Exit(1)
+        # Last-resort: scan the task text for an existing directory path that
+        # could serve as the repo root.  parse_task_info may miss it when the
+        # path is embedded in free-form text.
+        if task_content:
+            import re
+
+            for candidate in re.findall(r"(?:^|\s)(/\S+)", task_content):
+                p = Path(candidate.rstrip(",.;:"))
+                if p.is_dir():
+                    repo = p
+                    logger.info("Inferred repo from task text: %s", repo)
+                    break
+
+        if not kernel_target and repo is None:
+            logger.error(
+                "[red]Error: missing kernel target. Provide --kernel-url, --repo, or include kernel info in task.[/red]"
+            )
+            raise typer.Exit(1)
 
     parsed_gpu_ids = _parse_gpu_ids(gpu_ids)
 

@@ -90,6 +90,7 @@ class WorkingMemory:
     notebook_writer_id: str = "default"
     best_strategy: str = ""
     best_change_category: str = ""
+    metric_direction: str = "lower_is_better"
     pending_strategy: str = ""
     pending_change_category: str = ""
     _notebook: WorkingNotebook | None = field(default=None, init=False, repr=False)
@@ -123,13 +124,15 @@ class WorkingMemory:
 
     def update_latency(self, latency_ms: float):
         """Record a benchmark latency and compute speedup vs baseline."""
+        from minisweagent.run.preprocess.benchmark_parsing import compute_speedup
+
         self.latency_history.append(latency_ms)
         if self.baseline_latency_ms <= 0:
             self.baseline_latency_ms = latency_ms
         if self.best_latency_ms <= 0 or latency_ms < self.best_latency_ms:
             self.best_latency_ms = latency_ms
         if self.baseline_latency_ms > 0 and latency_ms > 0:
-            speedup = self.baseline_latency_ms / latency_ms
+            speedup = compute_speedup(self.baseline_latency_ms, latency_ms, self.metric_direction)
             self.update_speedup(speedup)
 
     def is_diminishing_returns(self) -> bool:
@@ -335,9 +338,11 @@ class WorkingMemory:
                 if len(shape_lats) >= 2:
                     lat_ms = float(shape_lats[-1])
             if lat_ms is not None and lat_ms > 0:
+                from minisweagent.run.preprocess.benchmark_parsing import compute_speedup
+
                 prev_best = self.best_speedup
                 self.update_latency(lat_ms)
-                if self.baseline_latency_ms / lat_ms > prev_best:
+                if compute_speedup(self.baseline_latency_ms, lat_ms, self.metric_direction) > prev_best:
                     self.best_strategy = self.pending_strategy
                     self.best_change_category = self.pending_change_category
 

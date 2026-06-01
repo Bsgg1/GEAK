@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 from minisweagent.debug_runtime import emit_debug_log
 from minisweagent.run.postprocess.benchmark_parsing import (
     compute_shape_speedups,
+    compute_speedup,
+    extract_benchmark_metric,
     extract_latency_ms,
     parse_shape_latencies_ms,
 )
@@ -695,19 +697,23 @@ class SaveAndTestTool:
         except OSError:
             return []
 
+        baseline_metric = extract_benchmark_metric(baseline_text)
+        direction = baseline_metric.direction if baseline_metric else "lower_is_better"
+
         baseline_ms = extract_latency_ms(baseline_text)
         candidate_ms = extract_latency_ms(test_output)
         if baseline_ms is None or candidate_ms is None or baseline_ms <= 0 or candidate_ms <= 0:
             return []
 
+        overall_speedup = compute_speedup(baseline_ms, candidate_ms, direction)
         lines = [
             "\nSpeedup vs true baseline:",
-            (f"Overall: {baseline_ms / candidate_ms:.4f}x ({baseline_ms:.6f} ms -> {candidate_ms:.6f} ms)"),
+            (f"Overall: {overall_speedup:.4f}x ({baseline_ms:.6f} ms -> {candidate_ms:.6f} ms)"),
         ]
 
         baseline_shapes = parse_shape_latencies_ms(baseline_text)
         candidate_shapes = parse_shape_latencies_ms(test_output)
-        per_shape = compute_shape_speedups(baseline_shapes, candidate_shapes)
+        per_shape = compute_shape_speedups(baseline_shapes, candidate_shapes, direction)
         if per_shape:
             lines.append("Per-shape:")
             for shape, metrics in per_shape.items():

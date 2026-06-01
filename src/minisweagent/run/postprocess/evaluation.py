@@ -24,7 +24,9 @@ from typing import Any
 
 from minisweagent.run.postprocess.benchmark_parsing import (
     compute_shape_speedups,
+    compute_speedup,
     extract_benchmark_config_lines,
+    extract_benchmark_metric,
     extract_latency_ms,
     parse_shape_count,
     parse_shape_latencies_ms,
@@ -202,11 +204,15 @@ def build_eval_env(
     work_dir: Path,
     repo_root: str,
     harness_path: str,
-    gpu_id: int,
+    gpu_ids: list[int] | int,
     *,
     benchmark_iterations: int | None = None,
 ) -> dict[str, str]:
     """Build the GEAK_* environment dict for evaluation subprocesses.
+
+    ``gpu_ids`` may be a single int (backward-compat) or a list of GPU
+    device IDs.  Multi-GPU kernels (e.g. cross_device_reduce) need all
+    IDs visible so ``torchrun --nproc_per_node=N`` can see them.
 
     ``benchmark_iterations`` overrides the default iteration count used by
     BENCHMARK / FULL_BENCHMARK commands in the COMMANDMENT.  When ``None``
@@ -215,13 +221,17 @@ def build_eval_env(
     from minisweagent.run.pipeline_helpers import DEFAULT_EVAL_BENCHMARK_ITERATIONS
     from minisweagent.run.preprocess.harness_utils import harness_supports_iterations
 
+    if isinstance(gpu_ids, int):
+        gpu_ids = [gpu_ids]
+    devices = ",".join(str(g) for g in gpu_ids)
+
     iters = benchmark_iterations or DEFAULT_EVAL_BENCHMARK_ITERATIONS
     env = os.environ.copy()
     env["GEAK_WORK_DIR"] = str(work_dir)
     env["GEAK_REPO_ROOT"] = repo_root
     env["GEAK_HARNESS"] = harness_path
-    env["GEAK_GPU_DEVICE"] = str(gpu_id)
-    env["HIP_VISIBLE_DEVICES"] = str(gpu_id)
+    env["GEAK_GPU_DEVICE"] = devices
+    env["HIP_VISIBLE_DEVICES"] = devices
     env["GEAK_BENCHMARK_ITERATIONS"] = str(iters)
     if harness_supports_iterations(harness_path):
         env["GEAK_BENCHMARK_EXTRA_ARGS"] = f"--iterations {iters}"
@@ -285,7 +295,7 @@ def resolve_eval_worktree(
     best_patch_file: str,
     harness_path: str,
     output_dir: Path,
-    gpu_id: int,
+    gpu_ids: list[int] | int,
 ) -> tuple[Path, dict[str, str]]:
     """Create a clean evaluation worktree, apply the patch, build env dict.
 
@@ -297,7 +307,7 @@ def resolve_eval_worktree(
 
     # The harness_path comes from the original location. We assume it does not
     # import the kernel from relative locations.
-    eval_env = build_eval_env(eval_worktree, repo_root, harness_path, gpu_id)
+    eval_env = build_eval_env(eval_worktree, repo_root, harness_path, gpu_ids)
     return eval_worktree, eval_env
 
 
@@ -305,7 +315,7 @@ def preflight_commandment_contract(
     commandment_path: Path,
     repo_root: str,
     harness_path: str,
-    gpu_id: int,
+    gpu_ids: list[int] | int,
     *,
     output_dir: Path | None = None,
     timeout_s: int = 600,
@@ -359,7 +369,7 @@ def preflight_commandment_contract(
         preflight_dir = repo_root_path
 
     try:
-        env = build_eval_env(preflight_dir, str(repo_root_path), harness_path, gpu_id)
+        env = build_eval_env(preflight_dir, str(repo_root_path), harness_path, gpu_ids)
         env["GEAK_BENCHMARK_ITERATIONS"] = "1"
         if harness_supports_iterations(harness_path):
             env["GEAK_BENCHMARK_EXTRA_ARGS"] = "--iterations 1"
@@ -428,7 +438,7 @@ def recapture_commandment_baseline(
     commandment_path: Path,
     repo_root: str,
     harness_path: str,
-    gpu_id: int,
+    gpu_ids: list[int] | int,
     pp_dir: Path,
     *,
     timeout_s: int = 1200,
@@ -442,7 +452,7 @@ def recapture_commandment_baseline(
     only on success; returns True if baseline was recaptured.
     """
     repo_root_path = Path(repo_root).resolve()
-    env = build_eval_env(repo_root_path, repo_root, harness_path, gpu_id)
+    env = build_eval_env(repo_root_path, repo_root, harness_path, gpu_ids)
 
     for section_name in ["FULL_BENCHMARK", "BENCHMARK"]:
         script = build_eval_script(str(commandment_path), ["SETUP", section_name])
@@ -488,6 +498,10 @@ def run_correctness_and_benchmark(
     pp_dir: Path,
     round_eval: dict[str, Any],
     round_num: int,
+    *,
+    repo_root: str | None = None,
+    harness_path: str = "",
+    gpu_ids: list[int] | int | None = None,
 ) -> None:
     """Run CORRECTNESS then FULL_BENCHMARK, compute verified speedup.
 
@@ -548,6 +562,22 @@ def run_correctness_and_benchmark(
         _correctness_stdout = correctness_result.stdout
     else:
         logger.warning("No CORRECTNESS commands found in COMMANDMENT")
+
+    # If neither baseline file exists, try to recapture from the COMMANDMENT
+    # on the unpatched repo. This covers the case where preprocessing didn't
+    # produce a baseline (e.g. non-standard harness that failed validation).
+    _has_any_baseline = (pp_dir / "full_benchmark_baseline.txt").exists() or (
+        pp_dir / "benchmark_baseline.txt"
+    ).exists()
+    if not _has_any_baseline and repo_root:
+        logger.info("No baseline files found; attempting recapture from COMMANDMENT on unpatched repo")
+        recapture_commandment_baseline(
+            commandment_path,
+            repo_root,
+            harness_path,
+            gpu_ids if gpu_ids is not None else [0],
+            pp_dir,
+        )
 
     for baseline_section_name in ["FULL_BENCHMARK", "BENCHMARK"]:
         section_key = baseline_section_name.lower()
@@ -651,19 +681,23 @@ def _compute_verified_speedup(
     measurement get distinct ``failure_reason`` strings, which then flow
     through to ``RoundEvaluation.full_benchmark.failure_reason``.
     """
+    baseline_metric = extract_benchmark_metric(baseline_text)
+    direction = baseline_metric.direction if baseline_metric else "lower_is_better"
+
     candidate_ms = extract_latency_ms(candidate_stdout)
     baseline_ms = extract_latency_ms(baseline_text)
 
     if candidate_ms is None or baseline_ms is None:
         candidate_shapes = parse_shape_latencies_ms(candidate_stdout)
         baseline_shapes = parse_shape_latencies_ms(baseline_text)
-        shape_speedups = compute_shape_speedups(baseline_shapes, candidate_shapes)
+        shape_speedups = compute_shape_speedups(baseline_shapes, candidate_shapes, direction)
         if shape_speedups:
             vals = [s["speedup"] for s in shape_speedups.values()]
             geomean = math.exp(sum(math.log(v) for v in vals) / len(vals))
             round_eval[section_key]["verified_speedup"] = round(geomean, 4)
             round_eval[section_key]["per_shape_speedups"] = shape_speedups
             round_eval[section_key]["speedup_method"] = "per_shape_geomean"
+            round_eval[section_key]["metric_direction"] = direction
             logger.info("  Verified speedup (per-shape geomean): %.4fx (%d shapes)", geomean, len(shape_speedups))
             return
         msg = f"latency parse failed (candidate_ms={candidate_ms}, baseline_ms={baseline_ms})"
@@ -683,10 +717,11 @@ def _compute_verified_speedup(
         round_eval[section_key]["baseline_ms"] = baseline_ms
         return
 
-    verified_speedup = baseline_ms / candidate_ms
+    verified_speedup = compute_speedup(baseline_ms, candidate_ms, direction)
     round_eval[section_key]["verified_speedup"] = round(verified_speedup, 4)
     round_eval[section_key]["candidate_ms"] = candidate_ms
     round_eval[section_key]["baseline_ms"] = baseline_ms
+    round_eval[section_key]["metric_direction"] = direction
     logger.info(f"  Verified speedup: {verified_speedup:.4f}x ({baseline_ms:.4f} ms -> {candidate_ms:.4f} ms)")
 
 
@@ -1080,7 +1115,10 @@ def evaluate_round_best(
     harness_path = ctx.get("harness_path", "")
     if not harness_path:
         logger.warning("No harness_path in ctx; PROFILE step will be skipped")
-    gpu_id = ctx.get("gpu_ids", [0])[0]
+    all_gpu_ids = ctx.get("gpu_ids", [0])
+    num_parallel = ctx.get("num_parallel") or len(all_gpu_ids) or 1
+    gpus_per_task = max(1, len(all_gpu_ids) // num_parallel)
+    eval_gpu_ids = all_gpu_ids[:gpus_per_task]
 
     # --- Resolve worktree, run benchmark + profile, clean up ---
     try:
@@ -1089,7 +1127,7 @@ def evaluate_round_best(
             best_patch_file,
             harness_path,
             output_dir,
-            gpu_id,
+            eval_gpu_ids,
         )
     except PatchApplyError as exc:
         logger.warning("Patch apply failed: %s", exc)
@@ -1108,7 +1146,17 @@ def evaluate_round_best(
         )
 
     try:
-        run_correctness_and_benchmark(eval_worktree, eval_env, commandment_path, pp_dir, round_eval, round_num)
+        run_correctness_and_benchmark(
+            eval_worktree,
+            eval_env,
+            commandment_path,
+            pp_dir,
+            round_eval,
+            round_num,
+            repo_root=repo_root,
+            harness_path=harness_path,
+            gpu_ids=eval_gpu_ids,
+        )
         run_profile(eval_worktree, eval_env, commandment_path, pp_dir, round_eval, round_num, results_dir)
     finally:
         cleanup_eval_worktree(repo_root, eval_worktree)

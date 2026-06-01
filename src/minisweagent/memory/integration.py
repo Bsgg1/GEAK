@@ -2,7 +2,7 @@
 
 Environment flags:
   GEAK_MEMORY_DISABLE=1             -- turn off all memory (within-session + cross-session)
-  GEAK_USE_KNOWLEDGE_BASE=0         -- turn off reading from the knowledge base (on by default)
+  GEAK_USE_KNOWLEDGE_BASE=1         -- turn on reading from the knowledge base (off by default)
   GEAK_SAVE_TO_KNOWLEDGE_BASE=1     -- turn on saving run insights to KB after each run (off by default)
   GEAK_MEMORY_MIN_SPEEDUP=1.10      -- minimum speedup required to save an experience (default 1.10x)
   GEAK_CROSS_SESSION_MEMORY_URL=... -- point to a shared memory server (default: local SQLite)
@@ -30,17 +30,15 @@ def is_memory_enabled() -> bool:
 
 
 def is_retrieve_enabled() -> bool:
-    """Reading from the knowledge base is on by default.
+    """Reading from the knowledge base is off by default.
 
-    Set GEAK_USE_KNOWLEDGE_BASE=0 to turn off.
+    Set GEAK_USE_KNOWLEDGE_BASE=1 to turn on.
     """
     if not is_memory_enabled():
         return False
-    if _is_off("GEAK_USE_KNOWLEDGE_BASE"):
-        return False
     if _is_on("GEAK_MEMORY_NO_CROSS_SESSION"):
         return False
-    return True
+    return _is_on("GEAK_USE_KNOWLEDGE_BASE")
 
 
 def is_record_enabled() -> bool:

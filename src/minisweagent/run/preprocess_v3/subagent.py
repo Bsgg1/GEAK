@@ -252,6 +252,7 @@ class PreprocessSubagent:
         tools: list[str] | None = None,
         step_limit: int = 0,
         cost_limit: float = 0.0,
+        wall_timeout: float = 0.0,
         cwd: str | Path | None = None,
         log_path: Path | None = None,
         extra_template_vars: dict[str, Any] | None = None,
@@ -262,6 +263,7 @@ class PreprocessSubagent:
         self.instance_template = instance_template
         self.step_limit = int(step_limit)
         self.cost_limit = float(cost_limit)
+        self.wall_timeout = float(wall_timeout)
         self.cwd = str(cwd) if cwd is not None else None
         self.log_path = Path(log_path) if log_path is not None else None
         self.extra_template_vars = dict(extra_template_vars or {})
@@ -271,6 +273,7 @@ class PreprocessSubagent:
         self._register_tools(tools)
 
         self._state = _SubagentMessageState()
+        self._wall_t0: float | None = None
 
     # -----------------------------------------------------------------
     # Tool wiring (whitelisting against the v3 registry)
@@ -363,6 +366,12 @@ class PreprocessSubagent:
         cost = float(getattr(self.model, "cost", 0.0) or 0.0)
         if self.cost_limit > 0 and cost >= self.cost_limit:
             raise _LimitsExceeded(f"cost_limit reached: ${cost:.2f} >= ${self.cost_limit:.2f}")
+        if self.wall_timeout > 0 and self._wall_t0 is not None:
+            import time
+
+            elapsed = time.monotonic() - self._wall_t0
+            if elapsed >= self.wall_timeout:
+                raise _LimitsExceeded(f"wall_timeout reached: {elapsed:.0f}s >= {self.wall_timeout:.0f}s")
 
     def step(self) -> dict[str, Any]:
         """Run one LLM turn. Returns the observation dict."""
@@ -498,7 +507,10 @@ class PreprocessSubagent:
         * ``"LimitsExceeded"`` — step / cost budget exhausted.
         * Other terminating exception types surface as their class name.
         """
+        import time
+
         self._state = _SubagentMessageState()
+        self._wall_t0 = time.monotonic()
         self.extra_template_vars |= {"task": task, **template_kwargs}
         self.extra_template_vars.setdefault("tool_names", set(self._tool_table.keys()))
 

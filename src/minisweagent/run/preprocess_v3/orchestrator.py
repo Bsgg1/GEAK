@@ -117,7 +117,7 @@ Before any other action, read the task prompt and classify it into exactly ONE o
 **Case A — user provided explicit run instructions / commands.**
 Indicators: a literal command-line invocation (``python <script>``, ``pytest ... -k ...``, ``make ...``, shell script, existing custom harness command). The command is opaque: it may NOT support GEAK's four harness flags.
 
-Action: run ``run_discovery`` because it is the standard cheap deterministic front step, then call ``commandment_from_user_command`` with the extracted user command. Discovery/ATD is IRRELEVANT for this case: do not inspect it to alter the user command, and do not generate a harness.
+Action: **skip ``run_discovery``** — the user already told you what to run, so test discovery is unnecessary and wastes time. Go directly to ``commandment_from_user_command`` with the extracted user command. Do not generate a harness.
 
 **STRICT keyword-argument names for ``commandment_from_user_command``** (do NOT use synonyms — the tool will TypeError):
 
@@ -133,7 +133,12 @@ commandment_from_user_command(
 
 **Important exception**: if the "Hints from the call site" section says the harness is **pre-validated** and supports the four standard modes (``--correctness``, ``--benchmark``, ``--full-benchmark``, ``--profile``), you MUST list all four modes in ``modes_covered`` when calling ``commandment_from_user_command``. The tool will substitute the correct flag for each COMMANDMENT section automatically. Do NOT put all modes in ``inferred_modes`` — use ``modes_covered``.
 
-**After ``commandment_from_user_command`` succeeds**: if the return value includes a ``harness_path`` (i.e. the command references a standard harness file), call ``collect_baseline(harness_path=<path>)`` and ``collect_profile(harness_path=<path>)`` before calling ``finish_preprocess``. These are fast deterministic subprocess calls (~30-60s total) and their output is required for downstream verified-speedup evaluation. If either call fails, proceed anyway — record the failure and call ``finish_preprocess``.
+**After ``commandment_from_user_command`` succeeds**, you **MUST** call ``collect_baseline`` before calling ``finish_preprocess``. Baseline is **required** for downstream verified-speedup evaluation:
+
+- If the return value includes a ``harness_path``, call ``collect_baseline(harness_path=<path>)`` and ``collect_profile(harness_path=<path>)``.
+- If ``harness_path`` is null/absent, call ``collect_baseline(eval_command="<eval_command from the return value>")`` — use the ``eval_command`` field from ``commandment_from_user_command``'s return value (NOT the original ``run_command`` you passed in, because the tool sanitizes the command to add GEAK metric markers). This runs the eval command directly and parses ``GEAK_METRIC`` / ``GEAK_RESULT_LATENCY_MS`` markers from stdout.
+
+If either call fails, proceed anyway — record the failure and call ``finish_preprocess``.
 
 **Case B — user provided explicit shapes/configs but no runnable command.**
 Indicators: the task names exact shapes, dims, dtype/config tuples, model-production configs, or says "use only this shape/config". The user's shapes/configs are authoritative.
@@ -151,11 +156,13 @@ Action: run ``run_discovery`` and use its legacy ATD output as authoritative. Th
 
 # Common deterministic step
 
-## Step 1 — legacy discovery front half (deterministic, all cases)
+## Step 1 — legacy discovery front half (deterministic, Case B and C only)
 
 Call ``run_discovery`` with ``repo_root``, ``kernel_path``, and ``output_dir``. This reuses the legacy deterministic discovery pipeline: resolve kernel/repo, write ``CODEBASE_CONTEXT.md``, run automated-test-discovery, write ``discovery.json``, and write ``DISCOVERY_CONTEXT.md`` with the legacy UTA ``FILES YOU MUST READ`` block.
 
-Important: discovery/ATD has only two states: AUTHORITATIVE or IRRELEVANT. It is AUTHORITATIVE only in Case C. It is IRRELEVANT in Case A and Case B. Never treat discovery as an auxiliary hint in Case A or B.
+**Case A skips this step entirely** — the user already provided a test command, so discovery is unnecessary. Proceed directly to ``commandment_from_user_command``.
+
+For Case B and C: discovery/ATD has only two states: AUTHORITATIVE or IRRELEVANT. It is AUTHORITATIVE only in Case C. It is IRRELEVANT in Case B. Never treat discovery as an auxiliary hint in Case B.
 
 ## Step 2 — translate (conditional)
 
@@ -216,17 +223,17 @@ After ``finish_preprocess`` returns, the orchestrator loop terminates.
 
 # Available tools
 
-1. ``run_discovery`` — deterministic legacy discovery front half; always runs first, but its output is authoritative only in Case C and irrelevant in Cases A/B.
+1. ``run_discovery`` — deterministic legacy discovery front half; runs for Case B and C only (Case A skips it). Its output is authoritative only in Case C and irrelevant in Case B.
 2. ``codebase_explore`` — deterministic legacy codebase context only; compatibility fallback if ``run_discovery`` fails before writing context.
 3. ``translate_to_flydsl`` — deterministic; step 2 (conditional, Path B only).
 4. ``dispatch_subagent`` — LLM dispatch. ``name`` argument must be ``harness-generator`` or ``harness-verifier``. Path B steps 3a and 3b only.
-5. ``collect_baseline`` — deterministic; step 4 (Path A when harness is available, and Path B).
+5. ``collect_baseline`` — deterministic; **MUST be called for both Path A and Path B**. Accepts either ``harness_path`` (runs ``python harness --benchmark``) or ``eval_command`` (runs the command directly). At least one is required.
 6. ``collect_profile`` — deterministic; step 4 (Path A when harness is available, and Path B).
 7. ``render_commandment`` — deterministic; Path B step 5.
 8. ``commandment_from_user_command`` — Path A short-circuit. Mutually exclusive with ``dispatch_subagent("harness-generator", ...)``.
 9. ``finish_preprocess`` — completion sentinel; terminates the loop only when final invariants pass.
 
-Begin by classifying the task into Case A, B, or C, then call ``run_discovery``. After discovery, follow the case-specific action above.
+Begin by classifying the task into Case A, B, or C. For Case A, skip discovery and go directly to ``commandment_from_user_command``. For Case B or C, call ``run_discovery`` first, then follow the case-specific action above.
 """
 
 
@@ -301,7 +308,7 @@ class PreprocessOrchestratorConfig:
         "- gpu_id: {{gpu_id}}\n\n"
         "## Task\n"
         "{{task}}\n\n"
-        "Classify the task into Case A, B, or C, then begin with run_discovery."
+        "Classify the task into Case A, B, or C. For Case A, skip discovery and go directly to commandment_from_user_command. For Case B or C, begin with run_discovery."
     )
 
 
@@ -834,7 +841,14 @@ class PreprocessOrchestratorAgent:
         for err in errors:
             text = err if isinstance(err, str) else str(err)
             stripped = text.lstrip()
-            if stripped.startswith("collect_baseline") or stripped.startswith("collect_profile"):
+            lower = stripped.lower()
+            if (
+                stripped.startswith("collect_baseline")
+                or stripped.startswith("collect_profile")
+                or stripped.startswith("PATH_A_PARTIAL_COVERAGE")
+                or "opaque" in lower
+                or "no harness_path available" in lower
+            ):
                 warnings.append(text)
             else:
                 real_errors.append(text)

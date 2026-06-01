@@ -6,7 +6,7 @@ server. Everything else auto-configures.
   - URL set   -> remote backend (REST client)
   - URL unset -> local backend (SQLite at ~/.cache/geak/memory.db)
   - GEAK_MEMORY_DISABLE=1            -> turn off all memory
-  - GEAK_USE_KNOWLEDGE_BASE=0        -> turn off reading from KB (on by default)
+  - GEAK_USE_KNOWLEDGE_BASE=1        -> turn on reading from KB (off by default)
   - GEAK_SAVE_TO_KNOWLEDGE_BASE=1    -> turn on saving to KB after runs (off by default)
 """
 

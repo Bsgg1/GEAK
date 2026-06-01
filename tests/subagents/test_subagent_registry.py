@@ -9,8 +9,8 @@ from minisweagent.subagents import SubAgentRegistry
 
 EXPECTED_BUNDLED_SUBAGENTS = {
     "codebase-explore",
+    "gemm-tuning",
     "general-kernel-optimization",
-    "harness-generator",
     "pytorch-to-flydsl",
     "reverse-knowledge",
     "speedup-verify",
@@ -25,12 +25,12 @@ def test_discovers_bundled_subagents() -> None:
 
 def test_loads_registered_system_prompt() -> None:
     registry = SubAgentRegistry()
-    descriptor = registry.get("harness-generator")
+    descriptor = registry.get("general-kernel-optimization")
 
     assert descriptor is not None
     prompt = registry.load_system_prompt(descriptor)
     assert prompt is not None
-    assert "harness" in prompt.lower()
+    assert "kernel" in prompt.lower()
 
 
 def test_build_tool_schema_includes_registered_agent_names() -> None:
@@ -49,7 +49,7 @@ def test_build_taskgen_catalog_uses_descriptors() -> None:
     catalog = registry.build_taskgen_catalog()
 
     assert "general-kernel-optimization" in catalog
-    assert "harness-generator" in catalog
+    assert "gemm-tuning" in catalog
     assert "tool_profile" in catalog
 
 
