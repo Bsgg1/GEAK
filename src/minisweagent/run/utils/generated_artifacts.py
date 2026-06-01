@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Callable
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
 
@@ -181,6 +182,115 @@ def strip_generated_helper_sections(patch_text: str) -> tuple[str, list[str]]:
         kept.extend(section)
 
     return "".join(kept), removed
+
+
+def _strip_diff_sections(
+    patch_text: str,
+    predicate: Callable[[str], bool],
+) -> tuple[str, list[str]]:
+    """Generic helper: drop ``diff --git`` sections whose path satisfies *predicate*.
+
+    Used by :func:`strip_jit_cache_sections` so JIT filtering stays behaviourally
+    aligned with :func:`strip_generated_helper_sections` (only the predicate differs).
+
+    Returns ``(sanitized_patch_text, removed_paths)``. Non-diff preamble and
+    sections without parseable ``diff --git`` headers are preserved verbatim.
+    """
+
+    if not patch_text.strip():
+        return patch_text, []
+
+    lines = patch_text.splitlines(keepends=True)
+    preamble: list[str] = []
+    sections: list[list[str]] = []
+    current: list[str] | None = None
+
+    for line in lines:
+        if line.startswith("diff --git "):
+            if current is not None:
+                sections.append(current)
+            current = [line]
+            continue
+        if current is None:
+            preamble.append(line)
+        else:
+            current.append(line)
+
+    if current is not None:
+        sections.append(current)
+
+    if not sections:
+        return patch_text, []
+
+    kept: list[str] = list(preamble)
+    removed: list[str] = []
+    for section in sections:
+        parsed = _parse_git_diff_paths(section[0])
+        if parsed is None:
+            kept.extend(section)
+            continue
+        a_path, b_path = parsed
+        if predicate(a_path) or predicate(b_path):
+            removed.append(b_path or a_path)
+            continue
+        kept.extend(section)
+
+    return "".join(kept), removed
+
+
+# ---------------------------------------------------------------------------
+# JIT runtime cache exclusion
+# ---------------------------------------------------------------------------
+#
+# The patterns above target files the GEAK *infrastructure* writes at the
+# worktree root. They do NOT cover JIT runtime cache files that the kernel
+# under test writes inside the package tree (e.g. aiter flydsl_cache pkls).
+# Those can ride along inside every patch and pollute final_report.json's
+# ``optimized_codes`` with hundreds of 0-byte "added" entries.
+
+_JIT_CACHE_PATH_SEGMENTS: frozenset[str] = frozenset(
+    {
+        "flydsl_cache",
+        ".triton",
+        "triton_cache",
+        "torch_compile_cache",
+        ".aiter_jit",
+    }
+)
+
+_JIT_NESTED_BUILD_DIRS: frozenset[str] = frozenset({"build", "__pycache__"})
+
+
+def is_jit_cache_artifact(rel_path: str | None) -> bool:
+    """Return True when *rel_path* lives inside a known JIT runtime cache."""
+
+    if not rel_path:
+        return False
+    rel = str(rel_path).lstrip("/")
+    if rel.startswith("./"):
+        rel = rel[2:]
+    if not rel:
+        return False
+    parts = PurePosixPath(rel).parts
+    for seg in parts:
+        if seg in _JIT_CACHE_PATH_SEGMENTS:
+            return True
+    for i in range(len(parts) - 1):
+        if parts[i] == "jit" and parts[i + 1] in _JIT_NESTED_BUILD_DIRS:
+            return True
+    return False
+
+
+def strip_jit_cache_sections(patch_text: str) -> tuple[str, list[str]]:
+    """Drop diff sections whose path lives inside a JIT runtime cache."""
+
+    return _strip_diff_sections(patch_text, is_jit_cache_artifact)
+
+
+def jit_cache_diff_basename_excludes() -> list[str]:
+    """Return JIT-cache directory basenames for ``diff -ruN --exclude=PATTERN``."""
+
+    return sorted(_JIT_CACHE_PATH_SEGMENTS)
 
 
 # Conflict-marker regexes. We reject patches whose 3-way merge result contains

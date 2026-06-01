@@ -24,7 +24,11 @@ from minisweagent.run.postprocess.benchmark_parsing import (
     extract_latency_ms,
     parse_shape_latencies_ms,
 )
-from minisweagent.run.utils.generated_artifacts import generated_helper_excludes
+from minisweagent.run.utils.generated_artifacts import (
+    generated_helper_excludes,
+    jit_cache_diff_basename_excludes,
+    strip_jit_cache_sections,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -782,7 +786,9 @@ class SaveAndTestTool:
                 timeout=30,
                 shell=True,
             )
-            return result.stdout
+            if result.returncode == 0 and result.stdout.strip():
+                return self._strip_jit_cache_from_patch(result.stdout)
+            # Fall through to diff -ruN when git diff fails or returns empty.
 
         if ctx.base_repo_path and ctx.base_repo_path.exists():
             excludes = [
@@ -806,6 +812,14 @@ class SaveAndTestTool:
                 "*.ncu-rep",
                 "__hip_fatbin",
                 ".cache",
+                # JIT runtime caches (.aiter_jit, .triton, flydsl_cache,
+                # torch_compile_cache, triton_cache) are pre-excluded here so
+                # ``diff -ruN`` never scans them in the first place. The
+                # ``_strip_jit_cache_from_patch`` post-filter below still runs
+                # as defence-in-depth, but pre-excluding avoids walking
+                # potentially large cache trees and keeps the captured patch
+                # narrower from the start.
+                *jit_cache_diff_basename_excludes(),
                 *self._generated_helper_excludes(),
             ]
             if ctx.patch_output_dir:
@@ -832,9 +846,31 @@ class SaveAndTestTool:
             # without choking on absolute paths like
             # ``--- /home/user/repo/.../kernel.py``. Otherwise eval fails
             # with "kernel.py: No such file or directory".
-            return _normalize_diff_ruN_to_git(result.stdout, ctx.base_repo_path, cwd)
+            normalized = _normalize_diff_ruN_to_git(result.stdout, ctx.base_repo_path, cwd)
+            return self._strip_jit_cache_from_patch(normalized)
 
         return ""
+
+    @staticmethod
+    def _strip_jit_cache_from_patch(patch_text: str) -> str:
+        """Drop any ``diff --git`` section whose path is a JIT runtime cache.
+
+        Layer A of the "no JIT pkls in final_report.optimized_codes" fix.
+        ``git add -N . && git diff`` can capture flydsl_cache placeholder pkls
+        when the harness imports the package. Post-strip the rendered patch;
+        Layer B (collect_optimized_codes) provides defence-in-depth.
+        """
+
+        if not patch_text:
+            return patch_text
+        sanitized, removed = strip_jit_cache_sections(patch_text)
+        if removed:
+            logger.info(
+                "save_and_test: stripped %d JIT-cache section(s) from captured patch (sample: %s)",
+                len(removed),
+                ", ".join(removed[:3]),
+            )
+        return sanitized
 
     # Evaluation infrastructure files that agents must never modify.
     # These are restored from git baseline before every test run.

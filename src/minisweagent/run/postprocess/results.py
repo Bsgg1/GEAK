@@ -287,9 +287,40 @@ def merge_round_evaluation_into_final_report(
             merged["agent_summary"] = existing_summary
         merged["summary"] = canonical_summary
 
+    _attach_optimized_codes(ctx, output_dir, merged)
+
     final_report_path.write_text(json.dumps(merged, indent=2, default=str))
     record_final_outcome(ctx, merged)
     return merged
+
+
+def _attach_optimized_codes(
+    ctx: dict[str, Any],
+    output_dir: Path,
+    report: dict[str, Any],
+) -> None:
+    """Populate ``report['optimized_codes']`` by snapshotting the best patch.
+
+    Defensive wrapper: anything that goes wrong inside ``collect_optimized_codes``
+    is silently swallowed (the helper already returns a structured ``skipped``
+    payload for expected failures). Final report writing must never fail just
+    because the snapshot step did.
+    """
+    best_patch = report.get("best_patch")
+    if not best_patch:
+        return
+    repo_root = ctx.get("repo_root")
+    if not repo_root:
+        logger.debug("optimized_codes: ctx['repo_root'] missing; skipping snapshot.")
+        return
+    try:
+        from minisweagent.run.postprocess.optimized_codes import collect_optimized_codes
+
+        manifest = collect_optimized_codes(repo_root, best_patch, output_dir)
+        if manifest:
+            report["optimized_codes"] = manifest
+    except Exception as exc:
+        logger.warning("optimized_codes: snapshot failed: %s", exc)
 
 
 def post_round_evaluate(
@@ -373,6 +404,7 @@ def _dict_to_final_report(d: dict[str, Any]) -> Any:
     best_speedup = d.get("best_speedup")
     if best_speedup is None:
         best_speedup = parse_reported_speedup(d.get("total_speedup"))
+    optimized = d.get("optimized_codes")
     return FinalReport(
         status=str(d.get("status", "complete")),
         summary=str(d.get("summary", "")),
@@ -381,6 +413,7 @@ def _dict_to_final_report(d: dict[str, Any]) -> Any:
         best_task=d.get("best_task"),
         best_speedup=float(best_speedup) if best_speedup is not None else None,
         verified_speedup_unclamped=float(verified_raw) if verified_raw is not None else None,
+        optimized_codes=optimized if isinstance(optimized, dict) else None,
     )
 
 
@@ -434,6 +467,7 @@ def finalize_run(
             finalize_result.setdefault("status", "complete")
             finalize_result.setdefault("best_speedup", 1.0)
             finalize_result.setdefault("best_speedup_verified", 1.0)
+            _attach_optimized_codes(ctx, output_dir, finalize_result)
             report_path.write_text(json.dumps(finalize_result, indent=2, default=str))
             logger.info("Wrote final_report.json (no verified round evaluations)")
         return _dict_to_final_report(finalize_result)
@@ -542,6 +576,7 @@ def auto_finalize(
         "the orchestrator will run FULL_BENCHMARK automatically after this round; "
         "do not use this speedup for final selection)"
     )
+    _attach_optimized_codes(ctx, output_dir, report)
     report_path.write_text(json.dumps(report, indent=2))
     logger.info("Auto-finalized: %s", summary_text)
     logger.info("Report written to: %s", report_path)
