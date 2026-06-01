@@ -166,11 +166,11 @@ class ToolRuntime:
         self.use_strategy_manager = use_strategy_manager
         self._codebase_context: str | None = None
 
-    def wrap_rag_tools_with_postprocessor(self, api_key: str | None = None) -> None:
+    def wrap_rag_tools_with_postprocessor(self, model_config: dict | None = None) -> None:
         """Wrap RAG MCP tools with RAGPostProcessor for result filtering."""
         from minisweagent.tools.rag_postprocessor import RAGPostProcessor, RAGPostProcessorConfig
 
-        postprocessor = RAGPostProcessor(RAGPostProcessorConfig(enabled=True, api_key=api_key))
+        postprocessor = RAGPostProcessor(RAGPostProcessorConfig(enabled=True, model_config=model_config))
 
         def _wrap(tool_callable):
             def wrapper(**kwargs):
