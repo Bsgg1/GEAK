@@ -222,19 +222,17 @@ _TIME_UNIT_TO_MS: dict[str, float] = {
 
 
 def _metric_to_ms(metric: BenchmarkMetric) -> float:
-    """Convert a :class:`BenchmarkMetric` value to milliseconds.
+    """Normalise a :class:`BenchmarkMetric` value for comparison.
 
-    For time-based units this is a direct conversion.  For throughput
-    units (higher-is-better) we return a synthetic inverse
-    (``1000 / value``) so that legacy callers comparing in ms-space
-    still get directionally correct results.
+    For time-based units (ms/us/ns/s) this converts to milliseconds.
+    For non-time units (GB/s, TFLOPS, …) the raw value is returned
+    as-is.  Callers must pass the metric's original ``direction`` to
+    :func:`compute_speedup` so the ratio is computed correctly.
     """
     factor = _TIME_UNIT_TO_MS.get(metric.unit.lower())
     if factor is not None:
         return metric.value * factor
-    if metric.value > 0:
-        return 1000.0 / metric.value
-    return 0.0
+    return metric.value
 
 
 def extract_benchmark_metric(text: str) -> BenchmarkMetric | None:
