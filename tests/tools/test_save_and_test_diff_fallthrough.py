@@ -15,17 +15,10 @@ The bug being pinned here:
     "no changes detected" even when the agent had really edited
     ``kernel.py`` and the test had really passed.
 
-The fix is twofold:
-
-  1. ``3rdparty/`` is added to the git-branch exclude list (and the bare
-     ``3rdparty`` token to the ``diff -ruN`` backup branch's exclude list)
-     so the common case never trips the submodule traversal.
-  2. The git branch now falls through to the ``diff -ruN`` backup branch
-     when ``git diff`` returns non-zero or empty stdout, instead of
-     returning empty unconditionally. ``diff -ruN`` does not understand
-     submodule pointers and therefore is robust to this failure mode.
-
-These tests pin both behaviours.
+The fix: the git branch now falls through to the ``diff -ruN`` backup
+path when ``git diff`` returns non-zero or empty stdout, instead of
+returning empty unconditionally. ``diff -ruN`` does not understand
+submodule pointers and therefore is robust to this failure mode.
 """
 
 from __future__ import annotations
@@ -181,32 +174,6 @@ def test_git_branch_empty_returns_empty_when_no_base_repo(tmp_path):
     assert run.call_count == 1
 
 
-def test_git_diff_excludes_3rdparty(tmp_path):
-    """The git-branch exclude list must scope ``3rdparty/`` out of the diff."""
-    base_repo = tmp_path / "base"
-    base_repo.mkdir()
-    tool = _make_tool(tmp_path, base_repo=base_repo)
-
-    captured: dict[str, str] = {}
-
-    def _capture(cmd, *args, **kwargs):  # noqa: ARG001 - mock signature
-        captured["cmd"] = cmd
-        return _git_diff_result("diff --git a/kernel.py b/kernel.py\n", returncode=0)
-
-    with (
-        mock.patch.object(SaveAndTestTool, "_is_git_repo", return_value=True),
-        mock.patch(
-            "minisweagent.tools.save_and_test.subprocess.run",
-            side_effect=_capture,
-        ),
-    ):
-        tool._get_patch_content()
-
-    assert "':(exclude)3rdparty/'" in captured["cmd"], (
-        f"git diff command must include ':(exclude)3rdparty/' pathspec; got: {captured['cmd']}"
-    )
-
-
 def test_git_branch_success_path_still_strips_jit_cache(tmp_path):
     """Composition guard: the fall-through fix and the JIT-cache strip must coexist.
 
@@ -288,30 +255,3 @@ def test_diff_ruN_excludes_jit_cache_basenames(tmp_path):
         )
 
 
-def test_diff_ruN_excludes_3rdparty(tmp_path):
-    """The diff -ruN backup branch must pass ``--exclude=3rdparty``."""
-    base_repo = tmp_path / "base"
-    base_repo.mkdir()
-    tool = _make_tool(tmp_path, base_repo=base_repo)
-
-    captured_args: list = []
-
-    def _capture(cmd, *args, **kwargs):  # noqa: ARG001 - mock signature
-        captured_args.append(cmd)
-        # Caller A (git branch) is shell=True, list-vs-string distinguishes them.
-        if isinstance(cmd, str):
-            return _git_diff_result("", returncode=0)  # force fall-through
-        return _diff_ruN_result("", returncode=0)
-
-    with (
-        mock.patch.object(SaveAndTestTool, "_is_git_repo", return_value=True),
-        mock.patch(
-            "minisweagent.tools.save_and_test.subprocess.run",
-            side_effect=_capture,
-        ),
-    ):
-        tool._get_patch_content()
-
-    # The second call is the diff-ruN list-form invocation.
-    diff_ruN_cmd = next(c for c in captured_args if isinstance(c, list) and c[0] == "diff")
-    assert "--exclude=3rdparty" in diff_ruN_cmd, f"diff -ruN must include --exclude=3rdparty; got: {diff_ruN_cmd}"

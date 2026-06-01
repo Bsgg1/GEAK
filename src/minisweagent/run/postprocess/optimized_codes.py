@@ -277,13 +277,10 @@ def collect_optimized_codes(
         entries = _git_diff_name_status(eval_dir)
         added, modified, deleted, renamed = _classify_entries(entries)
 
-        added, modified, deleted, renamed, filtered_jit_cache = _drop_jit_cache_paths(
-            added, modified, deleted, renamed
-        )
+        added, modified, deleted, renamed, filtered_jit_cache = _drop_jit_cache_paths(added, modified, deleted, renamed)
         if filtered_jit_cache:
             logger.info(
-                "collect_optimized_codes: dropped %d JIT-cache path(s) from snapshot "
-                "(sample: %s)",
+                "collect_optimized_codes: dropped %d JIT-cache path(s) from snapshot (sample: %s)",
                 len(filtered_jit_cache),
                 ", ".join(filtered_jit_cache[:3]),
             )
@@ -292,11 +289,7 @@ def collect_optimized_codes(
             shutil.rmtree(target_dir, ignore_errors=True)
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        snapshot_paths = (
-            sorted(set(added))
-            + sorted(set(modified))
-            + sorted(r["to"] for r in renamed)
-        )
+        snapshot_paths = sorted(set(added)) + sorted(set(modified)) + sorted(r["to"] for r in renamed)
         files_copied, total_bytes = _copy_snapshot(eval_dir, target_dir, snapshot_paths)
 
         manifest: dict[str, Any] = {
