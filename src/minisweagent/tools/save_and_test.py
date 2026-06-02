@@ -33,77 +33,54 @@ from minisweagent.run.utils.generated_artifacts import (
 logger = logging.getLogger(__name__)
 
 
-def _normalize_diff_ruN_to_git(patch_text: str, base_repo: Path, cwd: Path) -> str:
-    """Rewrite ``diff -ruN`` headers (absolute paths) to git-style relative.
+def _normalize_noindex_to_relative(patch_text: str, base_repo: Path, cwd: Path) -> str:
+    """Strip absolute base/cwd prefixes from ``git diff --no-index`` headers.
 
-    ``diff -ruN /abs/base /abs/cwd`` produces headers like::
+    ``git diff --no-index /abs/base /abs/cwd`` emits git-style headers that
+    already carry ``/dev/null`` and ``new file mode`` lines for created files,
+    but the ``a/`` and ``b/`` paths keep the absolute prefixes::
 
-        diff -ruN /abs/base/kernel.py /abs/cwd/kernel.py
-        --- /abs/base/kernel.py    2026-04-17 19:10:02 +0000
-        +++ /abs/cwd/kernel.py     2026-04-19 01:21:00 +0000
+        diff --git a/abs/cwd/newfile.py b/abs/cwd/newfile.py
+        new file mode 100644
+        --- /dev/null
+        +++ b/abs/cwd/newfile.py
 
-    ``git apply`` rejects these because it can't find ``/abs/base/kernel.py``.
-    Rewrite to::
+    ``git apply`` needs repo-relative paths, so rewrite to::
 
-        diff --git a/kernel.py b/kernel.py
-        --- a/kernel.py
-        +++ b/kernel.py
+        diff --git a/newfile.py b/newfile.py
+        new file mode 100644
+        --- /dev/null
+        +++ b/newfile.py
 
-    The relative path is derived by stripping the ``base_repo`` / ``cwd``
-    prefix from each header line. Returns the input unchanged if no
-    rewrite is needed.
+    Only ``diff --git ``, ``--- ``, and ``+++ `` header lines are touched;
+    ``/dev/null``, ``new file mode``, ``index``, and hunk lines pass through
+    untouched. Both base and cwd prefixes are stripped from both the ``a/``
+    and ``b/`` sides because ``git diff --no-index`` uses the cwd path on both
+    sides for a newly created file. Returns the input unchanged if empty.
     """
     if not patch_text:
         return patch_text
-    base_str = str(Path(base_repo).resolve()).rstrip("/")
-    cwd_str = str(Path(cwd).resolve()).rstrip("/")
+    base_rel = str(Path(base_repo).resolve()).lstrip("/").rstrip("/")
+    cwd_rel = str(Path(cwd).resolve()).lstrip("/").rstrip("/")
+
+    # ``a/<abs>/`` -> ``a/`` and ``b/<abs>/`` -> ``b/`` for both trees.
+    replacements = [
+        (f"a/{base_rel}/", "a/"),
+        (f"a/{cwd_rel}/", "a/"),
+        (f"b/{base_rel}/", "b/"),
+        (f"b/{cwd_rel}/", "b/"),
+    ]
 
     out_lines: list[str] = []
     rewrote = False
     for line in patch_text.splitlines():
-        if line.startswith("diff -ruN "):
-            # Try to derive the relative path of the changed file from the
-            # second argument (the cwd-side path).
-            parts = line.split()
-            if len(parts) >= 4:
-                rel = parts[-1]
-                if rel.startswith(cwd_str + "/"):
-                    rel = rel[len(cwd_str) + 1 :]
-                elif rel.startswith(base_str + "/"):
-                    rel = rel[len(base_str) + 1 :]
-                out_lines.append(f"diff --git a/{rel} b/{rel}")
-                rewrote = True
-                continue
-        if line.startswith("--- "):
-            payload = line[4:].split("\t", 1)[0].strip()
-            if payload == "/dev/null":
-                out_lines.append("--- /dev/null")
-                continue
-            rel = payload
-            for prefix in (base_str + "/", cwd_str + "/"):
-                if rel.startswith(prefix):
-                    rel = rel[len(prefix) :]
-                    break
-            else:
-                # Fall back to basename if neither prefix matches.
-                rel = Path(payload).name
-            out_lines.append(f"--- a/{rel}")
-            rewrote = True
-            continue
-        if line.startswith("+++ "):
-            payload = line[4:].split("\t", 1)[0].strip()
-            if payload == "/dev/null":
-                out_lines.append("+++ /dev/null")
-                continue
-            rel = payload
-            for prefix in (base_str + "/", cwd_str + "/"):
-                if rel.startswith(prefix):
-                    rel = rel[len(prefix) :]
-                    break
-            else:
-                rel = Path(payload).name
-            out_lines.append(f"+++ b/{rel}")
-            rewrote = True
+        if line.startswith(("diff --git ", "--- ", "+++ ")):
+            new_line = line
+            for needle, sub in replacements:
+                if needle in new_line:
+                    new_line = new_line.replace(needle, sub)
+                    rewrote = True
+            out_lines.append(new_line)
             continue
         out_lines.append(line)
 
@@ -788,7 +765,7 @@ class SaveAndTestTool:
             )
             if result.returncode == 0 and result.stdout.strip():
                 return self._strip_jit_cache_from_patch(result.stdout)
-            # Fall through to diff -ruN when git diff fails or returns empty.
+            # Fall through to ``git diff --no-index`` when git diff fails or returns empty.
 
         if ctx.base_repo_path and ctx.base_repo_path.exists():
             excludes = [
@@ -814,9 +791,9 @@ class SaveAndTestTool:
                 ".cache",
                 # JIT runtime caches (.aiter_jit, .triton, flydsl_cache,
                 # torch_compile_cache, triton_cache) are pre-excluded here so
-                # ``diff -ruN`` never scans them in the first place. The
-                # ``_strip_jit_cache_from_patch`` post-filter below still runs
-                # as defence-in-depth, but pre-excluding avoids walking
+                # ``git diff --no-index`` never scans them in the first place.
+                # The ``_strip_jit_cache_from_patch`` post-filter below still
+                # runs as defence-in-depth, but pre-excluding avoids walking
                 # potentially large cache trees and keeps the captured patch
                 # narrower from the start.
                 *jit_cache_diff_basename_excludes(),
@@ -827,26 +804,31 @@ class SaveAndTestTool:
                 if run_dir_name:
                     excludes.append(run_dir_name)
 
+            # ``git diff --no-index`` is git-native (unlike plain ``diff -ruN``):
+            # it emits ``--- /dev/null`` + ``new file mode`` for files the agent
+            # created and derives the executable bit from ``stat`` for free, so a
+            # later ``git apply`` recreates new files with the right mode. The
+            # only post-processing needed is stripping the absolute base/cwd
+            # prefixes from the ``a/`` ``b/`` headers. ``--no-index`` exits 1 when
+            # there are differences (like plain diff), so the return code is
+            # intentionally ignored and we read stdout directly.
+            exclude_args = [f":(exclude){entry}" for entry in excludes]
             result = subprocess.run(
                 [
+                    "git",
                     "diff",
-                    "-ruN",
-                    "--exclude=.git",
-                    "--exclude=__pycache__",
-                    *[f"--exclude={p}" for p in excludes if p not in (".git", "__pycache__")],
+                    "--no-index",
+                    "--no-color",
                     str(ctx.base_repo_path),
                     str(cwd),
+                    "--",
+                    *exclude_args,
                 ],
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
-            # Normalize ``diff -ruN`` headers into git-style relative paths
-            # so that ``git apply`` in the eval worktree can apply the patch
-            # without choking on absolute paths like
-            # ``--- /home/user/repo/.../kernel.py``. Otherwise eval fails
-            # with "kernel.py: No such file or directory".
-            normalized = _normalize_diff_ruN_to_git(result.stdout, ctx.base_repo_path, cwd)
+            normalized = _normalize_noindex_to_relative(result.stdout, ctx.base_repo_path, cwd)
             return self._strip_jit_cache_from_patch(normalized)
 
         return ""
