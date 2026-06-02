@@ -16,9 +16,7 @@ _DEFAULT_BASH_TIMEOUT_S = 300.0
 # Recursive-traversal commands whose explicit path operands are range-checked
 # against the denylist below. Non-recursive commands (and any command we cannot
 # confidently parse) are left untouched and rely on the timeout backstop.
-_RECURSIVE_SCANNERS = frozenset(
-    {"find", "grep", "egrep", "fgrep", "rg", "ag", "fd", "fdfind", "ls", "du", "tree"}
-)
+_RECURSIVE_SCANNERS = frozenset({"find", "grep", "egrep", "fgrep", "rg", "ag", "fd", "fdfind", "ls", "du", "tree"})
 _GREP_LIKE = frozenset({"grep", "egrep", "fgrep"})
 
 # Scanners whose FIRST non-flag operand is a pattern/regex, not a path, so it
@@ -315,7 +313,7 @@ class BashCommand:
                     "shared mount outside the allowed search scope and would stall "
                     "for a very long time. Restrict the search to your worktree "
                     "($GEAK_WORK_DIR) or the source repo ($GEAK_REPO_ROOT), e.g. "
-                    "`grep -r <pattern> \"$GEAK_WORK_DIR\"`."
+                    '`grep -r <pattern> "$GEAK_WORK_DIR"`.'
                 ),
                 "returncode": 1,
             }
@@ -340,7 +338,6 @@ class BashCommand:
                     "mount; otherwise split the work into smaller steps."
                 )
                 output_text = f"{output_text}\n\n{notice}" if output_text else notice
-
 
             if "COMMANDMENT.md" in command:
                 output_text = self._maybe_validate_commandment(command, output_text)

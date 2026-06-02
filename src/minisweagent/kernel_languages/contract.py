@@ -111,9 +111,25 @@ _BYPASS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 # literal (ROCm/CUDA includes, std headers, scratch, device nodes). A bare
 # absolute literal under one of these is NOT a source-repo bypass.
 _SYSTEM_PATH_PREFIXES = (
-    "/usr/", "/opt/rocm", "/opt/conda", "/opt/venv", "/opt/cuda", "/usr/local",
-    "/lib/", "/lib64/", "/bin/", "/sbin/", "/etc/", "/proc/", "/sys/", "/dev/",
-    "/tmp/", "/var/", "/run/", "/root/.cache", "/home/",
+    "/usr/",
+    "/opt/rocm",
+    "/opt/conda",
+    "/opt/venv",
+    "/opt/cuda",
+    "/usr/local",
+    "/lib/",
+    "/lib64/",
+    "/bin/",
+    "/sbin/",
+    "/etc/",
+    "/proc/",
+    "/sys/",
+    "/dev/",
+    "/tmp/",
+    "/var/",
+    "/run/",
+    "/root/.cache",
+    "/home/",
 )
 
 # A bare absolute-path *string literal* that appears as a collection element or
@@ -129,8 +145,16 @@ _BARE_ABS_LITERAL = re.compile(r"""(?P<q>['"])(?P<path>/[A-Za-z0-9._][^'"\n]*?)(
 # contains) one of these is almost certainly an import/include root, not a data
 # file or scratch path. Keeps backstop (3) precise (low false-positive).
 _CODE_TREE_MARKERS = (
-    "/python", "/src", "/csrc", "/include", "/lib", "/cpp", "/cuda", "/hip",
-    "/kernels", "/srt",
+    "/python",
+    "/src",
+    "/csrc",
+    "/include",
+    "/lib",
+    "/cpp",
+    "/cuda",
+    "/hip",
+    "/kernels",
+    "/srt",
 )
 
 
@@ -185,8 +209,13 @@ def _scan_context(text: str) -> tuple[set[int], dict[int, bool]]:
         return doc_lines, env_lines
 
     _skip = {
-        tokenize.NEWLINE, tokenize.NL, tokenize.INDENT, tokenize.DEDENT,
-        tokenize.COMMENT, tokenize.ENCODING, tokenize.ENDMARKER,
+        tokenize.NEWLINE,
+        tokenize.NL,
+        tokenize.INDENT,
+        tokenize.DEDENT,
+        tokenize.COMMENT,
+        tokenize.ENCODING,
+        tokenize.ENDMARKER,
     }
     cur: list[tokenize.TokenInfo] = []
 
@@ -253,16 +282,36 @@ def _resolve_repo_roots(repo_root: str | os.PathLike[str] | None) -> list[str]:
 #: context (the only way a hardcoded source path actually causes the *baseline*
 #: to be evaluated). If any of these is present the line is NOT provenance.
 _PATH_SINK_TOKENS: tuple[str, ...] = (
-    "sys.path", "pythonpath", "import ", "__import__", "open(", "-isystem",
-    "load(", "load_inline", "cpp_extension", "subprocess", "popen", "exec(",
-    "include_dirs", "extra_include",
+    "sys.path",
+    "pythonpath",
+    "import ",
+    "__import__",
+    "open(",
+    "-isystem",
+    "load(",
+    "load_inline",
+    "cpp_extension",
+    "subprocess",
+    "popen",
+    "exec(",
+    "include_dirs",
+    "extra_include",
 )
 
 #: Tokens that mean the path is being emitted as text (recorded to a file or
 #: logged) rather than used as a filesystem search path.
 _OUTPUT_CALL_TOKENS: tuple[str, ...] = (
-    ".write(", "print(", ".info(", ".debug(", ".warning(", ".error(",
-    ".exception(", "logging.", "logger.", "sys.stderr", "sys.stdout",
+    ".write(",
+    "print(",
+    ".info(",
+    ".debug(",
+    ".warning(",
+    ".error(",
+    ".exception(",
+    "logging.",
+    "logger.",
+    "sys.stderr",
+    "sys.stdout",
 )
 
 
@@ -330,9 +379,7 @@ def find_source_repo_path_leaks(
             for root in roots:
                 # Match the root as a quoted-or-flagged absolute literal so we
                 # don't trip on unrelated substrings.
-                if re.search(rf"""['"=:\s]{re.escape(root)}(?:/|['"\s)]|$)""", line) or (
-                    root in line and "/" in line
-                ):
+                if re.search(rf"""['"=:\s]{re.escape(root)}(?:/|['"\s)]|$)""", line) or (root in line and "/" in line):
                     findings.append(
                         (
                             lineno,

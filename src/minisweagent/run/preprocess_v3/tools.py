@@ -1756,8 +1756,7 @@ def _finish_blockers(
         blockers.append("Path B never dispatched harness-verifier")
     elif not verifier_ok and len(verifier_runs) < _MAX_VERIFIER_ATTEMPTS:
         blockers.append(
-            f"Path B has no successful harness-verifier run "
-            f"({len(verifier_runs)}/{_MAX_VERIFIER_ATTEMPTS} attempts)"
+            f"Path B has no successful harness-verifier run ({len(verifier_runs)}/{_MAX_VERIFIER_ATTEMPTS} attempts)"
         )
 
     baseline = agent._collected.get("baseline")
@@ -1770,8 +1769,7 @@ def _finish_blockers(
         and baseline_attempts < _MAX_DETERMINISTIC_PROBE_ATTEMPTS
     ):
         blockers.append(
-            f"Path B baseline collection failed "
-            f"({baseline_attempts}/{_MAX_DETERMINISTIC_PROBE_ATTEMPTS} attempts)"
+            f"Path B baseline collection failed ({baseline_attempts}/{_MAX_DETERMINISTIC_PROBE_ATTEMPTS} attempts)"
         )
 
     profile = agent._collected.get("profile")
@@ -1786,8 +1784,7 @@ def _finish_blockers(
         and profile_attempts < _MAX_DETERMINISTIC_PROBE_ATTEMPTS
     ):
         blockers.append(
-            f"Path B profile collection failed "
-            f"({profile_attempts}/{_MAX_DETERMINISTIC_PROBE_ATTEMPTS} attempts)"
+            f"Path B profile collection failed ({profile_attempts}/{_MAX_DETERMINISTIC_PROBE_ATTEMPTS} attempts)"
         )
 
     if not agent._collected.get("commandment_path"):

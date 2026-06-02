@@ -954,10 +954,7 @@ class PreprocessOrchestratorAgent:
         """
         if not errors:
             return False
-        return all(
-            ("step_limit" in e) or ("cost_limit" in e) or ("Limits exceeded" in e)
-            for e in errors
-        )
+        return all(("step_limit" in e) or ("cost_limit" in e) or ("Limits exceeded" in e) for e in errors)
 
     @staticmethod
     def _artifacts_sufficient_for_salvage(
