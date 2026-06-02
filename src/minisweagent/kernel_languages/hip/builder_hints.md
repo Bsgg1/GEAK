@@ -41,3 +41,52 @@ the user's test file:
 
 - Warmup 5 iterations; measure 100 and take the median (not mean).
 - `hipDeviceSynchronize()` before/after each measurement.
+
+## aiter kernels — MANDATORY worktree routing (do NOT use sys.path alone)
+
+If the kernel lives in the **aiter** repo (`csrc/kernels/*.cu` invoked via a
+Python-callable like `aiter.add_rmsnorm_quant(...)`, built by aiter's JIT
+`@compile_ops` mechanism), the generic "prepend the worktree to `sys.path`"
+rule is NOT enough and will silently evaluate the BASELINE kernel:
+
+- `aiter` is installed **editable** via a `sys.meta_path` finder
+  (`__editable__...amd_aiter...finder.py`). That finder is consulted BEFORE the
+  `sys.path`-based finder, so `import aiter` resolves to the ORIGINAL repo
+  (`/sgl-workspace/aiter`) no matter what you insert at `sys.path[0]`.
+- aiter's JIT derives its source dir from `AITER_META_DIR` →
+  `AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"` (see `aiter/jit/core.py`). If you
+  don't override it, it points at the baseline tree, so patches to
+  `$GEAK_WORK_DIR/csrc/...cu` are never compiled. Result: correctness always
+  PASSes and every speedup is ~1.00x (the worktree-bypass bug).
+
+You MUST route aiter's JIT to the worktree by setting these env vars at the very
+top of the harness, BEFORE `import aiter` (this recipe is verified to make
+sentinel-injected worktree corruption fail correctness, i.e. the worktree IS
+evaluated):
+
+```python
+import os
+WORK_DIR = os.path.abspath(os.environ.get("GEAK_WORK_DIR", "/sgl-workspace/aiter"))
+# Fail loud if the kernel under test is not actually in the worktree.
+_kernel_rel = "csrc/kernels/<this_kernel>.cu"
+assert os.path.exists(os.path.join(WORK_DIR, _kernel_rel)), \
+    f"kernel not found under WORK_DIR={WORK_DIR}"
+# Route aiter's JIT source dir (AITER_CSRC_DIR = $AITER_META_DIR/csrc) to the worktree.
+os.environ["AITER_META_DIR"] = WORK_DIR
+# Per-slot JIT build cache so worktrees don't share artifacts.
+_gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
+os.environ["AITER_JIT_DIR"] = os.path.join(WORK_DIR, f"_geak_jit_gpu{_gpu}")
+# Force recompile ONLY when the worktree kernel source is newer than the cached
+# .so (incremental); a patched candidate has a newer mtime so it still rebuilds.
+_so = os.path.join(os.environ["AITER_JIT_DIR"], "<module>.so")
+_src = os.path.join(WORK_DIR, _kernel_rel)
+if (not os.path.exists(_so)) or os.path.getmtime(_src) > os.path.getmtime(_so):
+    os.environ["AITER_REBUILD"] = "2"
+else:
+    os.environ.pop("AITER_REBUILD", None)
+import aiter  # now resolves source/build under $GEAK_WORK_DIR
+```
+
+Do NOT rely on deleting the `.so` plus `sys.path.insert` — that does not change
+where aiter's editable finder resolves `import aiter`, nor where `AITER_CSRC_DIR`
+points. The `AITER_META_DIR` override is the only mechanism that works.

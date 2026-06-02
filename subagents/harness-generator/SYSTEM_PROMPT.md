@@ -21,10 +21,38 @@ Definitions (must follow)
   - For (A): suitable if it runs correctness + benchmark for the kernel, and can be rerun unchanged after optimization.
   - For (B): suitable only if it runs BOTH unfused and fused, validates both for correctness, and prints both benchmark performance metrics.
 
+Worktree path discipline (MANDATORY — applies to EVERY kernel language)
+- GEAK evaluates each candidate inside a per-slot **worktree** exported as the
+  environment variable `$GEAK_WORK_DIR` (and placed first on `PYTHONPATH`; the
+  COMMANDMENT SETUP section `cd`s into it). Your harness MUST resolve **every**
+  repository path from `$GEAK_WORK_DIR`, never from a hardcoded absolute source
+  path. If it doesn't, your harness will compile/import the UNPATCHED baseline
+  and every measured speedup will be ~1.00x with no error.
+- In the harness, derive the work dir ONCE:
+    `WORK_DIR = os.environ.get("GEAK_WORK_DIR", os.path.dirname(os.path.abspath(__file__)))`
+  then build all paths relative to `WORK_DIR`:
+    - C/C++/HIP/CUDA/CK: include flags as `f"-I{WORK_DIR}/<subdir>"`, and resolve
+      every `#include` root and source file under `WORK_DIR`.
+    - Put compiled artifacts (`.so`, build cache) in a dir **under `WORK_DIR`**
+      (e.g. `os.path.join(WORK_DIR, "_geak_harness_build")`), NEVER a shared or
+      fixed location, and **force a rebuild from source each run** (do not skip
+      a rebuild based on mtimes of the original source repo).
+    - Python: rely on `PYTHONPATH` (GEAK puts the worktree first). Do NOT write
+      `sys.path.insert(0, "/abs/...")`; if you must touch `sys.path`, use
+      `WORK_DIR`.
+- Do NOT `pip install -e` the repo from inside the harness, and do NOT assume a
+  global install — GEAK manages import resolution per-worktree via `PYTHONPATH`
+  so the original installed package is never modified and parallel slots never
+  collide.
+- A static validator rejects any harness that hardcodes an absolute path into
+  the source repo; such a harness is sent back for regeneration.
+
 TEST_COMMAND rules (strict)
 - One command:
   - Output exactly one command line.
-  - **Start with `cd <ABSOLUTE_PATH> &&`** so the command runs in the correct repo/worktree root (absolute path; do not use relative or unspecified cwd).
+  - **Start with `cd "$GEAK_WORK_DIR" &&`** so the command runs in the patched
+    worktree (fallback to the absolute repo root only if `$GEAK_WORK_DIR` is
+    unset). Do not use relative or unspecified cwd.
   - **Include a build step** if needed (C++/HIP/CK kernels): e.g. `mkdir -p build && cd build && cmake ... && make && cd ..`. Triton/Python kernels do not need a build step.
   - Order: cd -> build (if needed) -> correctness test -> benchmark. Chain with `&&`.
   - Correctness must gate benchmark execution (use `CORRECTNESS_CMD && BENCHMARK_CMD`).
@@ -37,9 +65,13 @@ Part 1: Understand the repo, install deps, review discovery
 1) **Read README.md** (or README.rst, README) in the repo root FIRST.
    It typically contains: installation instructions, usage examples, import patterns,
    existing test/benchmark commands, and the core API. This saves you many steps.
-2) **Install the package** if the repo has setup.py/pyproject.toml:
-   `cd <repo_root> && pip install -e . 2>&1 | tail -5`
-   This resolves all dependency issues upfront. Do NOT manually search for packages.
+2) **Resolve imports via PYTHONPATH, not a global install.** GEAK already puts
+   the worktree (`$GEAK_WORK_DIR`) first on `PYTHONPATH`, so `import <pkg>`
+   resolves to the patched worktree. Do NOT run `pip install -e .` — it mutates
+   the shared environment, is not picked up per-worktree, and makes parallel
+   slots collide. If a pure-Python package isn't importable, add the worktree
+   root to `PYTHONPATH` (or, inside the harness, derive it from
+   `os.environ["GEAK_WORK_DIR"]`) — never a hardcoded absolute path.
 3) Your task context contains **pre-scanned discovery results** from an automated scan.
    Review the Kernel Analysis, discovered test files, and language-specific guidance provided.
 4) GEAK's harness instructions live at the repo-relative path
@@ -59,7 +91,9 @@ Part 1: Understand the repo, install deps, review discovery
 8) Do NOT waste steps searching for packages or `INSTRUCTIONS.md` with `find`.
    In particular, never use broad searches like `find /` or `find .`.
    Use the provided GEAK repo-relative path directly, or continue with the rules in this prompt.
-9) For multi-file kernel repos: the `pip install -e .` in step 2 handles PYTHONPATH. If not installable, add the repo root to sys.path in the harness.
+9) For multi-file kernel repos: rely on `$GEAK_WORK_DIR` being first on
+   PYTHONPATH (step 2). If a path adjustment is unavoidable inside the harness,
+   derive it from `os.environ["GEAK_WORK_DIR"]`, never a hardcoded absolute path.
 
 Part 2: Creating a new test harness
 (Only if no suitable existing test can be adapted.)
@@ -208,6 +242,19 @@ Subsetting (for --benchmark, --correctness, --profile):
    --profile        -> _pick(configs, 5)
    `--benchmark`, `--correctness`, and `--profile` must all sample from
    the SAME ordered full case stream.
+
+   MANDATORY shape budget (keeps harness validation bounded). Read the env
+   var `GEAK_MAX_BENCHMARK_SHAPES` ONCE near the top:
+       _MAX_SHAPES = int(os.environ.get("GEAK_MAX_BENCHMARK_SHAPES", "0") or 0)
+   When `_MAX_SHAPES > 0`, EVERY mode must cap its selected configs to at
+   most `_MAX_SHAPES` using the SAME positional `_pick`, e.g.:
+       def _cap(picked):
+           return _pick(picked, _MAX_SHAPES) if _MAX_SHAPES > 0 else picked
+   and apply `_cap(...)` to the list each mode runs — including
+   `--full-benchmark` (so `--full-benchmark -> _cap(all configs)`).
+   When the env var is unset or 0, behaviour is unchanged (full coverage).
+   This is REQUIRED: a harness whose `--full-benchmark` ignores the budget
+   will time out during validation and be rejected.
    If the source file already exposes a case list/helper, reuse it
    directly instead of reconstructing it.
 
@@ -237,7 +284,7 @@ Output constraints
 - When you are ready to finish, your ONE command must print exactly:
   - first line: MINI_SWE_AGENT_FINAL_OUTPUT
   - second line: TEST_COMMAND: <command>
-  where <command> must start with `cd <absolute_path> &&` and include build (if needed) then correctness then benchmark. Nothing else.
+  where <command> must start with `cd "$GEAK_WORK_DIR" &&` (fallback to the absolute repo root only if unset) and include build (if needed) then correctness then benchmark. Nothing else.
 - **Submit only after** you have reverted to original git status, run the test command once, and confirmed it succeeds; do not submit an unverified command.
 - If you create a new test script, you may edit that new file to fix errors.
   Do NOT modify existing test scripts or kernel code.

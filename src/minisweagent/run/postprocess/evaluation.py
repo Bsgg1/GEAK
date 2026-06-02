@@ -346,15 +346,54 @@ def preflight_commandment_contract(
     from minisweagent.run.preprocess.harness_utils import harness_supports_iterations
 
     repo_root_path = Path(repo_root).resolve()
-    is_git = (repo_root_path / ".git").exists()
 
-    # For git repos, run in a temporary worktree so side effects (run.sh,
-    # JIT caches, profile artifacts) never dirty the original repo.
-    if is_git and output_dir is not None:
+    # Resolve the git TOPLEVEL via ``git rev-parse`` rather than a naive
+    # ``.git``-child check. For monorepo SUBDIRECTORIES (e.g.
+    # ``sglang/sgl-kernel``) there is no ``.git`` directly under ``repo_root``,
+    # so the old check evaluated to False and the smoke test fell back to
+    # running against the ORIGINAL source tree. That is a real isolation hole:
+    # it (a) lets a harness that depends on preprocess-seeded build state
+    # (e.g. a pre-existing ``_geak_build/``) pass spuriously, and (b) lets a
+    # harness that evaluates the baseline (instead of the worktree) pass — both
+    # surface later as the "always ~1.00x speedup" bug. Always run the preflight
+    # in a FRESH worktree of the toplevel so the harness is forced to be
+    # self-contained and fully worktree-resolved.
+    toplevel: Path | None = None
+    try:
+        _tl = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(repo_root_path),
+            capture_output=True,
+            text=True,
+            env=get_git_safe_env(repo_root_path),
+        )
+        if _tl.returncode == 0 and _tl.stdout.strip():
+            toplevel = Path(_tl.stdout.strip()).resolve()
+    except Exception:  # noqa: BLE001 — non-git or git missing: fall back below
+        toplevel = None
+
+    # Cleanup bookkeeping: the registered git worktree is always the TOPLEVEL
+    # checkout (``worktree_root``); for a subdir kernel ``preflight_dir`` is a
+    # path INSIDE it, so we must remove ``worktree_root`` via the toplevel repo,
+    # not ``preflight_dir`` (otherwise the monorepo checkout + a stale
+    # ``git worktree`` entry leak on disk).
+    cleanup_root: Path | None = None
+    cleanup_repo: str | None = None
+
+    if toplevel is not None and output_dir is not None:
         from minisweagent.run.task_file import create_worktree
 
-        preflight_dir = (Path(output_dir) / "_preflight_worktree").resolve()
-        create_worktree(repo_root_path, preflight_dir)
+        try:
+            rel = repo_root_path.relative_to(toplevel)
+        except ValueError:
+            rel = Path(".")
+        worktree_root = (Path(output_dir) / "_preflight_worktree").resolve()
+        create_worktree(toplevel, worktree_root)
+        # For a subdir kernel, GEAK_WORK_DIR must point at the subdir INSIDE the
+        # worktree (where ``csrc/`` etc. live), not the monorepo root.
+        preflight_dir = (worktree_root / rel).resolve()
+        cleanup_root = worktree_root
+        cleanup_repo = str(toplevel)
     else:
         preflight_dir = repo_root_path
 
@@ -420,8 +459,8 @@ def preflight_commandment_contract(
         )
         raise CommandmentExecutionError("PREFLIGHT", last_result.returncode, detail)
     finally:
-        if preflight_dir != repo_root_path:
-            cleanup_eval_worktree(repo_root, preflight_dir)
+        if cleanup_root is not None and cleanup_repo is not None:
+            cleanup_eval_worktree(cleanup_repo, cleanup_root)
 
 
 def recapture_commandment_baseline(

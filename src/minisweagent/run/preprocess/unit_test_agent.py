@@ -31,6 +31,52 @@ class UnitTestAgent(DefaultAgent):
 _GEAK_PREPROCESS_INSTRUCTIONS_RELATIVE_PATH = "src/minisweagent/run/preprocess/INSTRUCTIONS.md"
 
 
+# Language-agnostic worktree-path rule injected into EVERY harness-generation
+# context (not per-kernel-language). This is the single most important harness
+# invariant: resolve all repo paths from $GEAK_WORK_DIR so the patched worktree
+# (not the baseline) is evaluated, keep parallel slots isolated, and never touch
+# the global environment. A static validator enforces it and triggers
+# regeneration on violation.
+_WORKTREE_PATH_DISCIPLINE = (
+    "## Worktree Path Discipline (MANDATORY — all kernel languages)\n"
+    "GEAK evaluates each candidate inside a per-slot worktree exported as "
+    "`$GEAK_WORK_DIR` (placed first on PYTHONPATH; SETUP `cd`s into it). The "
+    "harness MUST resolve EVERY repository path from `$GEAK_WORK_DIR`, never a "
+    "hardcoded absolute source path — otherwise it compiles/imports the UNPATCHED "
+    "baseline and every speedup silently reads ~1.00x.\n"
+    "- Derive once: "
+    "`WORK_DIR = os.environ.get('GEAK_WORK_DIR', os.path.dirname(os.path.abspath(__file__)))`.\n"
+    "- C/C++/HIP/CUDA/CK: build include flags as `f'-I{WORK_DIR}/<subdir>'`; put "
+    "compiled artifacts in a DETERMINISTIC build dir UNDER `WORK_DIR` (e.g. "
+    "`f'{WORK_DIR}/_geak_build'`). It is per-worktree-isolated because `WORK_DIR` "
+    "already differs per slot, so use a FIXED name (NOT a random/unique-per-run "
+    "dir) so repeated invocations in the same worktree reuse compiled objects. "
+    "Do an INCREMENTAL rebuild keyed on source mtime/hash: rebuild only when the "
+    "kernel source is newer than the built artifact (so a patched kernel is always "
+    "recompiled), otherwise reuse the cached build. NEVER do an unconditional cold "
+    "rebuild every run — for big compiled repos that turns harness validation into "
+    "a multi-hour recompile loop.\n"
+    "- Python: rely on PYTHONPATH; do NOT `sys.path.insert(0, '/abs')`; if you "
+    "must touch sys.path, derive it from `WORK_DIR` (e.g. `f'{WORK_DIR}/python'`). "
+    "NEVER add a hardcoded source-repo path as a sys.path fallback/candidate — not "
+    "even as an element of a candidate list/tuple. The worktree-derived entry must "
+    "be the ONLY one you insert; the sole permitted absolute literal anywhere is the "
+    "default arg of `os.environ.get('GEAK_WORK_DIR', <default>)`. A second hardcoded "
+    "candidate (e.g. `['/repo/python']`) will, via `sys.path.insert(0, ...)` in a "
+    "loop, end up AHEAD of the worktree and silently import the unpatched baseline.\n"
+    "- Do NOT `pip install -e` and do NOT mutate the global environment; GEAK "
+    "manages import resolution per-worktree so the original install is untouched "
+    "and parallel slots never collide.\n"
+    "- Shape budget (MANDATORY, keeps validation bounded): read "
+    "`_MAX_SHAPES = int(os.environ.get('GEAK_MAX_BENCHMARK_SHAPES', '0') or 0)` once. "
+    "When `_MAX_SHAPES > 0`, EVERY mode — including `--full-benchmark` — must cap its "
+    "selected configs to at most `_MAX_SHAPES` via the same positional `_pick` "
+    "(`--full-benchmark -> _pick(all_configs, _MAX_SHAPES)`). When unset/0, keep full "
+    "coverage. A `--full-benchmark` that ignores this budget times out during "
+    "validation and is rejected."
+)
+
+
 def _extract_test_command(text: str) -> str:
     match = re.search(r"TEST_COMMAND:\s*(.+)\s*$", text.strip(), re.MULTILINE)
     if not match:
@@ -62,6 +108,12 @@ _LANGUAGE_GUIDANCE: dict[str, str] = {
         "This is a HIP kernel (C++ compiled with hipcc).\n"
         "- A build step is REQUIRED before running tests.\n"
         "- Use the project's build system (CMake/Makefile) or compile with `hipcc` directly.\n"
+        "- CACHE the build: compile into a deterministic dir under `$GEAK_WORK_DIR` "
+        "(e.g. `$GEAK_WORK_DIR/_geak_build`) and rebuild ONLY when the kernel source "
+        "is newer than the built artifact (mtime/hash check). The harness is invoked "
+        "many times during validation (correctness + N benchmark repeats); an "
+        "unconditional cold rebuild each invocation makes a large repo take hours. A "
+        "patched kernel has a newer mtime, so the incremental check still recompiles it.\n"
         "- Use host-side validation (compare GPU output against CPU reference).\n"
         "- Use `hipEventElapsedTime` or `torch.cuda.Event` for benchmarking.\n"
         "- NEVER use `sys.path.insert(0, '/absolute/path/...')`. "
@@ -71,6 +123,11 @@ _LANGUAGE_GUIDANCE: dict[str, str] = {
         "This is a CUDA kernel (C++ compiled with nvcc).\n"
         "- A build step is REQUIRED before running tests.\n"
         "- Use the project's build system (CMake/Makefile) or compile with `nvcc` directly.\n"
+        "- CACHE the build: compile into a deterministic dir under `$GEAK_WORK_DIR` "
+        "and rebuild ONLY when the kernel source is newer than the built artifact "
+        "(mtime/hash). An unconditional cold rebuild on each of the many validation "
+        "invocations makes a large repo take hours; a patched kernel still recompiles "
+        "because its mtime is newer.\n"
         "- Use host-side validation (compare GPU output against CPU reference).\n"
         "- Use `cudaEventElapsedTime` or `torch.cuda.Event` for benchmarking."
     ),
@@ -152,6 +209,10 @@ def format_discovery_for_agent(result) -> str:
             lines.append("## Language-Specific Testing Guidance")
             lines.append(guidance)
             lines.append("")
+
+        # Universal worktree-path rule (language-agnostic; always injected).
+        lines.append(_WORKTREE_PATH_DISCIPLINE)
+        lines.append("")
 
     # --- FILES YOU MUST READ ---
     must_read: list[tuple[str, str]] = []

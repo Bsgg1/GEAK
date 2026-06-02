@@ -328,10 +328,21 @@ class LitellmModel:
             # as a request header. Preserve any other caller-supplied
             # ``extra_headers`` verbatim.
             filtered["extra_headers"] = dict(existing_headers)
+        # Bound every request with a wall-clock timeout. Without it, a stalled
+        # gateway socket (server accepted the connection but never sends bytes)
+        # blocks the read forever, the tenacity ``@retry`` never fires, and the
+        # whole preprocess/agent loop hangs indefinitely. ``litellm.Timeout`` is
+        # NOT in the no-retry exclusion list above (it does not subclass
+        # ``litellm.exceptions.APIError``), so a timed-out call is retried with
+        # exponential backoff. Override via ``GEAK_LLM_REQUEST_TIMEOUT`` (seconds).
+        request_timeout = filtered.pop("timeout", None)
+        if request_timeout is None:
+            request_timeout = float(os.getenv("GEAK_LLM_REQUEST_TIMEOUT", "600"))
         try:
             return litellm.completion(
                 model=self.config.model_name,
                 messages=messages,
+                timeout=request_timeout,
                 **filtered,
             )
         except litellm.exceptions.AuthenticationError as e:

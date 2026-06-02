@@ -60,8 +60,18 @@ _DEFAULT_QUICK = False
 
 #: Per-mode subprocess timeouts (seconds). Match
 #: ``run/preprocess/run_harness.MODE_TIMEOUTS``.
-_BENCHMARK_TIMEOUT_S = 600
-_PROFILE_TIMEOUT_S = 120
+#:
+#: These MUST be env-overridable: for compiled kernels (HIP/CUDA, e.g.
+#: sgl-kernel ``*.cu``) the very first ``--benchmark`` / ``--full-benchmark``
+#: invocation has to build the entire extension from source, which can take
+#: well over the historical 600 s default. When that first run times out it
+#: returns no latency, the orchestrator retries, and each retry recompiles
+#: from scratch — a multi-hour rebuild loop that never warms the build cache.
+#: Allowing a larger ``GEAK_BENCHMARK_TIMEOUT`` lets the first compile finish
+#: (warming the cache) so subsequent runs are fast. Override via
+#: ``GEAK_BENCHMARK_TIMEOUT`` / ``GEAK_PROFILE_TIMEOUT``.
+_BENCHMARK_TIMEOUT_S = int(os.environ.get("GEAK_BENCHMARK_TIMEOUT", "600"))
+_PROFILE_TIMEOUT_S = int(os.environ.get("GEAK_PROFILE_TIMEOUT", "120"))
 
 #: Short timeout for the correctness gate that runs before baseline collection.
 #: Goal: fail in ~5 s on a broken kernel rather than spending ~5 min running
@@ -342,6 +352,18 @@ def collect_baseline_metrics(
     if not harness_path.is_file():
         raise FileNotFoundError(f"collect_baseline_metrics: harness not found: {harness_path}")
 
+    # ``GEAK_BASELINE_REPEATS`` caps the number of benchmark invocations.
+    # Each invocation re-imports the (often heavy) kernel package, so on big
+    # repos like sglang the default of 5 dominates preprocess wall-time. The
+    # env override lets callers trade baseline-variance precision for speed
+    # (e.g. bounded CI / harness-eval validation) without touching the
+    # orchestrator tool defaults.
+    _repeats_override = os.environ.get("GEAK_BASELINE_REPEATS")
+    if _repeats_override:
+        try:
+            repeats = int(_repeats_override)
+        except ValueError:
+            pass
     repeats = max(1, int(repeats))
     cmd = _benchmark_command(harness_path)
     cmd_str = " ".join(shlex.quote(c) for c in cmd)
