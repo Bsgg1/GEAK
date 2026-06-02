@@ -198,6 +198,7 @@ class FinalReport:
     best_task: str | None = None
     best_speedup: float | None = None
     verified_speedup_unclamped: float | None = None
+    optimized_codes: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _strip_none({f.name: getattr(self, f.name) for f in fields(self)})
@@ -214,4 +215,5 @@ class FinalReport:
             best_task=d.get("best_task"),
             best_speedup=d.get("best_speedup"),
             verified_speedup_unclamped=d.get("verified_speedup_unclamped", d.get("verified_speedup_raw")),
+            optimized_codes=d.get("optimized_codes") if isinstance(d.get("optimized_codes"), dict) else None,
         )

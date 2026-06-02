@@ -60,6 +60,7 @@ class AgentConfig:
     source_file_paths: list[str] | None = None
     use_skills: bool = False
     tool_profile: str = "full"
+    model_config: dict | None = None
 
 
 # Unified observation truncation for both bash output and tool call results (head + tail).
@@ -143,7 +144,7 @@ class DefaultAgent:
             self.toolruntime.disable_tools(self.config.disabled_tools)
         # Always wrap RAG MCP tools with postprocessor filter
         try:
-            self.toolruntime.wrap_rag_tools_with_postprocessor(api_key=self.model.config.api_key)
+            self.toolruntime.wrap_rag_tools_with_postprocessor(model_config=self.config.model_config)
         except Exception as e:
             logger.warning("Failed to wrap RAG tools with RAG postprocessor: %s", e)
         # Propagate agent's env vars (HIP_VISIBLE_DEVICES etc.) to tools
@@ -170,6 +171,7 @@ class DefaultAgent:
                     "use_strategy_manager": self.config.use_strategy_manager,
                     "strategy_file_path": self.config.strategy_file_path,
                     "profiling_type": self.config.profiling_type,
+                    "model_config": self.config.model_config,
                 },
                 save_and_test_context=getattr(self, "_save_and_test_context", None),
             )

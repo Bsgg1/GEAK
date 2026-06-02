@@ -124,6 +124,19 @@ system_prompt: |
   - `--profile` → `_pick(configs, 5)`
   - All four modes sample from the SAME ordered case stream.
 
+  MANDATORY shape budget (keeps harness validation bounded). Read the env
+  var `GEAK_MAX_BENCHMARK_SHAPES` ONCE near the top:
+      _MAX_SHAPES = int(os.environ.get("GEAK_MAX_BENCHMARK_SHAPES", "0") or 0)
+  When `_MAX_SHAPES > 0`, EVERY mode must cap its selected configs to at
+  most `_MAX_SHAPES` using the SAME positional `_pick`, e.g.:
+      def _cap(picked):
+          return _pick(picked, _MAX_SHAPES) if _MAX_SHAPES > 0 else picked
+  and apply `_cap(...)` to the list each mode runs — including
+  `--full-benchmark` (so `--full-benchmark → _cap(all configs)`).
+  When the env var is unset or 0, behaviour is unchanged (full coverage).
+  This is REQUIRED: a harness whose `--full-benchmark` ignores the budget
+  will time out during validation and be rejected.
+
   Core principle
   - The harness is a THIN WRAPPER around existing repo code. Do NOT reimplement what the repo already does — import and call its existing functions.
 

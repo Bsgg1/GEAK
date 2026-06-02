@@ -118,7 +118,7 @@ class AgentTask:
         task: Specific instructions for this agent (overrides the base task_content).
         label: Human-readable label for logging (e.g. "fusion-rope-cos-sin").
         priority: Lower number = higher priority. OpenEvolve=0, fusion=5, tuning=10, etc.
-        kernel_language: Language context ("python", "cpp", "asm") for task prompt context.
+        kernel_language: Language context ("python", "cpp", "hip", "asm") for task prompt context.
         config: Config overrides merged into the base agent_config.
         step_limit: Per-task step limit (0 = inherit from parent).
         cost_limit: Per-task cost limit (0.0 = inherit from parent).

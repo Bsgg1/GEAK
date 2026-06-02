@@ -6,11 +6,9 @@ filtering irrelevant chunks, deduplication, and reorganizing content
 for downstream consumption.
 """
 
+import copy
 import logging
-from dataclasses import dataclass, field
-from typing import Any
-
-from minisweagent.models.amd_llm import AmdLlmModel
+from dataclasses import dataclass, fields
 
 logger = logging.getLogger(__name__)
 
@@ -19,11 +17,9 @@ logger = logging.getLogger(__name__)
 class RAGPostProcessorConfig:
     """Configuration for RAG postprocessor behavior."""
 
-    model_name: str = "claude-opus-4.6"
-    api_key: str | None = None
+    model_config: dict | None = None
     system_prompt: str | None = None
     enabled: bool = True
-    model_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 class RAGPostProcessor:
@@ -83,15 +79,19 @@ Instructions:
         self._model = None
 
     @property
-    def model(self) -> AmdLlmModel:
+    def model(self):
         """Lazy initialization of the LLM model."""
         if self._model is None:
-            self._model = AmdLlmModel(
-                model_name=self.config.model_name,
-                api_key=self.config.api_key,
-                model_kwargs=self.config.model_kwargs,
-            )
-            self._model._impl.tools = []
+            from minisweagent.models import get_model
+
+            if self.config.model_config:
+                config = copy.deepcopy(self.config.model_config)
+                self._model = get_model(config=config)
+            else:
+                self._model = get_model()
+            model_impl = getattr(self._model, "_impl", self._model)
+            if hasattr(model_impl, "tools"):
+                model_impl.tools = []
         return self._model
 
     def process(self, rag_result: str, query: str = "") -> str:
@@ -128,5 +128,6 @@ Instructions:
 
 def create_rag_postprocessor(**kwargs) -> RAGPostProcessor:
     """Convenience function to create a RAG postprocessor."""
-    config = RAGPostProcessorConfig(**kwargs)
+    valid_keys = {f.name for f in fields(RAGPostProcessorConfig)}
+    config = RAGPostProcessorConfig(**{k: v for k, v in kwargs.items() if k in valid_keys})
     return RAGPostProcessor(config)

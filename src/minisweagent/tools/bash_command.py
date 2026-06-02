@@ -87,10 +87,14 @@ _COMMANDMENT_WRITE_RE = re.compile(
 )
 
 
+_BASH_TIMEOUT_S = int(os.environ.get("GEAK_BASH_TIMEOUT", "300"))
+
+
 class BashCommand:
     def __init__(self):
         self._env_override: dict[str, str] = {}
         self._cwd: str | None = None
+        self.timeout: int = _BASH_TIMEOUT_S
         self.blocklist: list[str] = [
             "vim",
             "vi",
@@ -320,9 +324,11 @@ class BashCommand:
             env = os.environ | self._env_override if self._env_override else None
             cwd = self._cwd if self._cwd and Path(self._cwd).is_dir() else None
             try:
-                timeout_s = float(os.environ.get("GEAK_BASH_TIMEOUT_S", _DEFAULT_BASH_TIMEOUT_S))
+                # GEAK_BASH_TIMEOUT_S takes precedence; fall back to self.timeout
+                # (which itself reads main's GEAK_BASH_TIMEOUT) so both env names work.
+                timeout_s = float(os.environ.get("GEAK_BASH_TIMEOUT_S", self.timeout))
             except (TypeError, ValueError):
-                timeout_s = _DEFAULT_BASH_TIMEOUT_S
+                timeout_s = float(self.timeout)
             stdout_b, stderr_b, returncode, timed_out = self._run(command, env, cwd, timeout_s)
             output_text = _decode_captured_output(stdout_b, stderr_b)
 
@@ -334,6 +340,7 @@ class BashCommand:
                     "mount; otherwise split the work into smaller steps."
                 )
                 output_text = f"{output_text}\n\n{notice}" if output_text else notice
+
 
             if "COMMANDMENT.md" in command:
                 output_text = self._maybe_validate_commandment(command, output_text)

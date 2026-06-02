@@ -109,9 +109,9 @@ class CommandmentContext:
         kernel_language_kind:
             Coarse language family for the legacy generator's
             ``kernel_language`` parameter (``"python"``, ``"cpp"``,
-            or ``"asm"``). This is *not* the v3
+            ``"hip"``, or ``"asm"``). This is *not* the v3
             :class:`KernelLanguage` (those map to the Jinja path) —
-            it's the legacy enum that controls C++ build steps in
+            it's the legacy enum that controls C++/HIP build steps in
             ``SETUP``. Consumed only on the legacy fallback path.
         extras:
             Free-form extra variables propagated into the Jinja

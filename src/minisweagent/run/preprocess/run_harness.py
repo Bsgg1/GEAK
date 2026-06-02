@@ -43,10 +43,10 @@ MODE_TO_FLAG: dict[str, str] = {
 #: extension from source, are not killed mid-compile (which triggers a costly
 #: recompile-on-retry loop). Env names match ``preprocess_v3/baseline.py``.
 MODE_TIMEOUTS: dict[str, int] = {
-    "correctness": int(os.environ.get("GEAK_CORRECTNESS_TIMEOUT", "900")),
+    "correctness": int(os.environ.get("GEAK_BENCH_TIMEOUT", os.environ.get("GEAK_CORRECTNESS_TIMEOUT", "900"))),
     "profile": int(os.environ.get("GEAK_PROFILE_TIMEOUT", "120")),
-    "benchmark": int(os.environ.get("GEAK_BENCHMARK_TIMEOUT", "600")),
-    "full-benchmark": int(os.environ.get("GEAK_FULL_BENCHMARK_TIMEOUT", "900")),
+    "benchmark": int(os.environ.get("GEAK_BENCH_TIMEOUT", "600")),
+    "full-benchmark": int(os.environ.get("GEAK_BENCH_TIMEOUT", "900")),
 }
 
 # During UTA harness-generation validation the kernel may require expensive

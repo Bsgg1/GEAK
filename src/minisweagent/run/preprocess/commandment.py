@@ -82,8 +82,8 @@ def generate_commandment(
             in sync with profiler-mcp's default so that agent-side and
             preprocessor-side profiling see identical warm-up conditions.
         profile_replays: Number of replay passes for ``kernel-profile``.
-        kernel_language: ``"python"``, ``"cpp"``, or ``"asm"``.  When
-            ``"cpp"``, SETUP includes a build step and JIT cache isolation.
+        kernel_language: ``"python"``, ``"cpp"``, ``"hip"``, or ``"asm"``.  When
+            ``"cpp"`` or ``"hip"``, SETUP includes a build step and JIT cache isolation.
 
     Returns:
         The content of a valid COMMANDMENT.md as a string.
@@ -174,7 +174,7 @@ def _generate_simple(
         warmup_runs,
     )
 
-    if kernel_language == "cpp":
+    if kernel_language in ("cpp", "hip"):
         build_cmd = _detect_build_command(repo_root)
         setup_section = (
             "rm -rf ${GEAK_WORK_DIR}/.aiter_jit\n" + build_cmd + "\n"

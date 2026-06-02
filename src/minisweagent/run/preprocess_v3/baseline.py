@@ -59,7 +59,8 @@ _DEFAULT_NUM_REPLAYS = 3
 _DEFAULT_QUICK = False
 
 #: Per-mode subprocess timeouts (seconds). Match
-#: ``run/preprocess/run_harness.MODE_TIMEOUTS``.
+#: ``run/preprocess/run_harness.MODE_TIMEOUTS`` — both use the unified
+#: ``GEAK_BENCH_TIMEOUT`` env override.
 #:
 #: These MUST be env-overridable: for compiled kernels (HIP/CUDA, e.g.
 #: sgl-kernel ``*.cu``) the very first ``--benchmark`` / ``--full-benchmark``
@@ -67,16 +68,23 @@ _DEFAULT_QUICK = False
 #: well over the historical 600 s default. When that first run times out it
 #: returns no latency, the orchestrator retries, and each retry recompiles
 #: from scratch — a multi-hour rebuild loop that never warms the build cache.
-#: Allowing a larger ``GEAK_BENCHMARK_TIMEOUT`` lets the first compile finish
-#: (warming the cache) so subsequent runs are fast. Override via
-#: ``GEAK_BENCHMARK_TIMEOUT`` / ``GEAK_PROFILE_TIMEOUT``.
-_BENCHMARK_TIMEOUT_S = int(os.environ.get("GEAK_BENCHMARK_TIMEOUT", "600"))
+#: Allowing a larger ``GEAK_BENCH_TIMEOUT`` lets the first compile finish
+#: (warming the cache) so subsequent runs are fast.
+#:   GEAK_BENCH_TIMEOUT    — benchmark + correctness gate (each keeps its own default)
+#:   GEAK_PROFILE_TIMEOUT  — profiler-mcp invocation
+_BENCHMARK_TIMEOUT_S = int(os.environ.get("GEAK_BENCH_TIMEOUT", "600"))
 _PROFILE_TIMEOUT_S = int(os.environ.get("GEAK_PROFILE_TIMEOUT", "120"))
 
 #: Short timeout for the correctness gate that runs before baseline collection.
-#: Goal: fail in ~5 s on a broken kernel rather than spending ~5 min running
-#: the full benchmark loop. Override via ``GEAK_CORRECTNESS_GATE_TIMEOUT``.
-_CORRECTNESS_GATE_TIMEOUT_S = int(os.environ.get("GEAK_CORRECTNESS_GATE_TIMEOUT", "120"))
+#: Goal: fail fast on a broken kernel rather than spending minutes running the
+#: full benchmark loop. Override via ``GEAK_BENCH_TIMEOUT`` (or the legacy
+#: ``GEAK_CORRECTNESS_GATE_TIMEOUT``).
+_CORRECTNESS_GATE_TIMEOUT_S = int(
+    os.environ.get(
+        "GEAK_BENCH_TIMEOUT",
+        os.environ.get("GEAK_CORRECTNESS_GATE_TIMEOUT", "120"),
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -434,6 +442,111 @@ def collect_baseline_metrics(
     )
 
 
+def _run_eval_command_once(
+    eval_command: str,
+    *,
+    work_dir: Path | None,
+    gpu_id: int,
+    timeout_s: int,
+) -> dict[str, Any]:
+    """Run an eval command once (no harness flags) and capture output."""
+    import time as _time
+
+    env = _build_env(work_dir, gpu_id=gpu_id)
+    cwd = str(work_dir) if work_dir is not None else None
+    cmd = ["bash", "-lc", eval_command]
+
+    t0 = _time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env=env,
+            cwd=cwd,
+        )
+        duration_s = round(_time.monotonic() - t0, 3)
+        latency_ms = extract_latency_ms(proc.stdout or "") if proc.returncode == 0 else None
+        return {
+            "returncode": proc.returncode,
+            "stdout": proc.stdout or "",
+            "stderr": proc.stderr or "",
+            "duration_s": duration_s,
+            "latency_ms": latency_ms,
+        }
+    except subprocess.TimeoutExpired as exc:
+        duration_s = round(_time.monotonic() - t0, 3)
+        return {
+            "returncode": -1,
+            "stdout": (exc.stdout or "")
+            if isinstance(exc.stdout, str)
+            else (exc.stdout or b"").decode(errors="replace"),
+            "stderr": f"TIMEOUT after {timeout_s}s",
+            "duration_s": duration_s,
+            "latency_ms": None,
+        }
+    except Exception as exc:
+        duration_s = round(_time.monotonic() - t0, 3)
+        return {
+            "returncode": -1,
+            "stdout": "",
+            "stderr": str(exc),
+            "duration_s": duration_s,
+            "latency_ms": None,
+        }
+
+
+def collect_baseline_from_eval_command(
+    eval_command: str,
+    *,
+    repeats: int = 5,
+    work_dir: Path | None = None,
+    gpu_id: int = 0,
+) -> BaselineMetrics:
+    """Run an eval command directly (no ``--benchmark`` flag) ``repeats`` times.
+
+    For Path A flows where the user's eval command is not a standard
+    GEAK harness (no ``--benchmark`` support). The command is executed
+    as-is via ``bash -lc``, and ``extract_latency_ms`` parses
+    ``GEAK_METRIC`` / ``GEAK_RESULT_LATENCY_MS`` markers from stdout.
+    """
+    repeats = max(1, int(repeats))
+
+    raw_outputs: list[dict[str, Any]] = []
+    samples_ms: list[float] = []
+    for i in range(repeats):
+        result = _run_eval_command_once(
+            eval_command,
+            work_dir=work_dir,
+            gpu_id=gpu_id,
+            timeout_s=_BENCHMARK_TIMEOUT_S,
+        )
+        raw_outputs.append(result)
+        if result["latency_ms"] is not None:
+            samples_ms.append(float(result["latency_ms"]))
+        else:
+            logger.warning(
+                "collect_baseline_from_eval_command: sample %d/%d produced no latency (rc=%s)",
+                i + 1,
+                repeats,
+                result["returncode"],
+            )
+
+    median_ms = statistics.median(samples_ms) if samples_ms else None
+    stdev_ms = statistics.stdev(samples_ms) if len(samples_ms) >= 2 else None
+
+    return BaselineMetrics(
+        harness_path=Path("<eval_command>"),
+        median_ms=median_ms,
+        samples_ms=samples_ms,
+        stdev_ms=stdev_ms,
+        repeats=repeats,
+        command=eval_command,
+        raw_outputs=raw_outputs,
+    )
+
+
 def _invoke_profiler_mcp(
     command: str,
     *,
@@ -451,8 +564,11 @@ def _invoke_profiler_mcp(
     GPU hosts).
 
     Returns the structured profile result, or ``None`` if the
-    profiler is unavailable / raises.
+    profiler is unavailable / raises / times out.
     """
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FuturesTimeoutError
+
     try:
         ensure_preprocess_mcp_importable(
             "mcp_tools/profiler-mcp/src",
@@ -475,7 +591,12 @@ def _invoke_profiler_mcp(
         }
         if workdir is not None:
             kwargs["workdir"] = workdir
-        return profile_fn(**kwargs)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(profile_fn, **kwargs)
+            return future.result(timeout=_PROFILE_TIMEOUT_S)
+    except FuturesTimeoutError:
+        logger.warning("profiler-mcp timed out after %ds", _PROFILE_TIMEOUT_S)
+        return None
     except Exception as exc:
         logger.warning("profiler-mcp invocation failed: %s", exc, exc_info=True)
         return None

@@ -100,36 +100,41 @@ system_prompt: |
   - If you edited `harness_path`, list your edits in the success block's `WARNINGS=` field for the audit trail.
   - `GEAK_RESULT_LATENCY_MS=<number>` is the last line of stdout in both `--benchmark` and `--full-benchmark`.
 
-  Output contract — emit exactly one of these blocks on your final turn.
+  Output contract
+  When you are done, your LAST bash command must print the submit marker
+  on the first line, followed by your result. Use exactly this pattern:
 
   Success (possibly after in-place fixes):
-  ```
+  ```bash
+  echo "MINI_SWE_AGENT_FINAL_OUTPUT
   HARNESS_VERIFIED=true
   HARNESS_PATH=<absolute path>
   MODES_PASSED=correctness,profile,benchmark,full-benchmark
   FIXES_APPLIED=<comma-separated short descriptions, or "none">
-  WARNINGS=<comma-separated non-fatal warnings, or "none">
+  WARNINGS=<comma-separated non-fatal warnings, or "none">"
   ```
 
   Failure (retry allowed — generator-level `attempt < 3`):
-  ```
+  ```bash
+  echo "MINI_SWE_AGENT_FINAL_OUTPUT
   HARNESS_VERIFIED=false
   ESCALATE=false
   PHASE=<static|runtime>
   FAILED_RULE=<short identifier — e.g. "import-error-kernel", "build-step-failed", "correctness-value-mismatch", "shapes-determinism-drift">
   FAILED_MODE=<correctness|profile|benchmark|full-benchmark|n/a>
   EVIDENCE=<one-paragraph excerpt from stderr or static check>
-  CORRECTION_HINT=<one-sentence directive aimed at harness-generator>
+  CORRECTION_HINT=<one-sentence directive aimed at harness-generator>"
   ```
 
   Failure (escalation — orchestrator's `attempt == 3`):
-  ```
+  ```bash
+  echo "MINI_SWE_AGENT_FINAL_OUTPUT
   HARNESS_VERIFIED=false
   ESCALATE=true
   PHASE=<static|runtime>
   FAILED_RULE=<...>
   FAILED_MODE=<...>
-  EVIDENCE=<...>
+  EVIDENCE=<...>"
   ```
 
   Phase 3 — Shape-source comparison (run only when Phase 2 fails on a shape/order issue)
