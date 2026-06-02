@@ -53,6 +53,62 @@ class Model(nn.Module):
         return output
 ```
 
+## FlyDSL Kernel Lifecycle (Build Once, Launch Many)
+
+FlyDSL kernels are compiled at build time, not at call time. The correct
+pattern stores weights as `nn.Parameter` (NOT `nn.Linear` / `nn.Conv2d`),
+preshuffles them once, and compiles kernels once in `__init__`.
+
+- `__init__`: store weights as `nn.Parameter`, preshuffle with `register_buffer()`, compile kernels
+- `forward()`: call the pre-compiled launcher with runtime data
+
+Use `self.register_buffer("name", tensor)` for derived tensors (like
+preshuffled weights) so that `.cuda()` / `.to()` moves them alongside
+`nn.Parameter` tensors. Plain `self.x = tensor` is NOT moved by `.cuda()`.
+
+ANTI-PATTERN (uses PyTorch modules — produces PyTorch fallbacks):
+```python
+self.fc = nn.Linear(in_f, out_f)      # WRONG: PyTorch module
+out = self.fc(x)                       # WRONG: PyTorch compute
+```
+
+ANTI-PATTERN (recompiles every forward call):
+```python
+def forward(self, x):
+    fn = compile_preshuffle_gemm_a8(...)  # WRONG: recompiles every call
+```
+
+CORRECT PATTERN (FlyDSL-native internals):
+```python
+class Model(nn.Module):  # nn.Module required by translation harness (.cuda()/.to())
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        w = torch.randn(out_features, in_features, dtype=torch.float16)
+        self.weight = nn.Parameter(w)
+        self.bias = nn.Parameter(torch.randn(out_features, dtype=torch.float16))
+        self.register_buffer("w_shuffled",
+            shuffle_weight(self.weight.data.contiguous(), layout=(16, 16)))
+        self.gemm_fn = compile_preshuffle_gemm_a8(
+            K=in_features, tile_m=16, tile_n=64, tile_k=256,
+            in_dtype="fp16")
+
+    def forward(self, x):
+        M, N = x.shape[0], self.weight.shape[0]
+        stream = torch.cuda.current_stream()
+        c_out = torch.empty(M, N, dtype=torch.float16, device=x.device)
+        scale = torch.empty(0, device=x.device, dtype=torch.float32)
+        self.gemm_fn(c_out.view(-1), x.half().contiguous().view(-1),
+                     self.w_shuffled.view(-1), scale, scale,
+                     M, N, stream)
+        # Bias + ReLU as separate ops
+        c_out = torch.clamp(c_out + self.bias.unsqueeze(0), min=0)
+        return c_out
+```
+
+The `nn.Module` wrapper is required by the translation harness (which calls
+`.cuda()` / `.to()` to move parameters to GPU). Only the internals must be
+FlyDSL-native — no `nn.Linear`, `nn.Conv2d`, or other PyTorch compute modules.
+
 ## Parameter Types
 
 | Type | Usage | Description |
@@ -238,56 +294,6 @@ def scalar_kernel(Input: fx.Tensor, Output: fx.Tensor, N: fx.Constexpr[int]):
         fx.copy_atom_call(copy_atom, r_out, fx.slice(out_div, (None, idx)))
 ```
 
-## Control Flow
-
-```python
-from flydsl.expr import range_constexpr, const_expr
-
-# Compile-time unrolled loop (N must be Constexpr or literal)
-for i in range_constexpr(N):
-    # loop body is fully unrolled in generated IR
-    ...
-
-# Runtime loop (lowered to scf.for)
-for i in range(runtime_value):
-    ...
-
-# Mark a derived value as compile-time constant
-tile_size = const_expr(N // 4)
-```
-
-## Hardware Math Intrinsics
-
-```python
-from flydsl.expr import rocdl
-from flydsl.expr.typing import T
-
-# Single-cycle hardware exp2 (v_exp_f32) — lower precision than math.exp2
-result = rocdl.exp2(T.f32, x)
-
-# Single-cycle hardware reciprocal (v_rcp_f32)
-result = rocdl.rcp(T.f32, x)
-
-# ArithValue method style also works (used in Swish pattern):
-exp_val = neg_x_log2e.exp2()
-```
-
-## Synchronization
-
-```python
-from flydsl.expr import gpu
-gpu.barrier()   # workgroup barrier
-```
-
-## Kernel Debugging
-
-```python
-import flydsl.expr as fx
-
-# In-kernel printf (works inside @flyc.kernel)
-fx.printf("tid=%d bid=%d val=%f", tid, bid, value)
-```
-
 ## Launch Configuration
 
 ```python
@@ -366,7 +372,7 @@ executor = build_rmsnorm_module(M=batch, N=dim, dtype_str="f32")
 ### Pre-built Kernel Configuration
 
 GEMM additional parameters: `waves_per_eu` (int, optional) limits CU occupancy (1-4);
-`use_cshuffle_epilog` (bool) enables CK-style LDS CShuffle epilogue for output.
+`use_cshuffle_epilog` (bool) enables CK-style LDS CShuffle for output.
 
 All pre-built kernels use: `BLOCK_THREADS=256`, `VEC_WIDTH=8`, `WARP_SIZE=64` (AMD wavefront).
 
@@ -386,17 +392,8 @@ from kernels.reduce import reduce_vec_max, reduce_vec_sum, make_block_reduce
 
 ## AMD Hardware Reference
 
-| Property | MI300X (gfx942) | MI350 (gfx950) |
-|----------|-----------------|----------------|
-| Wavefront size | 64 threads | 64 threads |
-| LDS per CU | 64 KB | 160 KB |
-| VGPR per CU | 512 KB | 512 KB |
-
-**Translation paths for ops without direct FlyDSL pre-built kernels:**
-- **Conv2d**: im2col (`F.unfold`) + `compile_preshuffle_gemm_a8` (fp16 cast); fallback: im2col + `torch.mm`
-- **MaxPool2d**: custom `@flyc.kernel` with `arith.maximumf` over window elements
-- **BatchNorm2d**: `F.batch_norm` (acceptable PyTorch fallback, MIOpen backend)
-- **Conv3d, AvgPool2d**: no FlyDSL equivalent, use PyTorch
+AMD GPU wavefront size is 64 threads (`WARP_SIZE=64`). All pre-built kernels
+use `BLOCK_THREADS=256` and `VEC_WIDTH=8`.
 
 ## Common PyTorch -> FlyDSL Op Mapping
 
@@ -419,4 +416,4 @@ from kernels.reduce import reduce_vec_max, reduce_vec_sum, make_block_reduce
 | `nn.RMSNorm` | `build_rmsnorm_module()` | **Pre-built** |
 | `nn.Conv2d` | im2col + `compile_preshuffle_gemm_a8` (see conv_pool_bn guide) | Hybrid (im2col + **Pre-built** GEMM) |
 | `F.max_pool2d` | Custom `@flyc.kernel` (see conv_pool_bn guide) | Custom kernel |
-| `nn.BatchNorm2d` | `F.batch_norm` (acceptable PyTorch fallback) | PyTorch fallback |
+| `nn.BatchNorm2d` | Custom `@flyc.kernel` (pre-computed scale/shift, see conv_pool_bn guide) | Custom kernel |

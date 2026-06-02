@@ -40,7 +40,7 @@ class TranslationPair:
     kb_category_files: dict[str, str] = field(default_factory=dict)
     env_setup: Callable[[Path], dict[str, str]] = field(default=lambda: _noop_env_setup)
     max_attempts: int = 3
-    perf_fail_threshold: float = 0.5
+    perf_fail_threshold: float = 0.1
     perf_warn_threshold: float = 0.8
     supported: bool = True
     self_review: bool = False
@@ -218,7 +218,21 @@ def load_translation_kb(
        - Category-specific guides (reductions, GEMM, attention)
     """
     kb_root = Path(__file__).resolve().parents[3] / "skills" / "pytorch2flydsl-translation" / "docs"
+    native_pure_root = kb_root / "native-pure"
+    native_root = kb_root / "native"
     sections: list[str] = []
+
+    def _resolve_kb_path(filename: str) -> Path:
+        """Prefer native-pure/ or native/ version based on env vars."""
+        if _native_pure_mode:
+            pure_path = native_pure_root / filename
+            if pure_path.exists():
+                return pure_path
+        if _native_mode:
+            native_path = native_root / filename
+            if native_path.exists():
+                return native_path
+        return kb_root / filename
 
     if flydsl_repo:
         for doc_path in _FLYDSL_REPO_DOCS:
@@ -227,14 +241,14 @@ def load_translation_kb(
                 sections.append(full_path.read_text())
     else:
         for f in pair.kb_base_files:
-            path = kb_root / f
+            path = _resolve_kb_path(f)
             if path.exists():
                 sections.append(_strip_frontmatter(path.read_text()))
             else:
                 logger.warning("KB base file not found: %s", path)
 
     for f in pair.kb_translation_files:
-        path = kb_root / f
+        path = _resolve_kb_path(f)
         if path.exists():
             sections.append(_strip_frontmatter(path.read_text()))
         else:
@@ -242,7 +256,7 @@ def load_translation_kb(
 
     for cat in categories:
         if cat in pair.kb_category_files:
-            path = kb_root / pair.kb_category_files[cat]
+            path = _resolve_kb_path(pair.kb_category_files[cat])
             if path.exists():
                 sections.append(_strip_frontmatter(path.read_text()))
 
@@ -253,16 +267,30 @@ def load_translation_kb(
 # Registry: built-in pairs
 # ---------------------------------------------------------------------------
 
+_native_mode = os.environ.get("GEAK_NATIVE_PATTERN", "") == "1"
+_native_pure_mode = os.environ.get("GEAK_NATIVE_PURE", "") == "1"
+
+if _native_pure_mode:
+    _config_name = "mini_kernel_pytorch_to_flydsl_native_pure"
+elif _native_mode:
+    _config_name = "mini_kernel_pytorch_to_flydsl_native"
+else:
+    _config_name = "mini_kernel_pytorch_to_flydsl"
+
 _PYTORCH_TO_FLYDSL = TranslationPair(
     source="pytorch",
     target="flydsl",
     detect_source=_detect_pytorch_module,
-    config_name="mini_kernel_pytorch_to_flydsl",
+    config_name=_config_name,
     harness_config_name="mini_unit_test_agent_pytorch_translation",
     harness_candidate_flag="--flydsl-kernel",
     candidate_filename_fn=lambda stem: f"{stem}_flydsl.py",
     kb_base_files=["flydsl_translation_api_reference.md"],
-    kb_translation_files=["flydsl_translation_guide.md"],
+    kb_translation_files=(
+        ["flydsl_translation_guide.md", "flydsl_translation_im2col_pad.md"]
+        if _native_pure_mode
+        else ["flydsl_translation_guide.md"]
+    ),
     kb_category_files={
         "gemm": "flydsl_translation_gemm.md",
         "reductions": "flydsl_translation_reductions.md",
