@@ -118,6 +118,17 @@ def run_preprocess_v3(
         output_dir=output_dir,
     )
 
+    # Make the canonical SOURCE repo root visible to the worktree-bypass
+    # detector (``kernel_languages.contract.find_source_repo_path_leaks`` ->
+    # ``_resolve_repo_roots`` reads ``GEAK_REPO_ROOT``). Without this, harness
+    # validation during preprocess only sees ``GEAK_WORK_DIR`` (the *subagent*
+    # worktree), so a harness that hardcodes the original source tree (e.g.
+    # ``"/repo/python"`` in a sys.path candidate list) is NOT flagged and the
+    # optimizer silently evaluates the unpatched baseline (~1.00x). Force-set:
+    # GEAK_REPO_ROOT is by definition the original repo root, never a worktree.
+    if repo_root:
+        os.environ["GEAK_REPO_ROOT"] = str(repo_root)
+
     if model is None:
         raise RuntimeError(
             "run_preprocess_v3: neither ``model`` nor ``model_factory`` was supplied; "
@@ -166,9 +177,26 @@ def run_preprocess_v3(
     )
 
     if not result.success:
-        raise RuntimeError(
-            "v3 preprocess failed: " + ("; ".join(result.errors) if result.errors else "no artefacts produced")
-        )
+        # Backstop salvage: a pure step/cost-limit abort must not discard a run
+        # whose essential artifacts (COMMANDMENT.md, and a harness on Path B)
+        # were already produced. The orchestrator normally salvages this case
+        # itself; this guards the residual path where success stayed False but
+        # the artifacts are on disk, so a step_limit overshoot can't tear down
+        # the whole GEAK pipeline. Genuine failures (no artifacts, or non-limit
+        # errors) still raise.
+        if _can_proceed_despite_failure(result):
+            logger.warning(
+                "v3 preprocess returned success=False (errors=%s) but required artifacts are "
+                "present (harness=%s, commandment=%s); proceeding into optimization with the "
+                "salvaged context instead of aborting.",
+                result.errors,
+                result.harness_path,
+                result.commandment_path,
+            )
+        else:
+            raise RuntimeError(
+                "v3 preprocess failed: " + ("; ".join(result.errors) if result.errors else "no artefacts produced")
+            )
 
     return _preprocess_result_to_legacy_context(
         result=result,
@@ -464,6 +492,29 @@ def _build_orchestrator_task(
 # ---------------------------------------------------------------------------
 # Result projection
 # ---------------------------------------------------------------------------
+
+
+def _can_proceed_despite_failure(result: PreprocessResult) -> bool:
+    """Whether a ``success=False`` result is still usable for optimization.
+
+    True only when (a) every recorded error is a budget-limit abort (step/cost
+    limit) — never a real tool crash — and (b) the essential artifacts exist on
+    disk: a COMMANDMENT.md always, plus a harness file on Path B. This is the
+    adapter-level mirror of the orchestrator's salvage so a step_limit overshoot
+    cannot abort the whole GEAK run when the harness + COMMANDMENT were produced.
+    """
+    errors = result.errors or []
+    if not errors:
+        return False
+    if not all(("step_limit" in e) or ("cost_limit" in e) or ("Limits exceeded" in e) for e in errors):
+        return False
+    commandment_path = result.commandment_path
+    if commandment_path is None or not Path(commandment_path).is_file():
+        return False
+    if result.path_taken == "A":
+        return True
+    harness_path = result.harness_path
+    return harness_path is not None and Path(harness_path).is_file()
 
 
 def _preprocess_result_to_legacy_context(

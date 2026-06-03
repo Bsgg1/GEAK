@@ -129,6 +129,15 @@ def _substitute_mode_flag(cmd: str, target_mode: str) -> str:
 
 _DEFAULT_PROFILE_REPLAYS = 5
 
+#: Bounded-retry ceilings used by ``_finish_blockers`` so an unclearable
+#: deterministic-tool / verifier failure cannot spin the orchestrator loop up
+#: to its global ``step_limit``. Once these caps are hit the corresponding
+#: blocker is demoted (no longer blocks ``finish_preprocess``) and the
+#: partial/failed artifact is surfaced on the PreprocessResult instead.
+_MAX_DETERMINISTIC_PROBE_ATTEMPTS = 2
+#: Mirrors the prompt's "Maximum 3 generator attempts" budget for harness repair.
+_MAX_VERIFIER_ATTEMPTS = 3
+
 
 def _build_profile_section(profile_cmd: str) -> str:
     """Wrap a ``--profile`` harness invocation with warmup + ``kernel-profile``.
@@ -1331,6 +1340,39 @@ def _make_tool_render_commandment(
                 )
             out_path = str(Path(output_dir) / "COMMANDMENT.md")
 
+        # Hard worktree-bypass gate (deterministic, final). A harness that
+        # hardcodes the source-repo path imports/builds the UNPATCHED baseline,
+        # so correctness always PASSes and every speedup reads ~1.00x with no
+        # error. Refuse to finalize such a harness into COMMANDMENT.md — return
+        # a directive that routes the orchestrator back to harness-generator.
+        # ``repo_root`` here is the canonical source repo, so the detector is
+        # precise regardless of the GEAK_WORK_DIR/GEAK_REPO_ROOT env state.
+        if not os.environ.get("GEAK_ALLOW_HARDCODED_PATHS"):
+            try:
+                from minisweagent.kernel_languages.contract import (
+                    ContractViolation,
+                    validate_harness,
+                )
+
+                validate_harness(Path(harness_path), repo_root=repo_root)
+            except ContractViolation as exc:
+                logger.error("render_commandment REJECTED harness (worktree bypass): %s", exc)
+                agent._collected.pop("harness_path", None)
+                return {
+                    "ok": False,
+                    "error": "worktree_bypass",
+                    "detail": str(exc),
+                    "next_action": (
+                        "Do NOT retry render_commandment. Re-dispatch the "
+                        "harness-generator subagent to regenerate the harness so it "
+                        "resolves EVERY path from os.environ['GEAK_WORK_DIR'] (no "
+                        "hardcoded source-repo path, not even as a sys.path fallback "
+                        "candidate). Then re-run the verifier before render_commandment."
+                    ),
+                }
+            except Exception as exc:  # noqa: BLE001 — never let the gate crash finalize
+                logger.debug("render_commandment bypass-gate skipped (validator error): %s", exc)
+
         ctx = CommandmentContext(
             kernel_path=Path(kernel_path),
             harness_path=Path(harness_path),
@@ -1630,9 +1672,12 @@ def _make_tool_finish_preprocess(
                 "error": "finish_preprocess blocked: unresolved preprocess invariants",
                 "blockers": blockers,
                 "next_action": (
-                    "Do not call finish_preprocess again yet. Fix the listed blockers by "
-                    "rerunning the failed deterministic tool or redispatching the relevant "
-                    "subagent, then call finish_preprocess only after all blockers are gone."
+                    "Fix the listed blockers by rerunning the failed deterministic tool or "
+                    "redispatching the relevant subagent, then call finish_preprocess once the "
+                    "blockers are gone. IMPORTANT: do NOT retry the same failing tool more than "
+                    "twice (verifier: 3x). If a blocker persists after that budget, it is "
+                    "unrecoverable here — call finish_preprocess(errors=['<short reason>']) to "
+                    "terminate with a partial result instead of looping until the step limit."
                 ),
             }
         agent._finish_payload = payload
@@ -1691,23 +1736,56 @@ def _finish_blockers(
     if not agent._collected.get("harness_path"):
         blockers.append("Path B missing harness_path")
 
+    def _tool_attempts(tool_name: str) -> int:
+        return sum(1 for tc in agent._tool_calls if tc.get("name") == tool_name)
+
+    # ── Bounded retries ──────────────────────────────────────────────
+    # verifier / baseline / profile success used to be HARD gates with no
+    # attempt ceiling: an environment- or format-level failure that can never
+    # succeed (e.g. a profiler that can't parse an unusual standalone harness)
+    # would block ``finish_preprocess`` forever, so the LLM kept re-running the
+    # failing tool until it exhausted the global step_limit. We now cap the
+    # number of attempts. Once the cap is hit, the unclearable blocker is
+    # DEMOTED (we stop blocking) so the sentinel can terminate cleanly; the
+    # failed/partial artifact still rides along in the PreprocessResult and the
+    # downstream salvage / success logic decides usability. ``profile`` is
+    # never required by the optimizer, so it is demoted most aggressively.
     verifier_runs = [r for r in agent._subagent_runs if r.get("name") == "harness-verifier"]
+    verifier_ok = any(r.get("success") is True for r in verifier_runs)
     if not verifier_runs:
         blockers.append("Path B never dispatched harness-verifier")
-    elif not any(r.get("success") is True for r in verifier_runs):
-        blockers.append("Path B has no successful harness-verifier run")
+    elif not verifier_ok and len(verifier_runs) < _MAX_VERIFIER_ATTEMPTS:
+        blockers.append(
+            f"Path B has no successful harness-verifier run ({len(verifier_runs)}/{_MAX_VERIFIER_ATTEMPTS} attempts)"
+        )
 
     baseline = agent._collected.get("baseline")
-    if baseline is None:
-        blockers.append("Path B missing baseline metrics")
-    elif getattr(baseline, "success", True) is False:
-        blockers.append("Path B baseline collection failed")
+    baseline_attempts = _tool_attempts("collect_baseline")
+    if baseline is None and baseline_attempts < _MAX_DETERMINISTIC_PROBE_ATTEMPTS:
+        blockers.append("Path B missing baseline metrics (call collect_baseline)")
+    elif (
+        baseline is not None
+        and getattr(baseline, "success", True) is False
+        and baseline_attempts < _MAX_DETERMINISTIC_PROBE_ATTEMPTS
+    ):
+        blockers.append(
+            f"Path B baseline collection failed ({baseline_attempts}/{_MAX_DETERMINISTIC_PROBE_ATTEMPTS} attempts)"
+        )
 
     profile = agent._collected.get("profile")
-    if profile is None:
-        blockers.append("Path B missing profile result")
-    elif getattr(profile, "success", True) is False:
-        blockers.append("Path B profile collection failed")
+    profile_attempts = _tool_attempts("collect_profile")
+    if profile is None and profile_attempts == 0:
+        # Profiling must be attempted at least once, but a repeated failure is
+        # non-fatal (profile is advisory for the optimizer, not required).
+        blockers.append("Path B missing profile result (call collect_profile)")
+    elif (
+        profile is not None
+        and getattr(profile, "success", True) is False
+        and profile_attempts < _MAX_DETERMINISTIC_PROBE_ATTEMPTS
+    ):
+        blockers.append(
+            f"Path B profile collection failed ({profile_attempts}/{_MAX_DETERMINISTIC_PROBE_ATTEMPTS} attempts)"
+        )
 
     if not agent._collected.get("commandment_path"):
         blockers.append("Path B missing COMMANDMENT.md")

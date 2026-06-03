@@ -2,8 +2,36 @@ import locale
 import logging
 import os
 import re
+import shlex
+import signal
 import subprocess
 from pathlib import Path
+
+# Default per-command wall-clock timeout (seconds). A find/grep over a huge
+# shared mount (e.g. /wekafs, tens of TB) would otherwise block until the
+# preprocess soft/hard cap fires, burning the whole preprocess budget. Override
+# with GEAK_BASH_TIMEOUT_S.
+_DEFAULT_BASH_TIMEOUT_S = 300.0
+
+# Recursive-traversal commands whose explicit path operands are range-checked
+# against the denylist below. Non-recursive commands (and any command we cannot
+# confidently parse) are left untouched and rely on the timeout backstop.
+_RECURSIVE_SCANNERS = frozenset({"find", "grep", "egrep", "fgrep", "rg", "ag", "fd", "fdfind", "ls", "du", "tree"})
+_GREP_LIKE = frozenset({"grep", "egrep", "fgrep"})
+
+# Scanners whose FIRST non-flag operand is a pattern/regex, not a path, so it
+# must be skipped before range-checking the remaining (path) operands.
+_PATTERN_FIRST = frozenset({"grep", "egrep", "fgrep", "rg", "ag", "fd", "fdfind"})
+
+# Search roots that must never be scanned recursively: the multi-TB shared data
+# lake and the bare filesystem root (which contains it). Override/extend with a
+# ':'-separated GEAK_SEARCH_DENY_ROOTS (a bare "/" means "exactly /", not a
+# prefix, so it does not block legitimate /opt/rocm or /usr/include searches).
+_DEFAULT_DENY_ROOTS = ("/wekafs", "/")
+
+# Shell tokens that begin a new simple-command within a compound line, so each
+# sub-command's argv[0] can be re-evaluated against the scanner set.
+_CMD_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "(", ")", "{", "}", "\n"})
 
 _OUTPUT_UNREADABLE = (
     "The combined command output could not be decoded as a whole using the "
@@ -122,6 +150,145 @@ class BashCommand:
             return rewritten
         return command
 
+    @staticmethod
+    def _denied_roots() -> list[str]:
+        raw = os.environ.get("GEAK_SEARCH_DENY_ROOTS")
+        if raw is None:
+            return list(_DEFAULT_DENY_ROOTS)
+        return [d for d in raw.split(":") if d]
+
+    @staticmethod
+    def _path_in_deny(token: str, deny: list[str]) -> str | None:
+        """Resolve an absolute/`~` path token and return the matched deny root,
+        or None. A deny entry of "/" matches only the exact filesystem root, so
+        bounded system trees (``/opt/rocm``, ``/usr/include``) stay searchable."""
+        if not token.startswith(("/", "~")):
+            return None  # relative -> resolves under cwd (worktree); safe.
+        rp = os.path.realpath(Path(token).expanduser())
+        for d in deny:
+            if d == "/":
+                if rp == "/":
+                    return rp
+            elif rp == d.rstrip("/") or rp.startswith(d.rstrip("/") + "/"):
+                return rp
+        return None
+
+    @staticmethod
+    def _grep_is_recursive(flags: list[str]) -> bool:
+        for f in flags:
+            if f in ("--recursive", "--dereference-recursive"):
+                return True
+            if f.startswith("-") and not f.startswith("--") and ("r" in f[1:] or "R" in f[1:]):
+                return True
+        return False
+
+    @staticmethod
+    def _ls_is_recursive(flags: list[str]) -> bool:
+        # ls: only -R / --recursive walks; -r is merely reverse-sort.
+        for f in flags:
+            if f == "--recursive":
+                return True
+            if f.startswith("-") and not f.startswith("--") and "R" in f[1:]:
+                return True
+        return False
+
+    @classmethod
+    def _blocked_scan_root(cls, command: str) -> str | None:
+        """Return the offending deny-root if ``command`` recursively scans it.
+
+        Conservative & fail-open: any command we cannot confidently tokenize
+        (exotic quoting, ``$(...)``, etc.) returns None and falls back to the
+        timeout backstop. Only the recursive scanners in ``_RECURSIVE_SCANNERS``
+        are inspected, and grep/ls only when a recursion flag is present (a
+        single-file ``grep`` or a flat ``ls`` is bounded). Everything else
+        passes through untouched.
+        """
+        deny = cls._denied_roots()
+        if not deny:
+            return None
+        try:
+            tokens = shlex.split(command, comments=False)
+        except ValueError:
+            return None  # unbalanced quotes etc. -> let timeout handle it.
+
+        i = 0
+        at_cmd_start = True
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok in _CMD_SEPARATORS:
+                at_cmd_start = True
+                i += 1
+                continue
+            if not at_cmd_start:
+                i += 1
+                continue
+            at_cmd_start = False
+            cmd = Path(tok).name
+            if cmd not in _RECURSIVE_SCANNERS:
+                i += 1
+                continue
+            # Collect this simple-command's operands up to the next separator.
+            j = i + 1
+            operands: list[str] = []
+            while j < len(tokens) and tokens[j] not in _CMD_SEPARATORS:
+                operands.append(tokens[j])
+                j += 1
+            flags = [o for o in operands if o.startswith("-")]
+            # grep/ls only walk when their recursion flag is present.
+            if cmd in _GREP_LIKE and not cls._grep_is_recursive(flags):
+                i = j
+                continue
+            if cmd == "ls" and not cls._ls_is_recursive(flags):
+                i = j
+                continue
+            # Pattern-first commands take a regex as their first non-flag
+            # operand (e.g. ``rg "/x" /path``); skip it so it is not mistaken
+            # for a path. find/du/tree/ls are path-first -> check all operands.
+            skipped_pattern = cmd not in _PATTERN_FIRST
+            for operand in operands:
+                if operand.startswith("-"):
+                    continue
+                if not skipped_pattern:
+                    skipped_pattern = True
+                    continue
+                hit = cls._path_in_deny(operand, deny)
+                if hit:
+                    return hit
+            i = j
+        return None
+
+    @staticmethod
+    def _run(command: str, env, cwd, timeout_s: float):
+        """Run ``command`` in its own process group and enforce ``timeout_s``.
+
+        ``start_new_session=True`` puts the shell and all its children in a
+        fresh process group, so on timeout we ``killpg`` the WHOLE group —
+        otherwise a runaway ``find`` orphaned by killing only the shell would
+        keep hammering the filesystem. Returns ``(stdout, stderr, rc, timed_out)``.
+        """
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            cwd=cwd,
+            start_new_session=True,
+        )
+        try:
+            out_b, err_b = proc.communicate(timeout=timeout_s)
+            return out_b, err_b, proc.returncode, False
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            try:
+                out_b, err_b = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                out_b, err_b = b"", b""
+            return out_b, err_b, -signal.SIGKILL, True
+
     def __call__(
         self,
         *,
@@ -138,36 +305,48 @@ class BashCommand:
                 "output": f"Blocked dangerous command: {command}",
                 "returncode": 1,
             }
+        denied_root = self._blocked_scan_root(command)
+        if denied_root:
+            return {
+                "output": (
+                    f"Blocked recursive scan of '{denied_root}': it is a multi-TB "
+                    "shared mount outside the allowed search scope and would stall "
+                    "for a very long time. Restrict the search to your worktree "
+                    "($GEAK_WORK_DIR) or the source repo ($GEAK_REPO_ROOT), e.g. "
+                    '`grep -r <pattern> "$GEAK_WORK_DIR"`.'
+                ),
+                "returncode": 1,
+            }
         else:
             command = self._sandbox_command(command)
             env = os.environ | self._env_override if self._env_override else None
             cwd = self._cwd if self._cwd and Path(self._cwd).is_dir() else None
             try:
-                result = subprocess.run(
-                    command,
-                    shell=True,
-                    capture_output=True,
-                    text=False,
-                    env=env,
-                    cwd=cwd,
-                    timeout=self.timeout,
+                # GEAK_BASH_TIMEOUT_S takes precedence; fall back to self.timeout
+                # (which itself reads main's GEAK_BASH_TIMEOUT) so both env names work.
+                timeout_s = float(os.environ.get("GEAK_BASH_TIMEOUT_S", self.timeout))
+            except (TypeError, ValueError):
+                timeout_s = float(self.timeout)
+            stdout_b, stderr_b, returncode, timed_out = self._run(command, env, cwd, timeout_s)
+            output_text = _decode_captured_output(stdout_b, stderr_b)
+
+            if timed_out:
+                notice = (
+                    f"Command terminated after exceeding the {timeout_s:.0f}s timeout "
+                    "(process group killed). If you were searching the filesystem, "
+                    "scope it to $GEAK_WORK_DIR / $GEAK_REPO_ROOT instead of a shared "
+                    "mount; otherwise split the work into smaller steps."
                 )
-            except subprocess.TimeoutExpired:
-                return {
-                    "output": f"TIMEOUT: command exceeded {self.timeout}s limit. "
-                    "Override via GEAK_BASH_TIMEOUT env var.",
-                    "returncode": -1,
-                }
-            output_text = _decode_captured_output(result.stdout, result.stderr)
+                output_text = f"{output_text}\n\n{notice}" if output_text else notice
 
             if "COMMANDMENT.md" in command:
                 output_text = self._maybe_validate_commandment(command, output_text)
 
-            if result.returncode != 0:
+            if returncode != 0:
                 output_text = output_text or "Command failed with no output."
             return {
                 "output": output_text or "Bash command executed successfully.",
-                "returncode": result.returncode,
+                "returncode": returncode,
             }
 
     @staticmethod

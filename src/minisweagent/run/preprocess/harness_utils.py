@@ -1279,6 +1279,27 @@ def validate_harness(harness_path: str) -> tuple[bool, list[str]]:
         if flag not in code_only_source:
             errors.append(f"Harness source does not define '{flag}' flag")
 
+    # Worktree-bypass gate: a harness that hardcodes an absolute path into the
+    # source repo (REPO_ROOT="/...", hipcc -I /..., sys.path.insert(0, "/..."))
+    # compiles/imports the UNPATCHED baseline instead of the $GEAK_WORK_DIR
+    # worktree, so every speedup silently reads ~1.00x. Mechanism-agnostic:
+    # keys on "absolute literal into the repo root, not env-derived". Opt out
+    # with GEAK_ALLOW_HARDCODED_PATHS=1.
+    if not os.environ.get("GEAK_ALLOW_HARDCODED_PATHS"):
+        try:
+            from minisweagent.kernel_languages.contract import find_source_repo_path_leaks
+
+            leaks = find_source_repo_path_leaks(code_only_source)
+        except Exception:  # noqa: BLE001 — never let the detector break validation
+            leaks = []
+        for lineno, snippet, reason in leaks:
+            errors.append(
+                f"Line {lineno}: {reason}. This bypasses the GEAK worktree so the "
+                f"harness evaluates the BASELINE (every speedup ~1.00x). Derive the "
+                f"path from os.environ['GEAK_WORK_DIR'] (build artifacts under it too). "
+                f"Offending line: {snippet}"
+            )
+
     for flag in RECOMMENDED_HARNESS_FLAGS:
         if flag not in code_only_source:
             msg = (

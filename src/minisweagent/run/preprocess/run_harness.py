@@ -38,6 +38,10 @@ MODE_TO_FLAG: dict[str, str] = {
     "full-benchmark": "--full-benchmark",
 }
 
+#: Per-mode harness subprocess timeouts (seconds). All env-overridable so that
+#: compiled kernels (HIP/CUDA), whose first benchmark run must build the whole
+#: extension from source, are not killed mid-compile (which triggers a costly
+#: recompile-on-retry loop). Env names match ``preprocess_v3/baseline.py``.
 MODE_TIMEOUTS: dict[str, int] = {
     "correctness": int(os.environ.get("GEAK_BENCH_TIMEOUT", os.environ.get("GEAK_CORRECTNESS_TIMEOUT", "900"))),
     "profile": int(os.environ.get("GEAK_PROFILE_TIMEOUT", "120")),
@@ -64,12 +68,28 @@ def _build_env(
     gpu_id: int,
     env_overrides: dict[str, str] | None,
 ) -> dict[str, str]:
-    """Build subprocess environment matching COMMANDMENT SETUP conventions."""
+    """Build subprocess environment matching COMMANDMENT SETUP conventions.
+
+    ``repo_root`` here is the directory the harness must evaluate — at
+    optimization time this is the per-slot worktree, so we (a) put it first on
+    ``PYTHONPATH`` and (b) export it as ``GEAK_WORK_DIR``. A contract-compliant
+    harness resolves every repo path from ``GEAK_WORK_DIR``, which makes each
+    parallel slot self-contained: imports and build artifacts stay inside that
+    slot's worktree. We deliberately do NOT mutate global site-packages (no
+    ``pip install -e``), so the original sglang/vllm/aiter install is untouched
+    and parallel slots can never clobber a shared editable install.
+    """
     env = os.environ.copy()
 
     if repo_root:
         existing = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = f"{repo_root}:{existing}" if existing else repo_root
+        # Worktree-awareness contract: harnesses MUST read GEAK_WORK_DIR to
+        # locate the patched source. Setting it unconditionally also turns any
+        # ``os.environ.get("GEAK_WORK_DIR", "<baseline>")`` fallback into a
+        # no-op (the env already holds the right per-slot worktree).
+        env["GEAK_WORK_DIR"] = repo_root
+        env.setdefault("GEAK_REPO_ROOT", repo_root)
 
     env["HIP_VISIBLE_DEVICES"] = str(gpu_id)
     env["PYTHONUNBUFFERED"] = "1"

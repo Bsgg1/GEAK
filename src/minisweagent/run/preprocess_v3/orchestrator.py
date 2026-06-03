@@ -197,6 +197,8 @@ Once the harness is verified:
 
 Both are deterministic subprocess calls; do not dispatch a subagent.
 
+**Idempotency + bounded retries (CRITICAL — avoid step-limit loops).** Call each of ``collect_baseline`` and ``collect_profile`` AT MOST twice. If a call fails, you may retry it ONCE; if it still fails on the second attempt, stop retrying — do NOT keep re-running it. ``collect_profile`` is advisory for the optimizer and a persistent profile failure is NON-FATAL: proceed without a successful profile. If a deterministic tool or the verifier keeps failing past its retry budget and you cannot clear the blocker, go straight to the escape hatch in the Final section rather than re-running the same tool until the step limit.
+
 ## Step 5 — render COMMANDMENT.md (deterministic)
 
 Call ``render_commandment`` with these arguments ONLY:
@@ -212,7 +214,11 @@ The tool renders the canonical 5-section COMMANDMENT.md (Setup / Correctness / B
 
 Call ``finish_preprocess`` with no arguments (or at most an optional one-paragraph ``summary``). All artifacts are already recorded on the orchestrator from the deterministic tool calls above; the finish call is purely a completion sentinel. Do NOT pass ``harness_path``, ``commandment_path``, ``output_dir``, ``kernel_path``, ``artifacts``, ``codebase_context_path``, or ``path_taken`` — those fields are derived from the orchestrator state.
 
-After ``finish_preprocess`` returns, the orchestrator loop terminates.
+If ``finish_preprocess`` returns ``ok: false`` with a ``blockers`` list, read the ``next_action`` field: rerun the named failing tool (subject to the retry budget above) and call ``finish_preprocess`` again once the blocker clears.
+
+**Escape hatch (bounded termination).** If a blocker is unrecoverable — a deterministic tool (``collect_baseline`` / ``collect_profile``) or the harness-verifier has failed past its retry budget and you cannot clear it — call ``finish_preprocess(errors=["<short reason>"])``. Passing a non-empty ``errors`` list terminates the loop immediately with a partial result instead of spinning until the step limit. Use this rather than re-running a tool that keeps failing. A run that already produced a verified harness + COMMANDMENT.md is still salvageable downstream even if profiling failed, so terminating with a recorded error is far better than exhausting the step budget.
+
+After ``finish_preprocess`` returns (cleanly or via the escape hatch), the orchestrator loop terminates.
 
 # Output discipline
 
@@ -231,7 +237,7 @@ After ``finish_preprocess`` returns, the orchestrator loop terminates.
 6. ``collect_profile`` — deterministic; step 4 (Path A when harness is available, and Path B).
 7. ``render_commandment`` — deterministic; Path B step 5.
 8. ``commandment_from_user_command`` — Path A short-circuit. Mutually exclusive with ``dispatch_subagent("harness-generator", ...)``.
-9. ``finish_preprocess`` — completion sentinel; terminates the loop only when final invariants pass.
+9. ``finish_preprocess`` — completion sentinel; terminates the loop when final invariants pass, OR immediately when called with a non-empty ``errors`` list (escape hatch for unrecoverable blockers).
 
 Begin by classifying the task into Case A, B, or C. For Case A, skip discovery and go directly to ``commandment_from_user_command``. For Case B or C, call ``run_discovery`` first, then follow the case-specific action above.
 """
@@ -735,8 +741,12 @@ class PreprocessOrchestratorAgent:
 
         Success semantics (commit set 5a — fix for open question #7):
 
-        * Loop-level ``errors`` (e.g. ``LimitsExceeded``) always invalidate
-          ``success``.
+        * Loop-level ``errors`` (e.g. ``LimitsExceeded``) normally invalidate
+          ``success`` — EXCEPT a pure step/cost-limit abort is salvaged to
+          ``success=True`` when the required artifacts (COMMANDMENT.md +
+          harness on Path B) already exist on disk. The limit error is then
+          demoted to a warning. This keeps a step_limit overshoot from
+          discarding an otherwise-usable preprocess run.
         * ``finish_preprocess(errors=[...])`` — i.e. the LLM gracefully
           gave up after exhausting the harness-verifier retry budget — is
           treated as failure: the per-step errors are folded into
@@ -785,6 +795,32 @@ class PreprocessOrchestratorAgent:
             path_taken=path_taken,
             commandment_path=commandment_path,
         )
+
+        # ── Salvage: a step/cost-limit abort must NOT discard a usable run. ──
+        # When the loop exhausted its step (or cost) budget before the LLM
+        # could call ``finish_preprocess`` cleanly, but the required artifacts
+        # (COMMANDMENT.md + harness on Path B / COMMANDMENT.md on Path A) were
+        # already produced on disk, treat the run as a success so the
+        # downstream optimization loop can proceed. The limit error is demoted
+        # to a warning instead of aborting the whole GEAK pipeline. We scope
+        # this strictly to limit-only failures so genuine tool crashes still
+        # surface as ``success=False``.
+        if not success and finish_payload is None and self._is_limit_only(real_errors):
+            if self._artifacts_sufficient_for_salvage(path_taken, harness_path, commandment_path):
+                logger.warning(
+                    "Preprocess hit a step/cost limit before finish_preprocess, but required "
+                    "artifacts are present (harness=%s, commandment=%s); salvaging run as success.",
+                    harness_path,
+                    commandment_path,
+                )
+                warnings = [
+                    "preprocess hit step/cost limit before finish_preprocess; required artifacts "
+                    "were already produced, so the run was salvaged as success",
+                    *real_errors,
+                    *warnings,
+                ]
+                real_errors = []
+                success = True
 
         return PreprocessResult(
             success=success,
@@ -907,6 +943,37 @@ class PreprocessOrchestratorAgent:
         if baseline is None:
             return False
         return True
+
+    @staticmethod
+    def _is_limit_only(errors: list[str]) -> bool:
+        """True iff ``errors`` is non-empty and every entry is a budget-limit abort.
+
+        Used by the salvage path: only a pure step/cost-limit exhaustion is
+        eligible for salvage. Any other error (tool crash, fatal exception)
+        keeps ``success=False`` so real failures are never masked.
+        """
+        if not errors:
+            return False
+        return all(("step_limit" in e) or ("cost_limit" in e) or ("Limits exceeded" in e) for e in errors)
+
+    @staticmethod
+    def _artifacts_sufficient_for_salvage(
+        path_taken: Literal["A", "B"],
+        harness_path: Path | None,
+        commandment_path: Path | None,
+    ) -> bool:
+        """Whether on-disk artifacts justify salvaging a limit-aborted run.
+
+        Path A needs the rendered COMMANDMENT.md (the harness IS the user's
+        command). Path B additionally needs the generated harness file. Both
+        paths verify the paths actually exist on disk, not merely that the
+        orchestrator recorded a non-``None`` path.
+        """
+        if commandment_path is None or not Path(commandment_path).is_file():
+            return False
+        if path_taken == "A":
+            return True
+        return harness_path is not None and Path(harness_path).is_file()
 
     # -----------------------------------------------------------------
     # Model wiring
