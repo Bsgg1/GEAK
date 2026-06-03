@@ -20,20 +20,24 @@ Parameter tuning alone yields marginal gains. **Prioritize structural optimizati
 ## Step 2: Classify the Bottleneck
 
 - Check the **target GPU arch** via `get_hip_arch()` — LDS size, MFMA variants, and wavefront width are arch-dependent (e.g. gfx942: 64 KB LDS, 304 CUs, wavefront 64)
-- **Memory-bound** → reduce data movement (fusion, LDS caching, vectorization)
+- **Memory-bound with cross-thread reuse** (e.g. tiled GEMM operands, attention K/V tiles) → LDS staging, prefetch, vectorization
+- **Memory-bound without cross-thread reuse** (e.g. pure elementwise ops, RoPE position encoding, cache-write-only passes) → vectorization and coalescing **only**; LDS staging adds overhead without benefit because each thread processes its own independent slice. Do not add LDS staging or structural rewrites to this class.
 - **Compute-bound** → improve instruction throughput (MFMA selection, software pipelining)
 - **Latency-bound** (small shapes) → reduce kernel launch count (fusion)
+- **Already-fused kernel** (kernel name contains `fused_`, or the source already combines multiple ops in one `@flyc.kernel`) → the structural optimum is likely already reached; prioritize Tier 2 (vectorization, coalescing) and Tier 3 (MFMA, scheduling) instead of further fusion or loop restructuring
 - **GEMM-like kernel** → if the next optimization question is mainly about `tile_m` / `tile_n` / `tile_k`, GEMM-specific LDS staging, epilogue strategy, or MFMA-loop ISA counts, use this guide for generic prioritization and then switch to `flydsl_gemm_optimization.md`
 
 ## Step 3: Optimize — High Impact First
 
 ### Tier 1: Structural (highest impact)
 
-- **Kernel fusion**: if the `@flyc.jit` wrapper launches 2+ kernels that share input data, merge them into a single `@flyc.kernel`. Eliminates launch overhead and redundant HBM reads
+**Guard**: Tier 1 rewrites carry the highest regression risk. Before applying any structural change, confirm that the kernel is NOT already at the structural optimum: single-kernel, single-pass, or already named `fused_*` / `*_2stage` / `*_multistage`. For those, skip to Tier 2.
+
+- **Kernel fusion**: if the `@flyc.jit` wrapper launches 2+ kernels that share input data, merge them into a single `@flyc.kernel`. Eliminates launch overhead and redundant HBM reads. Do not attempt further fusion on a kernel that is already named `fused_*` or already combines all relevant ops.
 - **Fast-path relaxation**: look for overly-restrictive conditions guarding optimized code paths (e.g. disabled branches, alignment checks stricter than necessary). Relaxing these lets more shapes use the fast path
-- **Loop restructuring**: if the kernel uses constexpr loop unrolling that causes code bloat for large iteration counts, convert to `scf.for` with loop-carried state to reduce binary size and register pressure
+- **Loop restructuring**: if the kernel uses constexpr loop unrolling that causes measurable code bloat or register pressure for large iteration counts, convert to `scf.for` with loop-carried state. Do not convert when unrolling is the primary source of ILP or the iteration count is small and fixed — converting then adds overhead rather than saving it.
 - **Redundant work elimination**: identify repeated loads, recomputed indices, or overlapping branches, and hoist/cache them
-- **Algorithm replacement**: if the current algorithm has unnecessary passes over data, restructure to reduce pass count (e.g. online softmax vs two-pass, fused attention vs separate Q×K then softmax then ×V)
+- **Algorithm replacement**: if the current algorithm has unnecessary passes over data, restructure to reduce pass count (e.g. online softmax vs two-pass, fused attention vs separate Q×K then softmax then ×V). For single-pass elementwise kernels, the algorithm is already optimal at the pass level; do not add passes or stages.
 
 #### FlyDSL refactor guardrails
 
@@ -44,16 +48,16 @@ Parameter tuning alone yields marginal gains. **Prioritize structural optimizati
 
 ### Tier 2: Memory hierarchy (medium impact)
 
-- **LDS utilization**: if the kernel reads the same global data multiple times across threads, stage through LDS for reuse. Use `SmemAllocator` / `SmemPtr` from `flydsl.utils.smem_allocator`
+- **LDS utilization**: if the kernel reads the same global data multiple times **across threads within the same workgroup**, stage through LDS for reuse. Use `SmemAllocator` / `SmemPtr` from `flydsl.utils.smem_allocator`. **Do not add LDS staging for kernels where each thread processes its own independent slice with no block-level data sharing** (e.g. pure elementwise, RoPE position encoding, cache-write-only passes) — LDS adds synchronization and address overhead with no reuse benefit.
 - **Vectorized access**: use the widest vector loads/stores (`vec(8, ...)`, `vec(4, ...)`) that match the element type for maximum HBM bandwidth
-- **Overlap loads with compute**: move global loads earlier so they complete while ALU/MFMA work is in progress. Use scheduler barriers (`sched_barrier`) to control interleaving
+- **Overlap loads with compute**: move global loads earlier so they complete while ALU/MFMA work is in progress. Use scheduler barriers (`sched_barrier`) to control interleaving. This is only beneficial when MFMA or non-trivial ALU work exists to overlap with; for load-dominated kernels this produces no gain.
 - **Pre-load across passes**: if the kernel makes multiple passes, load data needed in later passes during earlier ones to avoid redundant HBM reads
 - **Data layout / coalescing**: ensure memory access patterns are coalesced; restructure loop ordering if needed
 - **Register pressure management**: balance between keeping data in registers vs spilling to LDS
 
 #### FlyDSL prefetch rewrite pattern
 
-- Use prefetch when the loop has enough independent MFMA/ALU work, or a later barrier-heavy phase, to hide the next global load. If the body is already dominated by loads, prefetch alone is unlikely to help.
+- Use prefetch when the loop has enough independent MFMA/ALU work, or a later barrier-heavy phase, to hide the next global load. **If the loop body is dominated by global loads with minimal MFMA or ALU compute, do not add prefetch** — there is no compute to hide behind, and the extra loop-carried state increases register pressure and can reduce occupancy without any latency benefit.
 - Follow a real loop-carried structure: prologue preloads iteration 0, `scf.for` carries the prefetched values, the loop body unpacks current state and issues next-iteration loads immediately, and the epilogue consumes the final carried values.
 - Carry every value needed to materialize the next iteration together — not just tensor payloads, but also block-table entries, page IDs, scale values, and running accumulators.
 - Keep the swap/prefetch path simple: unpack from `state`, issue the next loads as early as legality allows, and leave the load-to-consume distance for compute or barrier wait to hide.
@@ -198,10 +202,11 @@ Always verify after each patch — violations often cause silent corruption:
 
 1. Run correctness tests first — never sacrifice correctness for speed
 2. Confirm speedup across **all** tested shapes, not just one
-3. For structural rewrites, dump IR/ISA with `FLYDSL_DUMP_IR=1` and inspect the relevant `.mlir` stage plus `final_isa.s`
-4. Verify the specific effect you wanted: `scf.for` survives tracing/lowering, wide loads/stores stay vectorized, the MFMA variant matches the target dtype/arch, and the final loop shape reflects the intended schedule
-5. If the generated form did not change, assume the optimization did not land yet, even if the Python source looks right
-6. If speedup is marginal, move to the next structural strategy rather than re-tuning the same approach
+3. **Report both speedup ratio and absolute optimized time (ms)**. A higher speedup ratio paired with a worse absolute optimized time means the baseline shifted, not that the kernel improved. Treat any case where the absolute optimized time regresses as a failure even if the ratio looks better.
+4. For structural rewrites, dump IR/ISA with `FLYDSL_DUMP_IR=1` and inspect the relevant `.mlir` stage plus `final_isa.s`
+5. Verify the specific effect you wanted: `scf.for` survives tracing/lowering, wide loads/stores stay vectorized, the MFMA variant matches the target dtype/arch, and the final loop shape reflects the intended schedule
+6. If the generated form did not change, assume the optimization did not land yet, even if the Python source looks right
+7. If speedup is marginal or absolute time regresses, move to the next structural strategy rather than re-tuning the same approach
 
 ## Key FlyDSL APIs
 
