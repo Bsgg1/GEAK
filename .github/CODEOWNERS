@@ -1,0 +1,21 @@
+# GEAK Repository Code Owners
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# ──────────────────────────────────────────────
+# Global catch-all — every file must have an owner
+# ──────────────────────────────────────────────
+* @iraj465 @yueliu14 @jianghui-jianghui @amd-ethany @sdubagun-amd @Umangatamd @chao-xu-spec
+
+# ──────────────────────────────────────────────
+# Governance & compliance files
+# ──────────────────────────────────────────────
+.github/CODEOWNERS      @iraj465 @yueliu14 @jianghui-jianghui
+CONTRIBUTING.md          @iraj465 @yueliu14 @jianghui-jianghui
+SECURITY.md              @iraj465 @yueliu14 @jianghui-jianghui
+LICENSE                  @iraj465 @yueliu14 @jianghui-jianghui
+README.md                @iraj465 @yueliu14 @jianghui-jianghui
+
+# ──────────────────────────────────────────────
+# CI / CD workflows
+# ──────────────────────────────────────────────
+.github/workflows/       @iraj465 @yueliu14 @jianghui-jianghui
