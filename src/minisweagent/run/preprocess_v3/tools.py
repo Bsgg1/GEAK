@@ -1456,6 +1456,32 @@ def _make_tool_commandment_from_user_command(
             original_harness_path = None
         if original_harness_path:
             agent._collected["harness_path"] = original_harness_path
+
+        # Deterministic backstop for the flag-less Path-A case (issue #258).
+        # A command that (a) exposes none of GEAK's four harness flags, (b) is
+        # not a compound ``&&`` shell contract, and (c) yielded no usable
+        # harness_path carries no per-mode contract: every COMMANDMENT section
+        # would receive the SAME command (the section builders cannot inject a
+        # mode flag a flag-less command never had), and the correctness preflight
+        # would then run the harness's full default sweep until it times out. Refuse to
+        # render that all-modes-identical artifact and signal the orchestrator to
+        # switch to harness synthesis (Case A2). This guard is independent of the
+        # ``modes_covered`` the LLM passed, so it cannot be defeated by the LLM
+        # listing all four modes as covered.
+        is_flagless = _extract_harness_from_command(cmd) is None and "&&" not in cmd and original_harness_path is None
+        if is_flagless:
+            return {
+                "ok": False,
+                "error": "PATH_A_FLAG_MISSING",
+                "warnings": [
+                    "PATH_A_FLAG_MISSING: flag-less command exposes none of "
+                    "--correctness/--benchmark/--full-benchmark/--profile and has no "
+                    "harness; dispatch harness-generator (Case A2) instead of copying "
+                    "the command into all four modes. Do NOT retry "
+                    "commandment_from_user_command with the same command."
+                ],
+            }
+
         # Preserve the sanitized command (with real paths) for
         # collect_baseline before we replace repo_root with ${GEAK_WORK_DIR}.
         eval_command_for_baseline = cmd
