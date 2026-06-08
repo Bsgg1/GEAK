@@ -246,10 +246,10 @@ docker exec geak_mixed_hip pip install -e /workspace 2>/dev/null || true
 ### 5.4 API key
 
 ```bash
-export AMD_LLM_API_KEY="7d3c15d3142b4d1492859da87f16d9fc"
+export AMD_LLM_API_KEY="your_api_key_here"
 ```
 
-The model is `claude-opus-4.6` via AMD's LLM gateway.
+The model is `claude-opus-4.8` via AMD's LLM gateway.
 
 ### 5.5 Kernel test data (AKA)
 
@@ -325,7 +325,7 @@ KERNEL_DIR="/path/to/AKA_triton/tasks/triton2triton/geak_eval/L1/llama_ff_triton
 OUT_DIR="/data/$USER/mixed_test/triton_llama_ff_triton"
 
 docker exec \
-  -e "GEAK_MODEL=claude-opus-4.6" \
+  -e "GEAK_MODEL=claude-opus-4.8" \
   -e "AMD_LLM_API_KEY=$AMD_LLM_API_KEY" \
   -e "GEAK_PIPELINE_MODE=mixed" \
   geak_mixed_triton bash -c \
@@ -341,9 +341,9 @@ docker exec \
 # Mixed mode parity test: 18 Triton + 12 HIP
 set -euo pipefail
 
-AMD_LLM_API_KEY="${AMD_LLM_API_KEY:-7d3c15d3142b4d1492859da87f16d9fc}"
+AMD_LLM_API_KEY="${AMD_LLM_API_KEY:-your_api_key_here}"
 BATCH_DIR="/data/$USER/mixed_test"
-MODEL="claude-opus-4.6"
+MODEL="claude-opus-4.8"
 
 TRITON_CONTAINER="geak_mixed_triton"
 HIP_CONTAINER="geak_mixed_hip"
