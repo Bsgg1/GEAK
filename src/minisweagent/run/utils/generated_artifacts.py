@@ -9,7 +9,6 @@ evaluation when they leak into patch capture.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import subprocess
 import tempfile
@@ -277,8 +276,8 @@ _JIT_CACHE_PATH_SEGMENTS: frozenset[str] = frozenset(
 # ``torchinductor_<user>``); the substrings below catch every ``*cache*`` dir
 # (``triton_cache``, ``torch_compile_cache``, ``.cache``, ``__pycache__`` ...).
 _JIT_CACHE_SEGMENT_PREFIXES: tuple[str, ...] = (
-    ".triton",        # .triton, .triton_cache_geak, triton_cache_slotN
-    ".aiter",         # .aiter, .aiter_jit, .aiter_cpp_itfs
+    ".triton",  # .triton, .triton_cache_geak, triton_cache_slotN
+    ".aiter",  # .aiter, .aiter_jit, .aiter_cpp_itfs
     "torch_compile",  # torch_compile_cache
     "torchinductor",  # torchinductor_<user> (torch._inductor runtime cache)
     "flydsl_cache",

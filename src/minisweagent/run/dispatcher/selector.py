@@ -98,9 +98,7 @@ class Dispatcher:
         )
 
     @staticmethod
-    def _k_for_mode(
-        mode: str, n: int, round_evals: list[dict[str, Any]] | None = None
-    ) -> int:
+    def _k_for_mode(mode: str, n: int, round_evals: list[dict[str, Any]] | None = None) -> int:
         """Adaptive K allocation for mixed mode.
 
         Fixed/planned modes are unchanged. Mixed mode splits the N slots
