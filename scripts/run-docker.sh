@@ -198,7 +198,7 @@ fi
 if [ -n "$GEAK_MODEL" ]; then
     echo "✅ GEAK_MODEL: $GEAK_MODEL"
 else
-    GEAK_MODEL="claude-opus-4.6"
+    GEAK_MODEL="claude-opus-4.8"
     echo "ℹ️  GEAK_MODEL: (using default: $GEAK_MODEL)"
 fi
 echo ""

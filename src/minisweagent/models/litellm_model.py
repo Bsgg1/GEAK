@@ -418,7 +418,7 @@ if __name__ == "__main__":
             },
         },
         {
-            "model_name": "anthropic/claude-opus-4.6",
+            "model_name": "anthropic/claude-opus-4.8",
             "model_kwargs": {
                 "extra_headers": {"Ocp-Apim-Subscription-Key": ""},
                 "temperature": 1.0,

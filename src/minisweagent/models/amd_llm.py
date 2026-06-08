@@ -100,7 +100,7 @@ if __name__ == "__main__":
 
     model_list = [
         "gpt-5",
-        "claude-opus-4.6",
+        "claude-opus-4.8",
         "claude-sonnet-4.5",
         "gemini-3-pro-preview",
     ]
