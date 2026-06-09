@@ -31,6 +31,66 @@ from minisweagent.run.task_file import (
 
 logger = logging.getLogger(__name__)
 
+
+def resolve_num_parallel(
+    gpu_count: int,
+    *,
+    min_workers: int | None = None,
+    workers_per_gpu: int | None = None,
+) -> int:
+    """Default subagent count from allocated GPUs: max(min_workers, workers_per_gpu * gpu_count)."""
+    if min_workers is None:
+        try:
+            min_workers = int(os.environ.get("GEAK_MIN_PARALLEL_WORKERS", "4") or "4")
+        except ValueError:
+            min_workers = 4
+    if workers_per_gpu is None:
+        try:
+            workers_per_gpu = int(os.environ.get("GEAK_WORKERS_PER_GPU", "3") or "3")
+        except ValueError:
+            workers_per_gpu = 3
+    min_workers = max(1, min_workers)
+    workers_per_gpu = max(1, workers_per_gpu)
+    if gpu_count <= 0:
+        return min_workers
+    return max(min_workers, workers_per_gpu * gpu_count)
+
+
+def _softstop_drain_timeout_s() -> float:
+    """Grace window to let in-flight sub-agents finish after SoftStop."""
+    raw = os.environ.get("GEAK_SOFTSTOP_DRAIN_S", "300")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _task_patch_dir_name(task, task_id: int, has_dup_labels: bool) -> str:
+    if has_dup_labels:
+        return f"{task.label}_{task_id}" if task.label else f"task_{task_id}"
+    return task.label if task.label else f"task_{task_id}"
+
+
+def _inflight_lacks_best_results(
+    pending: set,
+    futures: dict,
+    task_by_id: dict[int, Any],
+    base_patch_dir: Path,
+    has_dup_labels: bool,
+) -> bool:
+    """True when any still-running task has no ``best_results.json`` yet."""
+    for fut in pending:
+        task_id = futures.get(fut)
+        if task_id is None:
+            continue
+        task = task_by_id.get(task_id)
+        if task is None:
+            continue
+        patch_dir = base_patch_dir / _task_patch_dir_name(task, task_id, has_dup_labels)
+        if not (patch_dir / "best_results.json").is_file():
+            return True
+    return False
+
 # ============================================================================
 # Thread-local stdout/stderr redirection
 # ============================================================================
@@ -871,6 +931,8 @@ def run_pool(
     results: list = []
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=n_tasks)
     soft_stop_observed = False
+    softstop_drain_until: float | None = None
+    task_by_id = {tid: task for tid, task in sorted_tasks}
     try:
         futures: dict[concurrent.futures.Future, int] = {}
         for tid, task in sorted_tasks:
@@ -908,6 +970,35 @@ def run_pool(
         pending = set(futures.keys())
         while pending:
             if soft_stop is not None and soft_stop.is_set():
+                drain_s = _softstop_drain_timeout_s()
+                lacks_results = _inflight_lacks_best_results(
+                    pending,
+                    futures,
+                    task_by_id,
+                    base_patch_dir,
+                    _has_dup_labels,
+                )
+                if lacks_results and drain_s > 0:
+                    if softstop_drain_until is None:
+                        softstop_drain_until = time.monotonic() + drain_s
+                        logger.warning(
+                            "run_pool: SoftStop set with %d in-flight task(s) "
+                            "lacking best_results; draining up to %.0fs before cancel",
+                            len(pending),
+                            drain_s,
+                        )
+                    if time.monotonic() < softstop_drain_until:
+                        done, pending = concurrent.futures.wait(pending, timeout=2.0)
+                        for future in done:
+                            task_id = futures[future]
+                            try:
+                                r = future.result()
+                                results.append(r)
+                            except concurrent.futures.CancelledError:
+                                logger.info("Pool task %d cancelled", task_id)
+                            except Exception as e:
+                                logger.error("Error in pool task %d: %s", task_id, e, exc_info=True)
+                        continue
                 logger.warning(
                     "run_pool: SoftStop set during dispatch; cancelling %d in-flight, terminating subprocesses",
                     len(pending),

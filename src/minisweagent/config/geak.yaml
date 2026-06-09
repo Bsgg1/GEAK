@@ -57,8 +57,10 @@ run:
       orchestrator:
         max_rounds: 5
 parallel:
-  num_parallel: null              # null -> ceil(len(gpu_ids) * gpu_oversubscribe)
-  gpu_oversubscribe: 1.0          # bump to 2.0 once stats validate headroom
+  num_parallel: null              # null -> max(min_parallel, workers_per_gpu * len(gpu_ids))
+  min_parallel: 4                 # floor; env GEAK_MIN_PARALLEL_WORKERS overrides
+  workers_per_gpu: 3              # env GEAK_WORKERS_PER_GPU overrides -> 12 on 4 GPUs
+  gpu_oversubscribe: 1.0          # legacy; unused by resolve_num_parallel
   max_concurrent_llm: null        # null -> num_parallel
 gpu_manager:
   job_timeout_default_s: 900
