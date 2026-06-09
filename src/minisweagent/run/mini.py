@@ -521,17 +521,20 @@ def main(
     if num_parallel is None:
         num_parallel = _as_int(parsed_config.get("num_parallel"))
     if num_parallel is None and parsed_gpu_ids:
-        from math import ceil
+        from minisweagent.run.utils.parallel_helpers import resolve_num_parallel
 
-        _oversubscribe = float(
-            parsed_config.get("gpu_oversubscribe")
-            or (config.get("parallel") or {}).get("gpu_oversubscribe", 1.0)
+        _par_cfg = config.get("parallel") or {}
+        _min_w = parsed_config.get("min_parallel") or _par_cfg.get("min_parallel")
+        _wpg = parsed_config.get("workers_per_gpu") or _par_cfg.get("workers_per_gpu")
+        num_parallel = resolve_num_parallel(
+            len(parsed_gpu_ids),
+            min_workers=int(_min_w) if _min_w is not None else None,
+            workers_per_gpu=int(_wpg) if _wpg is not None else None,
         )
-        num_parallel = max(1, ceil(len(parsed_gpu_ids) * _oversubscribe))
         logger.info(
-            "Auto-setting num_parallel=%s from gpu_ids (oversubscribe=%.1f).",
+            "Auto-setting num_parallel=%s from %d gpu_ids.",
             num_parallel,
-            _oversubscribe,
+            len(parsed_gpu_ids),
         )
 
     kernel_name_for_output = parsed_config.get("kernel_name")
