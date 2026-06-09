@@ -228,8 +228,19 @@ def _benchmark_command(harness_path: Path, flag: str = "--benchmark") -> list[st
 
     Wraps with ``bash -lc`` so login-shell profile fragments are
     sourced — matches ``run/preprocess/run_harness._run_single``.
+
+    Picks the interpreter from the harness type: a ``.sh`` wrapper (e.g. the
+    Path-A sanitized ``_geak_sanitized_*.sh``, which exports PYTHONPATH then
+    ``exec python``) must be run by ``bash``, NOT ``python`` — invoking a shell
+    script with ``python`` makes it fail instantly (rc=1, ~0.02s) and trips the
+    correctness gate. Default to ``sys.executable`` for ``.py`` harnesses.
     """
-    inner = " ".join(shlex.quote(c) for c in [sys.executable, str(harness_path), flag])
+    suffix = harness_path.suffix.lower()
+    if suffix == ".sh":
+        interp: list[str] = ["bash"]
+    else:
+        interp = [sys.executable]
+    inner = " ".join(shlex.quote(c) for c in [*interp, str(harness_path), flag])
     return ["bash", "-lc", inner]
 
 

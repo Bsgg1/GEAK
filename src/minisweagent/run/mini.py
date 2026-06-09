@@ -481,10 +481,22 @@ def main(
                 )
             config = _deep_merge(config, _task_user_config)
 
-    if model_name is None and parsed_config.get("model"):
-        model_name = parsed_config["model"]
+    _task_model = parsed_config.get("model")
+    # Guard: the task's parsed `model` can be the INFERENCE model path (e.g.
+    # /home/.../gpt-oss-120b-BF16) leaking from a runtime_args block, not an LLM
+    # id. litellm can't infer a provider from a filesystem path -> BadRequestError
+    # ("LLM Provider NOT provided"), which crashes the preprocess orchestrator.
+    # An LLM id is never an absolute path; ignore path-like values and keep the
+    # configured agent model (model.model_name from the geak config).
+    if model_name is None and _task_model and not str(_task_model).startswith(("/", "~", ".")):
+        model_name = _task_model
         model = get_model(model_name, config.get("model", {}))
         logger.info("Using model (from task): [bold cyan]%s[/bold cyan]", model_name)
+    elif model_name is None and _task_model:
+        logger.info(
+            "Ignoring task 'model' that looks like a filesystem path (%s); "
+            "keeping configured agent model.", _task_model,
+        )
 
     if output is None and parsed_config.get("output_dir"):
         output = Path(parsed_config["output_dir"])
