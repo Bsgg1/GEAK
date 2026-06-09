@@ -1,9 +1,14 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-import minisweagent.run.preprocess.resolve_kernel_url as resolve_kernel_url_module
 import pytest
-from minisweagent.run.preprocess_v3.adapter import _preprocess_result_to_legacy_context, _resolve_kernel_and_repo
+
+import minisweagent.run.preprocess.resolve_kernel_url as resolve_kernel_url_module
+from minisweagent.run.preprocess_v3.adapter import (
+    _build_orchestrator_task,
+    _preprocess_result_to_legacy_context,
+    _resolve_kernel_and_repo,
+)
 from minisweagent.run.preprocess_v3.orchestrator import (
     FinishedSuccessfully,
     PreprocessOrchestratorAgent,
@@ -426,3 +431,44 @@ def test_legacy_context_recovers_harness_path_from_promoted_command(tmp_path: Pa
     assert ctx["full_benchmark_baseline"] == str(output_dir / "full_benchmark_baseline.txt")
     assert (output_dir / "benchmark_baseline.txt").read_text() == "GEAK_RESULT_LATENCY_MS=1.25\n"
     assert ctx["v3_path_taken"] == "A"
+
+
+def _harness_hint(harness: str = "/tmp/x_harness.py") -> str:
+    """Render just the call-site hint block for a supplied harness."""
+    return _build_orchestrator_task(
+        user_task="Optimize this kernel.",
+        harness=harness,
+        eval_command=None,
+        correctness_command=None,
+        performance_command=None,
+        benchmark_timeout=3600,
+        translate_only=False,
+    )
+
+
+def test_harness_hint_contains_both_a1_and_a2_branches() -> None:
+    """Deletion-guard for the shapes-override hint (prompt-only fix).
+
+    The supplied-harness hint must carry BOTH routing branches so the
+    orchestrator can pick A1 (no prompt shapes) or A2-with-shapes (prompt
+    shapes override the harness). This is a presence check only — it does NOT
+    prove routing (the LLM decides) nor that the generator's shape-compare
+    works (covered by manual E2E). Presence != executability.
+    """
+    task = _harness_hint("/tmp/x_harness.py")
+
+    # A1 branch: the all-four commandment_from_user_command call, fenced to the
+    # no-prompt-shapes case, plus the skip-discovery fast path.
+    assert "commandment_from_user_command" in task
+    assert "['correctness', 'profile', 'benchmark', 'full_benchmark']" in task
+    assert "skip `run_discovery`" in task
+
+    # A2-override branch: prompt shapes divert to the generator with the harness
+    # passed as a structural template; the orchestrator must NOT itself read or
+    # compare shapes.
+    assert "template_harness_path: /tmp/x_harness.py" in task
+    assert "harness-generator" in task
+
+    # The override must not be exempted by the harness passing the four-mode
+    # contract: "pre-validated" must no longer appear as an unconditional A1 trigger.
+    assert "pre-validated" not in task.lower()
