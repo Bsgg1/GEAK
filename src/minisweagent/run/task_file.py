@@ -254,7 +254,25 @@ def _demote_submodule_gitlinks(worktree_path: Path, env: dict[str, str] | None =
             env=env,
         )
 
-    # Commit baseline so git diff only captures subsequent agent edits
+    _commit_worktree_baseline(worktree_path, env=env, reason="submodules demoted")
+
+
+def _commit_worktree_baseline(
+    worktree_path: Path, env: dict[str, str] | None = None, reason: str = "seed"
+) -> None:
+    """Stage everything present and commit a baseline so ``git diff HEAD`` shows
+    only subsequent agent edits.
+
+    A fresh worktree is seeded from the source repo's dirty + untracked files
+    (``_apply_dirty_tracked_changes`` / ``_copy_untracked_files``). Those
+    pre-existing files (e.g. an editable install's ``aiter/_version.py`` dirty
+    suffix, ``install_mode``, ``.pytest_cache/``) are not in HEAD, so without
+    this baseline ``git diff HEAD`` captures them as spurious hunks. ``git
+    apply`` is atomic, so a single non-matching junk hunk rejects the entire
+    patch -- silently discarding the real kernel edit. Committing them as the
+    baseline makes the captured patch contain the agent's edit and nothing
+    else, independent of any denylist of which files happen to be noisy.
+    """
     subprocess.run(
         ["git", "add", "-A"],
         cwd=worktree_path,
@@ -273,7 +291,7 @@ def _demote_submodule_gitlinks(worktree_path: Path, env: dict[str, str] | None =
             "commit",
             "--allow-empty",
             "-m",
-            "GEAK worktree baseline (submodules demoted)",
+            f"GEAK worktree baseline ({reason})",
         ],
         cwd=worktree_path,
         capture_output=True,
@@ -588,6 +606,11 @@ def create_worktree(repo_path: Path, worktree_path: Path) -> Path:
     # treats their content as regular files (clean diffs, no gitlink noise).
     _neutralize_nested_git_repos(worktree_path)
     _demote_submodule_gitlinks(worktree_path, git_env)
+    # Commit a baseline of the seeded worktree (dirty + untracked source files)
+    # so the captured ``git diff HEAD`` contains only the agent's edits. Without
+    # this, pre-existing noise (e.g. aiter/_version.py, install_mode) leaks into
+    # every patch and atomically breaks ``git apply``.
+    _commit_worktree_baseline(worktree_path, env=git_env, reason="seed")
     return worktree_path
 
 
@@ -677,6 +700,7 @@ def _create_worktree_clean(repo_path: Path, worktree_path: Path) -> Path:
     _symlink_gitignored_so_files(repo_path, worktree_path, git_env)
     _neutralize_nested_git_repos(worktree_path)
     _demote_submodule_gitlinks(worktree_path, git_env)
+    _commit_worktree_baseline(worktree_path, env=git_env, reason="clean seed")
     log.info("Clean-HEAD worktree created at %s (no dirty/untracked sync)", worktree_path)
     return worktree_path
 

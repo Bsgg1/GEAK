@@ -157,3 +157,55 @@ class TestCopyNestedGitReposSkipsOutputRoot:
         _copy_nested_git_repos(git_repo, worktree)
 
         assert (worktree / "third_party" / "lib" / "lib.py").exists()
+
+
+# ---------------------------------------------------------------------------
+# baseline commit -- captured patch must contain ONLY agent edits
+# ---------------------------------------------------------------------------
+
+
+class TestWorktreeBaselineCommit:
+    """Regression for the spurious-hunk apply failure (the 43/60 cohort).
+
+    A worktree seeded from the source repo's untracked files (e.g. an editable
+    install's dirty ``_version.py``, ``install_mode``) must commit those as a
+    baseline so ``git diff HEAD`` captures only the agent's subsequent edit.
+    Without the baseline the captured patch carries the seed files as spurious
+    hunks; ``git apply`` is atomic and rejects the whole patch -- discarding the
+    real kernel edit.
+    """
+
+    def test_captured_diff_excludes_seeded_untracked_files(self, git_repo: Path) -> None:
+        from minisweagent.run.task_file import create_worktree
+
+        # Seed the source repo with untracked noise (mirrors aiter editable
+        # install: _version.py / install_mode present on disk, not in HEAD).
+        (git_repo / "_version.py").write_text("__version__ = '0.1+dirty.d20260101'\n")
+        (git_repo / "install_mode").write_text("develop")
+
+        worktree = create_worktree(git_repo, git_repo.parent / "wt_slot_0")
+
+        # The untracked noise is seeded into the worktree but committed as
+        # baseline, so it must NOT appear in a HEAD diff.
+        assert (worktree / "_version.py").exists()
+
+        # Agent edits a tracked source file.
+        (worktree / "tracked.py").write_text("x = 2  # agent edit\n")
+
+        diff = subprocess.run(
+            ["git", "diff", "HEAD"],
+            cwd=worktree, check=True, capture_output=True, text=True,
+        ).stdout
+
+        assert "tracked.py" in diff
+        assert "_version.py" not in diff
+        assert "install_mode" not in diff
+
+        # And the captured patch applies cleanly back onto the source repo.
+        patch = git_repo.parent / "captured.patch"
+        patch.write_text(diff)
+        check = subprocess.run(
+            ["git", "apply", "--check", "--whitespace=nowarn", str(patch)],
+            cwd=git_repo, capture_output=True, text=True,
+        )
+        assert check.returncode == 0, check.stderr
