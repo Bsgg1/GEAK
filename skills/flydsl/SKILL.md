@@ -72,8 +72,15 @@ optimizations in early patches**, then fall back to tuning in later patches.
 - **Memory-bound** → reduce data movement (fusion, LDS caching, vectorization)
 - **Compute-bound** → improve instruction throughput (MFMA selection, software pipelining)
 - **Latency-bound** (small shapes) → reduce kernel launch count (fusion)
+- **LDS-dominated symptoms** (`ds_read`, `ds_write`, `lgkmcnt`, `s_barrier`, swizzle, padding, shared-memory layout) → stay in this optimization workflow; the detailed guidance lives in `docs/flydsl_optimization.md`
+- **GEMM-like kernel** → use this workflow for broad prioritization, then switch
+  to `docs/flydsl_gemm_optimization.md` when the main questions are about GEMM
+  tile shapes, MFMA-loop structure, epilogue strategy, or GEMM-specific LDS
+  staging trade-offs. For generic LDS symptoms, start with
+  `docs/flydsl_optimization.md` first, even if the kernel is GEMM-like.
 
 Full optimization workflow and detailed strategies: `docs/flydsl_optimization.md`
+GEMM-specific follow-on guide: `docs/flydsl_gemm_optimization.md`
 
 ---
 
@@ -119,4 +126,5 @@ The `docs/` subdirectory contains detailed guides:
 
 - `flydsl_tile_programming.md` — Kernel skeletons, compute recipes, control flow, LDS, MFMA reference
 - `flydsl_optimization.md` — Optimization workflow, tier-by-tier strategies, correctness constraints, key APIs
+- `flydsl_gemm_optimization.md` — GEMM-specific tuning for tile strategy, LDS staging, MFMA-loop efficiency, and epilogue/store trade-offs
 - `flydsl_debug_kernel.md` — NaN/zeros debugging, mismatch triage, compilation errors, GPU hangs
