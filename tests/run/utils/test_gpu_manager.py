@@ -132,10 +132,7 @@ class TestShutdown:
         fut_blocking = mgr.submit(GpuJob(fn=_block, label="blocker"))
         blocker_started.wait(timeout=5)
 
-        pending_futs = [
-            mgr.submit(GpuJob(fn=lambda g, e: "pending", label=f"p{i}"))
-            for i in range(3)
-        ]
+        pending_futs = [mgr.submit(GpuJob(fn=lambda g, e: "pending", label=f"p{i}")) for i in range(3)]
         blocker_release.set()
         assert fut_blocking.result(timeout=10) == "done"
         mgr.shutdown(cancel_pending=True)
@@ -194,6 +191,12 @@ class TestRegistryIntegration:
         registry.lock = threading.RLock()
         mgr = GPUManager([0], registry=registry, stats_log_interval_s=0)
         mgr.run(GpuJob(fn=lambda g, e: "ok", label="reg-test"))
+        # The dispatcher registers the worker future just after submitting it to
+        # the executor, so for a trivial job ``run()`` can return before
+        # registration lands. Poll instead of asserting instantly.
+        deadline = time.monotonic() + 5
+        while not registry.register_future.called and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert registry.register_future.called
         mgr.shutdown()
 
@@ -249,10 +252,7 @@ class TestDispatcherDrain:
         mgr.submit(GpuJob(fn=_block, label="blocker"))
         blocker_started.wait(timeout=5)
 
-        pending_futs = [
-            mgr.submit(GpuJob(fn=lambda g, e: "should-not-run", label=f"p{i}"))
-            for i in range(3)
-        ]
+        pending_futs = [mgr.submit(GpuJob(fn=lambda g, e: "should-not-run", label=f"p{i}")) for i in range(3)]
 
         blocker.set()
         mgr.shutdown(cancel_pending=True)
