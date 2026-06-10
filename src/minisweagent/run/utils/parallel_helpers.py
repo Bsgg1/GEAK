@@ -91,6 +91,7 @@ def _inflight_lacks_best_results(
             return True
     return False
 
+
 # ============================================================================
 # Thread-local stdout/stderr redirection
 # ============================================================================
