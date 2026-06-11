@@ -45,6 +45,48 @@ from minisweagent.run.utils.git_safe_env import get_git_safe_env
 
 logger = logging.getLogger(__name__)
 
+#: Single source of truth for "a build+correctness/benchmark subprocess may take
+#: this long" (seconds). Compiled kernels (HIP/CUDA CK codegen, sgl-kernel) build
+#: the whole extension from source on the FIRST invocation — routinely >600s on a
+#: cold cache. The preprocess path already honours ``GEAK_BENCH_TIMEOUT`` (see
+#: preprocess_v3/baseline.py); the postprocess preflight + per-round correctness
+#: gates historically hardcoded 600s and so aborted every slow-compiling kernel
+#: (~half of all fleet runs) before any optimization. Honour the SAME env var
+#: here so the timeout is one knob, not three divergent constants. 1800s default
+#: covers a cold CK codegen build; override with GEAK_BENCH_TIMEOUT.
+EVAL_BUILD_TIMEOUT_S = int(os.environ.get("GEAK_BENCH_TIMEOUT", "1800"))
+
+
+def _ensure_rocm_on_path(env: dict[str, str]) -> None:
+    """Guarantee the ROCm toolchain bin dir is on ``env['PATH']`` (in place).
+
+    Kernel profiling (metrix -> ``rocprofv3``) and HIP compiles (``hipcc``) live
+    in ``$ROCM_PATH/bin`` (default ``/opt/rocm/bin``). When GEAK is launched from
+    an env that did not export that dir, the profiler subprocess exits 127
+    (command not found) — the kernel runs *blind* (no roofline/bottleneck data,
+    "Bottleneck: unknown") and the planner guesses. Auto-detect the bin dir from
+    ``$ROCM_PATH``/``$HIP_PATH`` or the conventional ``/opt/rocm*`` install and
+    prepend it if missing. Generic: derives the path, hardcodes nothing.
+    """
+    import glob as _glob
+
+    candidates: list[str] = []
+    for var in ("ROCM_PATH", "HIP_PATH", "ROCM_HOME"):
+        root = env.get(var) or os.environ.get(var)
+        if root:
+            candidates.append(os.path.join(root, "bin"))
+    # Conventional install locations (prefer an unversioned symlink, then newest).
+    candidates.append("/opt/rocm/bin")
+    candidates.extend(sorted(_glob.glob("/opt/rocm-*/bin"), reverse=True))
+
+    cur = env.get("PATH", "")
+    parts = cur.split(os.pathsep) if cur else []
+    for binp in candidates:
+        if binp and os.path.isdir(binp) and binp not in parts:
+            parts.insert(0, binp)
+            env["PATH"] = os.pathsep.join(parts)
+            return
+
 
 class PatchApplyError(Exception):
     """Raised when a patch fails to apply to the evaluation worktree."""
@@ -339,6 +381,9 @@ def build_eval_env(
     if "expandable_segments" in alloc_conf:
         logger.debug("build_eval_env: removing PYTORCH_CUDA_ALLOC_CONF with expandable_segments.")
         env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    # Ensure rocprofv3 / hipcc resolve so profiling isn't silently skipped
+    # (exit 127 -> blind planning). No-op when ROCm bin is already on PATH.
+    _ensure_rocm_on_path(env)
     return env
 
 
@@ -397,7 +442,7 @@ def preflight_commandment_contract(
     gpu_ids: list[int] | int,
     *,
     output_dir: Path | None = None,
-    timeout_s: int = 600,
+    timeout_s: int = EVAL_BUILD_TIMEOUT_S,
 ) -> None:
     """Smoke-test SETUP + CORRECTNESS once before fanning out sub-agents.
 
@@ -660,7 +705,7 @@ def run_correctness_and_benchmark(
                 ["bash", correctness_script],
                 capture_output=True,
                 text=True,
-                timeout=600,
+                timeout=EVAL_BUILD_TIMEOUT_S,
                 cwd=str(eval_worktree),
                 env=eval_env,
             )
