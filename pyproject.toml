@@ -122,6 +122,8 @@ minisweagent = [
     "run/preprocess/config/**/*",
     "tools/*.json",
     "memory/cross_session/*.json",
+    "subagents/**/*",
+    "skills/**/*",
 ]
 
 [tool.ruff]

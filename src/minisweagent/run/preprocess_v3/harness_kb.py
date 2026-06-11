@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from minisweagent import get_data_dir
 from minisweagent.kernel_languages.base import KernelLanguage
 
 logger = logging.getLogger(__name__)
@@ -49,17 +50,13 @@ def _strip_frontmatter(content: str) -> str:
 
 
 def _default_skills_root() -> Path:
-    """Resolve ``<repo>/skills`` by walking up from this file.
+    """Resolve the ``skills`` data dir via the shared resolver.
 
-    Same shape as ``SubagentRegistry._default_root``: prefer a parent
-    that has both ``pyproject.toml`` and a ``skills/`` directory, fall
-    back to four-levels-up.
+    Delegates to :func:`get_data_dir` so the in-package location (plain
+    ``pip install``) is found first, with /workspace and source-checkout
+    fallbacks preserved.
     """
-    here = Path(__file__).resolve()
-    for candidate in here.parents:
-        if (candidate / "pyproject.toml").exists() and (candidate / "skills").is_dir():
-            return candidate / "skills"
-    return here.parents[4] / "skills"
+    return get_data_dir("skills")
 
 
 def load_harness_kb(

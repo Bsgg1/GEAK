@@ -40,6 +40,35 @@ def get_repo_root() -> Path:
     return package_dir.parent.parent
 
 
+def get_data_dir(name: str) -> Path:
+    """Resolve a bundled data dir ('subagents' or 'skills').
+
+    Order: GEAK_ROOT override -> in-package (wheel/editable) ->
+    /workspace (Docker) -> source-tree walk-up -> in-package guess.
+
+    The in-package location is the primary path and works for a plain
+    (non-editable) ``pip install``. The remaining branches keep older setups
+    (custom GEAK_ROOT tree, /workspace staging, source checkouts) working.
+
+    GEAK_SUBAGENTS_ROOT is intentionally NOT honored here: it historically
+    points at the ``subagents/preprocess`` subdir, while callers of this helper
+    want the ``subagents`` parent. The preprocess resolver handles that env var
+    itself (see run/preprocess_v3/registry.py).
+    """
+    if r := os.environ.get("GEAK_ROOT"):
+        if (p := Path(r) / name).is_dir():
+            return p
+    p = package_dir / name
+    if p.is_dir():
+        return p
+    if (p := Path("/workspace") / name).is_dir():
+        return p
+    for c in Path(__file__).resolve().parents:
+        if (c / "pyproject.toml").exists() and (c / name).is_dir():
+            return c / name
+    return package_dir / name
+
+
 global_config_dir = Path(os.getenv("MSWEA_GLOBAL_CONFIG_DIR") or user_config_dir("mini-swe-agent"))
 global_config_dir.mkdir(parents=True, exist_ok=True)
 global_config_file = Path(global_config_dir) / ".env"
@@ -93,6 +122,8 @@ __all__ = [
     "Agent",
     "Model",
     "Environment",
+    "get_repo_root",
+    "get_data_dir",
     "package_dir",
     "__version__",
     "global_config_file",

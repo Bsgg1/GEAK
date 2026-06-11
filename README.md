@@ -47,6 +47,13 @@ make install-dev          # install-full, editable (for developers)
 pip install -e .          # core package, including MCP runtime dependencies
 pip install -e '.[full]'  # core + dev + langchain + swe-rex
 
+# (or) plain, non-editable install — recommended for production / embedding
+# consumers (e.g. Hyperloom). The bundled subagents/ and skills/ data ships
+# inside the wheel, so no GEAK_ROOT, /workspace copy, or editable checkout is
+# required for runtime discovery to work.
+pip install .             # from a source checkout
+pip install <wheel>       # from a built wheel
+
 # (optional) RAG index build: if enable RAG, build index after make install
 make index
 
@@ -247,7 +254,7 @@ Automatically selects the best result across rounds:
 
 GEAK uses **skills** (domain knowledge bases) and **subagents** (delegated specialist agents) to handle different kernel types and optimization tasks.
 
-**Skills** (`skills/`):
+**Skills** (`src/minisweagent/skills/`):
 
 | Skill | When loaded |
 |-------|-------------|
@@ -257,7 +264,7 @@ GEAK uses **skills** (domain knowledge bases) and **subagents** (delegated speci
 | `pytorch2flydsl-translation` | Translating PyTorch GPU kernels to FlyDSL |
 | `fp8-gemm-tuning-sglang-aiter` | FP8 GEMM tuning for SGLang + AITer workloads |
 
-**Subagents** (`subagents/`):
+**Subagents** (`src/minisweagent/subagents/`):
 
 | Subagent | Purpose |
 |----------|---------|

@@ -54,6 +54,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from minisweagent import get_data_dir
 from minisweagent.kernel_languages.base import KernelLanguage
 from minisweagent.run.preprocess_v3.lang import detect_language, detect_language_for_repo
 from minisweagent.run.preprocess_v3.orchestrator import (
@@ -216,15 +217,10 @@ def run_preprocess_v3(
 
 
 def _find_codebase_explore_prompt() -> Path:
-    """Locate ``subagents/codebase-explore/SYSTEM_PROMPT.md``."""
-    here = Path(__file__).resolve().parent
-    for candidate in here.parents:
-        p = candidate / "subagents" / "codebase-explore" / "SYSTEM_PROMPT.md"
-        if p.is_file():
-            return p
-    workspace = Path("/workspace/subagents/codebase-explore/SYSTEM_PROMPT.md")
-    if workspace.is_file():
-        return workspace
+    """Locate ``subagents/codebase-explore/SYSTEM_PROMPT.md`` via the shared resolver."""
+    p = get_data_dir("subagents") / "codebase-explore" / "SYSTEM_PROMPT.md"
+    if p.is_file():
+        return p
     raise FileNotFoundError("Could not find subagents/codebase-explore/SYSTEM_PROMPT.md")
 
 

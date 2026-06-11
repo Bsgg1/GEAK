@@ -6,7 +6,7 @@ This directory holds **subagent definitions** that GEAK discovers at runtime. Ea
 
 1. Create a **new folder** under this directory:
 
-   `GEAK/subagents/<your-subagent-folder>/`
+   `GEAK/src/minisweagent/subagents/<your-subagent-folder>/`
 
 2. Add a file named **`SUBAGENT.yaml`** inside that folder (exact name, case-sensitive).
 
@@ -130,7 +130,7 @@ registry.register_from_dict({
 
 | Step | Action |
 |------|--------|
-| 1 | Create `GEAK/subagents/<folder>/` |
+| 1 | Create `GEAK/src/minisweagent/subagents/<folder>/` |
 | 2 | Add `SUBAGENT.yaml` with metadata + embedded config |
 | 3 | Ensure `name` is unique across all subagents |
 | 4 | For subprocess mode: create and test the entry script |
