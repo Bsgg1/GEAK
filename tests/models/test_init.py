@@ -31,10 +31,13 @@ class TestGetModelName:
             assert get_model_name(None, self.CONFIG_WITH_MODEL_NAME) == "config-model"
 
     def test_returns_default_when_no_model_configured(self):
-        """Test that a hardcoded default is returned when no model is configured anywhere."""
+        """Default must be PROVIDER-QUALIFIED. A bare 'claude-opus-4.8' reaches
+        litellm.completion verbatim and raises BadRequestError ('LLM Provider NOT
+        provided'), aborting the run; the default is 'openai/...' so every
+        sub-agent fallback is valid on the openai-compatible AMD gateway."""
         with patch.dict(os.environ, {}, clear=True):
-            assert get_model_name(None, {}) == "claude-opus-4.8"
-            assert get_model_name(None, None) == "claude-opus-4.8"
+            assert get_model_name(None, {}) == "openai/claude-opus-4.8"
+            assert get_model_name(None, None) == "openai/claude-opus-4.8"
 
 
 class TestGetModelClass:
