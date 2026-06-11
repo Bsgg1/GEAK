@@ -100,7 +100,7 @@ def _run_subprocess(descriptor, prompt: str | None, positional_args: list[str], 
     """Run a subprocess-mode subagent."""
     import subprocess
 
-    from minisweagent import get_repo_root
+    from minisweagent import get_repo_root, resolve_entry_script
 
     geak_root = get_repo_root()
 
@@ -108,9 +108,11 @@ def _run_subprocess(descriptor, prompt: str | None, positional_args: list[str], 
         console.print("[bold red]Error:[/bold red] No entry_script defined for this subagent.")
         raise typer.Exit(1)
 
-    entry = geak_root / descriptor.entry_script
-    if not entry.exists():
-        console.print(f"[bold red]Error:[/bold red] Entry script not found: {entry}")
+    # Resolve the entry script relative to the installed package first (works for
+    # a plain pip install), then fall back to GEAK_ROOT / source checkouts.
+    entry = resolve_entry_script(descriptor.entry_script)
+    if entry is None:
+        console.print(f"[bold red]Error:[/bold red] Entry script not found: {descriptor.entry_script}")
         raise typer.Exit(1)
 
     import os

@@ -124,6 +124,7 @@ minisweagent = [
     "memory/cross_session/*.json",
     "subagents/**/*",
     "skills/**/*",
+    "scripts/**/*",
 ]
 
 [tool.ruff]

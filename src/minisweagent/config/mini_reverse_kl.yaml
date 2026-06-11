@@ -293,7 +293,7 @@ model:
     text:
       verbosity: low
 
-# Invoked by scripts/run-reverse_knowledge.sh (workspace = REVERSE_KL_PATH / --repo).
+# Invoked by src/minisweagent/scripts/run-reverse_knowledge.sh (workspace = REVERSE_KL_PATH / --repo).
 geak_mini_entry: reverse_knowledge
 tools:
   profiling: false
