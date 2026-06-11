@@ -370,6 +370,38 @@ def strip_jit_cache_sections(patch_text: str) -> tuple[str, list[str]]:
     return _strip_diff_sections(patch_text, is_jit_cache_artifact)
 
 
+def _path_matches_exclude(path: str, patterns: list[str]) -> bool:
+    """True if *path* matches any exclude *pattern* by basename or path segment.
+
+    Mirrors the intent of ``git`` pathspec excludes (``:(exclude)__pycache__``,
+    ``:(exclude)*.so``, ``:(exclude).git``): a pattern matches when it globs the
+    full relative path, the basename, or any individual path segment. A bare dir
+    name like ``__pycache__`` therefore excludes anything beneath it.
+    """
+    pure = PurePosixPath(path)
+    segments = pure.parts
+    for pattern in patterns:
+        norm = pattern.rstrip("/")
+        if fnmatch(path, norm) or fnmatch(pure.name, norm):
+            return True
+        if any(fnmatch(seg, norm) for seg in segments):
+            return True
+    return False
+
+
+def strip_excluded_sections(patch_text: str, excludes: list[str]) -> tuple[str, list[str]]:
+    """Drop diff sections whose a/b path matches any *excludes* pattern.
+
+    Post-render replacement for ``git diff`` pathspec excludes, needed because
+    ``git diff --no-index`` rejects pathspecs entirely on git < ~2.45 (it errors
+    with a usage message and returns an empty patch). Filtering the rendered
+    patch instead keeps exclusion behaviour identical across git versions.
+    """
+    if not excludes:
+        return patch_text, []
+    return _strip_diff_sections(patch_text, lambda p: _path_matches_exclude(p, excludes))
+
+
 def jit_cache_diff_basename_excludes() -> list[str]:
     """Return JIT-cache exclude patterns for ``diff -ruN`` / ``git diff``.
 

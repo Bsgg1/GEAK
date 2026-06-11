@@ -30,6 +30,7 @@ from minisweagent.run.utils.generated_artifacts import (
     jit_cache_diff_basename_excludes,
     jit_cache_env,
     strip_already_present_additions,
+    strip_excluded_sections,
     strip_jit_cache_sections,
 )
 
@@ -961,7 +962,13 @@ class SaveAndTestTool:
             # prefixes from the ``a/`` ``b/`` headers. ``--no-index`` exits 1 when
             # there are differences (like plain diff), so the return code is
             # intentionally ignored and we read stdout directly.
-            exclude_args = [f":(exclude){entry}" for entry in excludes]
+            #
+            # NOTE: pathspecs (``-- :(exclude)...``) are deliberately NOT passed
+            # here. ``git diff --no-index`` rejects any pathspec on git < ~2.45
+            # (it errors with a usage message and returns an empty patch, which
+            # silently drops the agent's entire change set on those gits, e.g.
+            # 2.34 on Ubuntu 22.04 CI). Excludes are applied to the rendered
+            # patch via ``strip_excluded_sections`` instead, which is portable.
             result = subprocess.run(
                 [
                     "git",
@@ -970,15 +977,14 @@ class SaveAndTestTool:
                     "--no-color",
                     str(ctx.base_repo_path),
                     str(cwd),
-                    "--",
-                    *exclude_args,
                 ],
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
             normalized = _normalize_noindex_to_relative(result.stdout, ctx.base_repo_path, cwd)
-            return self._strip_jit_cache_from_patch(normalized)
+            filtered, _ = strip_excluded_sections(normalized, excludes)
+            return self._strip_jit_cache_from_patch(filtered)
 
         return ""
 

@@ -116,8 +116,7 @@ def test_diff_basename_excludes_cover_plan_patterns() -> None:
     assert "__pycache__" in patterns
     assert "flydsl_cache" in patterns
     # Compile-output extension globs (incl. the newly-added *.o / *.so).
-    for ext in ("*.hsaco", "*.amdgcn", "*.llir", "*.ttir", "*.ttgir",
-                "*.ptx", "*.cubin", "*.spv", "*.o", "*.so"):
+    for ext in ("*.hsaco", "*.amdgcn", "*.llir", "*.ttir", "*.ttgir", "*.ptx", "*.cubin", "*.spv", "*.o", "*.so"):
         assert ext in patterns, f"missing suffix glob {ext!r}"
 
 
@@ -161,3 +160,47 @@ def test_jit_cache_env_base_override(tmp_path: Path) -> None:
 @pytest.mark.parametrize("falsy", [None, "", 0])
 def test_jit_cache_env_empty_for_falsy_workdir(falsy) -> None:
     assert jit_cache_env(falsy) == {}
+
+
+# ---------------------------------------------------------------------------
+# strip_excluded_sections — post-render replacement for --no-index pathspecs
+# ---------------------------------------------------------------------------
+def _section(path: str, mode: str = "100644") -> str:
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        f"new file mode {mode}\n"
+        "index 0000000..1111111\n"
+        "--- /dev/null\n"
+        f"+++ b/{path}\n"
+        "@@ -0,0 +1 @@\n+x\n"
+    )
+
+
+def test_strip_excluded_sections_drops_basename_and_keeps_source() -> None:
+    from minisweagent.run.utils.generated_artifacts import strip_excluded_sections
+
+    patch = _section("kernel.py") + _section("__pycache__/m.pyc")
+    out, removed = strip_excluded_sections(patch, ["__pycache__"])
+    assert "kernel.py" in out
+    assert "__pycache__" not in out
+    assert removed == ["__pycache__/m.pyc"]
+
+
+def test_strip_excluded_sections_matches_glob_and_nested_segment() -> None:
+    from minisweagent.run.utils.generated_artifacts import strip_excluded_sections
+
+    patch = _section("kernel.py") + _section("a/b/libfoo.so") + _section("nested/.git/HEAD")
+    out, removed = strip_excluded_sections(patch, ["*.so", ".git"])
+    assert "kernel.py" in out
+    assert "libfoo.so" not in out
+    assert ".git" not in out
+    assert set(removed) == {"a/b/libfoo.so", "nested/.git/HEAD"}
+
+
+def test_strip_excluded_sections_empty_excludes_is_noop() -> None:
+    from minisweagent.run.utils.generated_artifacts import strip_excluded_sections
+
+    patch = _section("kernel.py")
+    out, removed = strip_excluded_sections(patch, [])
+    assert out == patch
+    assert removed == []
