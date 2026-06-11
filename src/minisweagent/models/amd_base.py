@@ -39,8 +39,8 @@ def get_amd_llm_user() -> str:
 def _normalize_ntid(val: str) -> str:
     """Return a gateway-valid NTID. The amd_hyperloom_geak_ application requires
     a full ``<ntid>@amd.com`` user header; a bare login name (e.g. ``root`` or a
-    domainless ``sapmajum``) is rejected with HTTP 400. Append ``@amd.com`` when
-    the value looks like a bare AMD ntid and carries no domain. ``unknown`` and
+    domainless ntid) is rejected with HTTP 400. Append ``@amd.com`` when the
+    value looks like a bare AMD ntid and carries no domain. ``unknown`` and
     already-qualified addresses pass through unchanged.
     """
     v = val.strip()
