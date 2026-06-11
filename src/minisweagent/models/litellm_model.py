@@ -45,6 +45,11 @@ CACHE_CONTROL_EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
 _AMD_LLM_GATEWAY_API_BASE_PREFIXES: tuple[str, ...] = (
     "https://llm-api.amd.com/",
     "https://llm-gateway-dev.apps.amdcloud.com/",
+    # core42 SaFE proxy also fronts the AMD gateway and enforces the mandatory
+    # `user` NTID header for the amd_hyperloom_geak_ application (400 without
+    # it). Include it so the header auto-attaches on every code path, not only
+    # when a config happens to set extra_headers.user.
+    "https://core42.primus-safe.amd.com/",
 )
 
 
