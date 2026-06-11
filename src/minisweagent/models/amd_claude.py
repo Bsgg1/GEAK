@@ -208,6 +208,8 @@ class AmdClaudeModel(AmdLlmModelBase):
 
     def _parse_response(self, response) -> dict:
         output_dict: dict = {"content": "", "tools": ""}
+        stop_reason = getattr(response, "stop_reason", None)
+        output_dict["stop_reason"] = stop_reason
         try:
             if response.content:
                 content_parts = []
@@ -228,6 +230,20 @@ class AmdClaudeModel(AmdLlmModelBase):
 
                 for block in response.content:
                     if block.type == "tool_use":
+                        # When the response is truncated mid-tool-call
+                        # (stop_reason == "max_tokens"), Anthropic returns a
+                        # tool_use block with an empty/partial input dict.
+                        # Forwarding it verbatim makes the caller invoke the
+                        # tool with missing required args, which crashes. Flag
+                        # it so callers can retry with a shorter command.
+                        if stop_reason == "max_tokens" and not block.input:
+                            output_dict["truncated_tool_call"] = True
+                            logger.warning(
+                                "Anthropic response truncated mid-tool-call "
+                                "(stop_reason=max_tokens, empty input for tool %r); "
+                                "increase max_tokens or shorten the tool call.",
+                                block.name,
+                            )
                         output_dict["tools"] = {
                             "id": block.id,
                             "function": {
