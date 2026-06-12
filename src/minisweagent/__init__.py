@@ -69,6 +69,34 @@ def get_data_dir(name: str) -> Path:
     return package_dir / name
 
 
+def resolve_entry_script(entry_script: str) -> Path | None:
+    """Resolve a subagent subprocess ``entry_script`` to an existing file.
+
+    ``entry_script`` is declared in SUBAGENT.yaml as a path that mirrors the
+    repo layout (e.g. ``scripts/run-reverse_knowledge.sh``). The scripts that
+    back subprocess subagents are bundled under ``src/minisweagent/`` so a plain
+    (non-editable) ``pip install`` ships them; the in-package location is tried
+    first. GEAK_ROOT, /workspace, and source-checkout roots are kept as
+    fallbacks so custom trees, Docker staging, and editable checkouts keep
+    working.
+
+    Returns the first existing path, or ``None`` if the script cannot be found.
+    """
+    rel = Path(entry_script)
+    candidates: list[Path] = [package_dir / rel]
+    if r := os.environ.get("GEAK_ROOT"):
+        candidates.append(Path(r) / rel)
+    candidates.append(Path("/workspace") / rel)
+    for c in Path(__file__).resolve().parents:
+        if (c / "pyproject.toml").exists():
+            candidates.append(c / rel)
+            break
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return None
+
+
 global_config_dir = Path(os.getenv("MSWEA_GLOBAL_CONFIG_DIR") or user_config_dir("mini-swe-agent"))
 global_config_dir.mkdir(parents=True, exist_ok=True)
 global_config_file = Path(global_config_dir) / ".env"
@@ -124,6 +152,7 @@ __all__ = [
     "Environment",
     "get_repo_root",
     "get_data_dir",
+    "resolve_entry_script",
     "package_dir",
     "__version__",
     "global_config_file",

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
+from minisweagent import package_dir, resolve_entry_script
 from minisweagent.subagents import SubAgentRegistry
 
 
@@ -21,6 +23,34 @@ def test_discovers_bundled_subagents() -> None:
     registry = SubAgentRegistry()
 
     assert EXPECTED_BUNDLED_SUBAGENTS.issubset(set(registry.list_names()))
+
+
+def test_reverse_knowledge_entry_script_resolves_bundled() -> None:
+    """The subprocess subagent's entry_script must resolve to a packaged file.
+
+    Regression guard: ``scripts/`` used to live outside the importable package,
+    so a non-editable ``pip install`` never shipped it and the subprocess-mode
+    reverse-knowledge subagent could not start. The script now ships under
+    ``src/minisweagent/`` and must resolve in-package and be executable.
+    """
+    registry = SubAgentRegistry()
+    descriptor = registry.get("reverse-knowledge")
+
+    assert descriptor is not None
+    assert descriptor.execution_mode == "subprocess"
+    assert descriptor.entry_script
+
+    resolved = resolve_entry_script(descriptor.entry_script)
+    assert resolved is not None, "entry_script did not resolve to any existing file"
+    assert resolved.is_file()
+    # The resolved script ships inside the importable package.
+    assert resolved.is_relative_to(package_dir)
+    # subagent_cli executes it directly, so it must carry the executable bit.
+    assert os.access(resolved, os.X_OK)
+
+
+def test_resolve_entry_script_missing_returns_none() -> None:
+    assert resolve_entry_script("scripts/does-not-exist-12345.sh") is None
 
 
 def test_loads_registered_system_prompt() -> None:

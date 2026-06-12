@@ -51,9 +51,9 @@ Use Markdown files with clear heading hierarchy (`#`, `##`, `###`). The indexer 
 **Reverse knowledge** is generated under `mcp_tools/rag-mcp/knowledge-base/amd-knowledge-base/layer-6-extended/optimize-guides/user-case/user/` (per-kernel folders and simplified Markdown). From the **GEAK repo root**, run:
 
 ```bash
-bash scripts/run-reverse_knowledge.sh <baseline_path> <optimized_path>   # two trees to compare
-bash scripts/run-reverse_knowledge.sh <path_to_git_repo>                   # one Git repo (commit history)
-bash scripts/run-reverse_knowledge.sh --help
+bash src/minisweagent/scripts/run-reverse_knowledge.sh <baseline_path> <optimized_path>   # two trees to compare
+bash src/minisweagent/scripts/run-reverse_knowledge.sh <path_to_git_repo>                   # one Git repo (commit history)
+bash src/minisweagent/scripts/run-reverse_knowledge.sh --help
 ```
 
 Behavior is defined in `src/minisweagent/config/mini_reverse_kl.yaml`. 

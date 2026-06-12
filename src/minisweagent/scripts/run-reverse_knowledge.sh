@@ -10,8 +10,8 @@ set -euo pipefail
 usage() {
   cat <<'USAGE' >&2
 Usage:
-  bash scripts/run-reverse_knowledge.sh <unoptimized_path> <optimized_path>
-  bash scripts/run-reverse_knowledge.sh <local_git_repository_path>
+  bash src/minisweagent/scripts/run-reverse_knowledge.sh <unoptimized_path> <optimized_path>
+  bash src/minisweagent/scripts/run-reverse_knowledge.sh <local_git_repository_path>
 
 Environment:
   REVERSE_KL_PATH   Exported for convenience; always set to the canonical AMD user-case path
@@ -37,7 +37,19 @@ _relpath() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GEAK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# This script ships inside the package at <root>/src/minisweagent/scripts/.
+# PKG_DIR is the importable package dir (<root>/src/minisweagent), used to locate
+# the bundled agent config regardless of whether GEAK is run from source or a
+# pip-installed wheel.
+PKG_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# GEAK_ROOT is the repository root that holds the mcp_tools/ knowledge workspace.
+# Honor an inherited GEAK_ROOT (the subagent CLI exports it); otherwise derive the
+# source-checkout root, which sits three levels up (scripts -> minisweagent -> src).
+if [[ -n "${GEAK_ROOT:-}" && -d "${GEAK_ROOT}" ]]; then
+  GEAK_ROOT="$(cd "${GEAK_ROOT}" && pwd)"
+else
+  GEAK_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+fi
 DEFAULT_REL_WS="mcp_tools/rag-mcp/knowledge-base/amd-knowledge-base/layer-6-extended/optimize-guides/user-case/user"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -53,7 +65,7 @@ fi
 WS_ABS="$(_realpath "${GEAK_ROOT}/${DEFAULT_REL_WS}")"
 export REVERSE_KL_PATH="${WS_ABS}"
 
-CONFIG_ABS="$(_realpath "${GEAK_ROOT}/src/minisweagent/config/mini_reverse_kl.yaml")"
+CONFIG_ABS="$(_realpath "${PKG_DIR}/config/mini_reverse_kl.yaml")"
 CONFIG_REL="$(_relpath "${WS_ABS}" "${CONFIG_ABS}")"
 
 if [[ ! -f "${CONFIG_ABS}" ]]; then
