@@ -13,20 +13,32 @@ import pytest
 from minisweagent.run.utils.gpu_manager import GpuJob, GpuLease, GPUManager, LeaseState
 
 
+@pytest.fixture(autouse=True)
+def _neutralize_cpu_pressure_gate():
+    """Pin reported load to zero so the dispatcher's CPU-pressure gate never
+    pauses during tests.
+
+    The gate sleeps the single dispatcher thread while per-core loadavg exceeds
+    the threshold. Under CI (pytest -n auto saturates every core) that pause can
+    outlast a test's result() timeout and cause spurious TimeoutErrors. Every
+    manager built in this module — fixtures and inline — inherits this. The
+    TestCPUPressureGate tests install their own os/getloadavg overrides, which
+    shadow this patch within their scope.
+    """
+    with patch("minisweagent.run.utils.gpu_manager.os.getloadavg", return_value=(0.0, 0.0, 0.0)):
+        yield
+
+
 @pytest.fixture
 def manager_2gpu():
-    mgr = GPUManager(
-        [0, 1], stats_log_interval_s=0, reaper_interval_s=0, cpu_pressure_threshold=float("inf")
-    )
+    mgr = GPUManager([0, 1], stats_log_interval_s=0, reaper_interval_s=0)
     yield mgr
     mgr.shutdown()
 
 
 @pytest.fixture
 def manager_4gpu():
-    mgr = GPUManager(
-        [0, 1, 2, 3], stats_log_interval_s=0, reaper_interval_s=0, cpu_pressure_threshold=float("inf")
-    )
+    mgr = GPUManager([0, 1, 2, 3], stats_log_interval_s=0, reaper_interval_s=0)
     yield mgr
     mgr.shutdown()
 
