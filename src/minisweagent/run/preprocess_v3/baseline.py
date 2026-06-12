@@ -218,6 +218,11 @@ def _build_env(
         env.setdefault("GEAK_REPO_ROOT", str(work_dir))
     env["HIP_VISIBLE_DEVICES"] = str(gpu_id)
     env["PYTHONUNBUFFERED"] = "1"
+    # Ensure rocprofv3 / hipcc resolve in the profile + benchmark subprocesses.
+    # Without ROCm bin on PATH the profiler exits 127 and the kernel is planned
+    # blind (no roofline). No-op when already present.
+    from minisweagent.run.postprocess.evaluation import _ensure_rocm_on_path
+    _ensure_rocm_on_path(env)
     if extra:
         env.update(extra)
     return env

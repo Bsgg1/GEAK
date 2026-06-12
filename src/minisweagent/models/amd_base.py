@@ -29,11 +29,26 @@ def get_amd_llm_user() -> str:
     for var in ("GEAK_USER", "USER"):
         val = os.getenv(var)
         if val:
-            return val
+            return _normalize_ntid(val)
     try:
-        return os.getlogin()
+        return _normalize_ntid(os.getlogin())
     except OSError:
         return "unknown"
+
+
+def _normalize_ntid(val: str) -> str:
+    """Return a gateway-valid NTID. The amd_hyperloom_geak_ application requires
+    a full ``<ntid>@amd.com`` user header; a bare login name (e.g. ``root`` or a
+    domainless ntid) is rejected with HTTP 400. Append ``@amd.com`` when the
+    value looks like a bare AMD ntid and carries no domain. ``unknown`` and
+    already-qualified addresses pass through unchanged.
+    """
+    v = val.strip()
+    if not v or v == "unknown" or "@" in v:
+        return v
+    if v == "root":  # container default login is not a valid NTID
+        return os.getenv("GEAK_USER", v)
+    return f"{v}@amd.com"
 
 
 @dataclass

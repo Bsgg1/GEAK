@@ -45,6 +45,11 @@ CACHE_CONTROL_EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
 _AMD_LLM_GATEWAY_API_BASE_PREFIXES: tuple[str, ...] = (
     "https://llm-api.amd.com/",
     "https://llm-gateway-dev.apps.amdcloud.com/",
+    # core42 SaFE proxy also fronts the AMD gateway and enforces the mandatory
+    # `user` NTID header for the amd_hyperloom_geak_ application (400 without
+    # it). Include it so the header auto-attaches on every code path, not only
+    # when a config happens to set extra_headers.user.
+    "https://core42.primus-safe.amd.com/",
 )
 
 
@@ -338,9 +343,28 @@ class LitellmModel:
         request_timeout = filtered.pop("timeout", None)
         if request_timeout is None:
             request_timeout = float(os.getenv("GEAK_LLM_REQUEST_TIMEOUT", "600"))
+        # litellm requires a provider-qualified model (e.g. "openai/<name>").
+        # A bare name (from a sub-agent that fell back to the unqualified default)
+        # raises BadRequestError "LLM Provider NOT provided", which tenacity
+        # retries then aborts the whole round. When we have an openai-compatible
+        # gateway base_url (AMD / core42) and the name carries no "provider/"
+        # prefix, qualify it with "openai/" so every path is valid. Generic:
+        # only fires on an unqualified name, never rewrites an explicit provider.
+        model_for_call = self.config.model_name
+        has_base = bool(
+            filtered.get("api_base")
+            or (self.config.model_kwargs or {}).get("api_base")
+            or (self.config.model_kwargs or {}).get("base_url")
+        )
+        if model_for_call and "/" not in model_for_call and has_base:
+            logger.warning(
+                "litellm: model %r has no provider prefix; qualifying as 'openai/%s' "
+                "for the gateway base_url.", model_for_call, model_for_call,
+            )
+            model_for_call = f"openai/{model_for_call}"
         try:
             return litellm.completion(
-                model=self.config.model_name,
+                model=model_for_call,
                 messages=messages,
                 timeout=request_timeout,
                 **filtered,

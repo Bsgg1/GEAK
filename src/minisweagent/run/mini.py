@@ -607,11 +607,20 @@ def main(
             logger.info("[bold cyan]Promoted test command to validated harness: %s[/bold cyan]", promoted)
 
     _target_language = "flydsl" if kernel_type in {"pytorch2flydsl", "flydsl"} else None
-    scoring_target_norm = (scoring_target or "wall").strip().lower()
+    # Scoring signal precedence: explicit --target > GEAK_SCORE_TARGET env > "wall".
+    # ``kernel`` scores GPU-only kernel time (torch.profiler CUDA events), which
+    # excludes host dispatch + DVFS jitter — the ±1% wall-time noise that drowns
+    # sub-2% kernel gains and lets the agent over-report a noisy favorable draw.
+    # Keep ``wall`` the default (E2E-correlated, what most callers expect); the
+    # env knob lets an operator switch the whole fleet to the low-noise signal
+    # without editing per-run CLI. Generic: no per-kernel special-casing.
+    scoring_target_norm = (
+        scoring_target or os.environ.get("GEAK_SCORE_TARGET") or "wall"
+    ).strip().lower()
     if scoring_target_norm not in {"wall", "kernel"}:
         logger.warning(
-            "Unknown --target=%s, falling back to 'wall'. Valid: wall|kernel.",
-            scoring_target,
+            "Unknown scoring target=%s, falling back to 'wall'. Valid: wall|kernel.",
+            scoring_target_norm,
         )
         scoring_target_norm = "wall"
     logger.info("Scoring target: %s (GEAK_RESULT_LATENCY_MS = %s_ms)", scoring_target_norm, scoring_target_norm)

@@ -76,7 +76,16 @@ def get_model_name(input_model_name: str | None = None, config: dict | None = No
         return from_env
     if from_env := os.getenv("MSWEA_MODEL_NAME"):
         return from_env
-    return "claude-opus-4.8"  # GEAK default
+    if from_env := os.getenv("GEAK_MODEL_NAME"):
+        return from_env
+    # GEAK default. MUST be provider-qualified: a sub-agent (e.g. unit-test /
+    # harness-gen) that builds a model without an explicit config model_name
+    # falls back here, and the litellm path forwards the name verbatim to
+    # litellm.completion — a bare "claude-opus-4.8" raises BadRequestError
+    # ("LLM Provider NOT provided"), aborting the whole run mid-round. The
+    # provider prefix (litellm convention) makes the default valid on every
+    # path; "openai/" routes through the openai-compatible AMD/core42 gateway.
+    return os.getenv("GEAK_DEFAULT_MODEL", "openai/claude-opus-4.8")
 
 
 _MODEL_CLASS_MAPPING = {

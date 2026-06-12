@@ -259,7 +259,7 @@ class TestLitellmModelUserHeader:
     wire."""
 
     def test_injects_resolved_user_when_no_headers(self, monkeypatch):
-        monkeypatch.setenv("GEAK_USER", "alice")
+        monkeypatch.setenv("GEAK_USER", "alice@amd.com")
         model = LitellmModel(
             model_name="anthropic/claude-opus-4.6",
             model_kwargs={"api_key": "k", "api_base": _AMD_GATEWAY_API_BASE},
@@ -275,12 +275,12 @@ class TestLitellmModelUserHeader:
         ):
             model.query([{"role": "user", "content": "hi"}])
         headers = comp.call_args.kwargs["extra_headers"]
-        assert headers["user"] == "alice"
+        assert headers["user"] == "alice@amd.com"
 
     def test_preserves_explicit_user_override(self, monkeypatch):
         """Caller-provided ``"user"`` wins for any provider (AMD gateway
         or not) — the override is what's intentional, not the default."""
-        monkeypatch.setenv("GEAK_USER", "alice")
+        monkeypatch.setenv("GEAK_USER", "alice@amd.com")
         model = LitellmModel(
             model_name="anthropic/claude-opus-4.6",
             model_kwargs={
@@ -304,7 +304,7 @@ class TestLitellmModelUserHeader:
         assert headers["Ocp-Apim-Subscription-Key"] == "k"
 
     def test_merges_with_other_extra_headers(self, monkeypatch):
-        monkeypatch.setenv("GEAK_USER", "alice")
+        monkeypatch.setenv("GEAK_USER", "alice@amd.com")
         model = LitellmModel(
             model_name="anthropic/claude-opus-4.6",
             model_kwargs={
@@ -324,14 +324,14 @@ class TestLitellmModelUserHeader:
         ):
             model.query([{"role": "user", "content": "hi"}])
         headers = comp.call_args.kwargs["extra_headers"]
-        assert headers["user"] == "alice"
+        assert headers["user"] == "alice@amd.com"
         assert headers["Ocp-Apim-Subscription-Key"] == "k"
 
     def test_does_not_inject_user_for_non_amd_gateway(self, monkeypatch):
         """Calling a non-AMD-gateway provider (e.g. openai.com direct)
         must not leak the local OS username as an HTTP header.
         Regression guard for PR #226 review note."""
-        monkeypatch.setenv("GEAK_USER", "alice")
+        monkeypatch.setenv("GEAK_USER", "alice@amd.com")
         model = LitellmModel(
             model_name="openai/gpt-4o",
             model_kwargs={"api_key": "k", "api_base": _NON_AMD_API_BASE},
@@ -356,7 +356,7 @@ class TestLitellmModelUserHeader:
     def test_non_amd_preserves_other_extra_headers(self, monkeypatch):
         """For non-AMD-gateway providers, other caller-supplied
         ``extra_headers`` must still pass through verbatim."""
-        monkeypatch.setenv("GEAK_USER", "alice")
+        monkeypatch.setenv("GEAK_USER", "alice@amd.com")
         model = LitellmModel(
             model_name="openai/gpt-4o",
             model_kwargs={
@@ -383,7 +383,7 @@ class TestLitellmModelUserHeader:
         """The dev gateway hostname (used by ``scripts/run-docker.sh``
         default ``AMD_LLM_BASE_URL``) is also recognised as AMD-gateway
         traffic and gets the ``user`` header attribution."""
-        monkeypatch.setenv("GEAK_USER", "alice")
+        monkeypatch.setenv("GEAK_USER", "alice@amd.com")
         model = LitellmModel(
             model_name="anthropic/claude-opus-4.6",
             model_kwargs={
@@ -402,4 +402,4 @@ class TestLitellmModelUserHeader:
         ):
             model.query([{"role": "user", "content": "hi"}])
         headers = comp.call_args.kwargs["extra_headers"]
-        assert headers["user"] == "alice"
+        assert headers["user"] == "alice@amd.com"
