@@ -22,6 +22,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from minisweagent.run.pipeline_types import (
+    FullBenchmarkResult,
+    PerTaskOutcome,
+    RoundEvaluation,
+)
 from minisweagent.run.postprocess.benchmark_parsing import (
     compute_shape_speedups,
     compute_speedup,
@@ -34,10 +39,53 @@ from minisweagent.run.postprocess.benchmark_parsing import (
 )
 from minisweagent.run.utils.generated_artifacts import (
     apply_patch_with_generated_helper_fallback,
+    jit_cache_env,
 )
 from minisweagent.run.utils.git_safe_env import get_git_safe_env
 
 logger = logging.getLogger(__name__)
+
+#: Single source of truth for "a build+correctness/benchmark subprocess may take
+#: this long" (seconds). Compiled kernels (HIP/CUDA CK codegen, sgl-kernel) build
+#: the whole extension from source on the FIRST invocation — routinely >600s on a
+#: cold cache. The preprocess path already honours ``GEAK_BENCH_TIMEOUT`` (see
+#: preprocess_v3/baseline.py); the postprocess preflight + per-round correctness
+#: gates historically hardcoded 600s and so aborted every slow-compiling kernel
+#: (~half of all fleet runs) before any optimization. Honour the SAME env var
+#: here so the timeout is one knob, not three divergent constants. 1800s default
+#: covers a cold CK codegen build; override with GEAK_BENCH_TIMEOUT.
+EVAL_BUILD_TIMEOUT_S = int(os.environ.get("GEAK_BENCH_TIMEOUT", "1800"))
+
+
+def _ensure_rocm_on_path(env: dict[str, str]) -> None:
+    """Guarantee the ROCm toolchain bin dir is on ``env['PATH']`` (in place).
+
+    Kernel profiling (metrix -> ``rocprofv3``) and HIP compiles (``hipcc``) live
+    in ``$ROCM_PATH/bin`` (default ``/opt/rocm/bin``). When GEAK is launched from
+    an env that did not export that dir, the profiler subprocess exits 127
+    (command not found) — the kernel runs *blind* (no roofline/bottleneck data,
+    "Bottleneck: unknown") and the planner guesses. Auto-detect the bin dir from
+    ``$ROCM_PATH``/``$HIP_PATH`` or the conventional ``/opt/rocm*`` install and
+    prepend it if missing. Generic: derives the path, hardcodes nothing.
+    """
+    import glob as _glob
+
+    candidates: list[str] = []
+    for var in ("ROCM_PATH", "HIP_PATH", "ROCM_HOME"):
+        root = env.get(var) or os.environ.get(var)
+        if root:
+            candidates.append(str(Path(root) / "bin"))
+    # Conventional install locations (prefer an unversioned symlink, then newest).
+    candidates.append("/opt/rocm/bin")
+    candidates.extend(sorted(_glob.glob("/opt/rocm-*/bin"), reverse=True))
+
+    cur = env.get("PATH", "")
+    parts = cur.split(os.pathsep) if cur else []
+    for binp in candidates:
+        if binp and Path(binp).is_dir() and binp not in parts:
+            parts.insert(0, binp)
+            env["PATH"] = os.pathsep.join(parts)
+            return
 
 
 class PatchApplyError(Exception):
@@ -84,11 +132,47 @@ _CONTRACT_BROKEN_PATTERNS: tuple[str, ...] = (
 )
 
 
+def _resolve_task_kind(task_files_dir: Path, label: str) -> str:
+    """Look up ``kind`` from the task file whose label matches *label*."""
+    if not task_files_dir.is_dir():
+        return "planned"
+    for tf in task_files_dir.iterdir():
+        if tf.suffix == ".md" and label in tf.stem:
+            from minisweagent.run.task_file import read_task_file
+
+            meta, _ = read_task_file(tf)
+            return meta.get("kind", "planned")
+    return "planned"
+
+
 def _stderr_indicates_broken_contract(stderr: str) -> str | None:
     """Return the first contract-broken signature found in *stderr*, or None."""
     if not stderr:
         return None
     for pattern in _CONTRACT_BROKEN_PATTERNS:
+        if pattern in stderr:
+            return pattern
+    return None
+
+
+# Stderr signatures of transient/environmental GPU failures that are unrelated
+# to the kernel or the COMMANDMENT contract — typically a momentary ROCm hiccup
+# under heavy worker oversubscription. These should NOT abort the whole task.
+_TRANSIENT_GPU_PATTERNS: tuple[str, ...] = (
+    "No HIP GPUs are available",
+    "No CUDA GPUs are available",
+    "HIP error",
+    "hipErrorNoDevice",
+    "CUDA error: out of memory",
+    "HSA_STATUS_ERROR",
+)
+
+
+def _stderr_indicates_transient_gpu_error(stderr: str) -> str | None:
+    """Return the first transient-GPU signature found in *stderr*, or None."""
+    if not stderr:
+        return None
+    for pattern in _TRANSIENT_GPU_PATTERNS:
         if pattern in stderr:
             return pattern
     return None
@@ -145,6 +229,11 @@ def setup_eval_worktree(repo_root: str, patch_file: str, output_dir: Path) -> Pa
         )
         logger.warning("Initialised temporary git repo in non-git eval worktree: %s", eval_dir)
 
+    # The COMMANDMENT references the sanitized harness via ``${GEAK_WORK_DIR}_logs/...``
+    # which at eval time resolves to ``<eval_dir>_logs``; mirror the original _logs
+    # dir there so those references resolve. Cleaned up by cleanup_eval_worktree.
+    mirror_sanitized_logs(output_dir, eval_dir)
+
     git_env = get_git_safe_env(output_dir)
     patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
     # errors="replace" is the Unicode error handling mode for str.decode()
@@ -183,8 +272,31 @@ def setup_eval_worktree(repo_root: str, patch_file: str, output_dir: Path) -> Pa
     return eval_dir
 
 
+def mirror_sanitized_logs(output_dir: Path, worktree_dir: Path) -> Path | None:
+    """Mirror the original ``_logs`` dir next to a temporary worktree.
+
+    The COMMANDMENT references the sanitized harness via
+    ``${GEAK_WORK_DIR}_logs/_geak_sanitized_test_kernel_harness.sh`` (the
+    original repo_root is rewritten to ``${GEAK_WORK_DIR}`` in
+    preprocess_v3/tools.py). At runtime ``GEAK_WORK_DIR`` is the worktree, so
+    those references resolve to a ``<worktree>_logs`` sibling. Per-agent
+    worktrees get that sibling automatically; the bare worktrees created for
+    preflight / round-eval do not — so copy ``output_dir`` (the original
+    ``<repo_root>_logs`` dir) to ``<worktree>_logs``.
+
+    Returns the mirrored path (for later cleanup), or ``None`` on failure.
+    """
+    logs_dir = Path(str(worktree_dir) + "_logs")
+    try:
+        shutil.copytree(output_dir, logs_dir, dirs_exist_ok=True)
+        return logs_dir
+    except (OSError, shutil.Error) as exc:
+        logger.warning("mirror_sanitized_logs: could not mirror %s -> %s: %s", output_dir, logs_dir, exc)
+        return None
+
+
 def cleanup_eval_worktree(repo_root: str, eval_dir: Path) -> None:
-    """Remove the temporary evaluation worktree."""
+    """Remove the temporary evaluation worktree (and its mirrored _logs)."""
     repo = Path(repo_root).resolve()
     is_git = (repo / ".git").exists() or (repo / ".git").is_file()
     if is_git:
@@ -198,6 +310,10 @@ def cleanup_eval_worktree(repo_root: str, eval_dir: Path) -> None:
         )
     if eval_dir.exists():
         shutil.rmtree(eval_dir, ignore_errors=True)
+    # Remove the mirrored ``<worktree>_logs`` sibling if present.
+    logs_sibling = Path(str(eval_dir) + "_logs")
+    if logs_sibling.exists():
+        shutil.rmtree(logs_sibling, ignore_errors=True)
 
 
 def build_eval_env(
@@ -256,10 +372,18 @@ def build_eval_env(
             pass
     pp_parts.append(env.get("PYTHONPATH", ""))
     env["PYTHONPATH"] = ":".join(p for p in pp_parts if p)
+    # Relocate Triton / JIT caches to a per-worktree dir OUTSIDE ``work_dir`` so
+    # the eval-side patch capture / re-apply A/B never sweeps compiled blobs into
+    # the diff and the patched kernel is always recompiled fresh (mirrors the
+    # reactor-side save_and_test._build_test_env relocation).
+    env.update(jit_cache_env(work_dir))
     alloc_conf = env.get("PYTORCH_CUDA_ALLOC_CONF", "")
     if "expandable_segments" in alloc_conf:
         logger.debug("build_eval_env: removing PYTORCH_CUDA_ALLOC_CONF with expandable_segments.")
         env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    # Ensure rocprofv3 / hipcc resolve so profiling isn't silently skipped
+    # (exit 127 -> blind planning). No-op when ROCm bin is already on PATH.
+    _ensure_rocm_on_path(env)
     return env
 
 
@@ -318,7 +442,7 @@ def preflight_commandment_contract(
     gpu_ids: list[int] | int,
     *,
     output_dir: Path | None = None,
-    timeout_s: int = 600,
+    timeout_s: int = EVAL_BUILD_TIMEOUT_S,
 ) -> None:
     """Smoke-test SETUP + CORRECTNESS once before fanning out sub-agents.
 
@@ -404,8 +528,12 @@ def preflight_commandment_contract(
         preflight_dir = (worktree_root / rel).resolve()
         cleanup_root = worktree_root
         cleanup_repo = str(toplevel)
+        # Mirror the original _logs dir so ``${GEAK_WORK_DIR}_logs/...`` references
+        # in the COMMANDMENT resolve inside the worktree (see mirror_sanitized_logs).
+        preflight_logs_dir = mirror_sanitized_logs(output_dir, preflight_dir)
     else:
         preflight_dir = repo_root_path
+        preflight_logs_dir = None
 
     try:
         env = build_eval_env(preflight_dir, str(repo_root_path), harness_path, gpu_ids)
@@ -455,6 +583,22 @@ def preflight_commandment_contract(
                 time.sleep(5)
 
         stderr_tail = _format_stderr_tail(last_result.stderr)
+
+        # A transient/environmental GPU error (e.g. a momentary "No HIP GPUs"
+        # under heavy worker oversubscription) is not a contract break. The
+        # preflight is only an upfront smoke test, so skip it rather than abort
+        # the whole task — the per-round eval will still catch real failures.
+        transient = _stderr_indicates_transient_gpu_error(last_result.stderr)
+        if transient is not None:
+            logger.warning(
+                "preflight_commandment_contract: skipped after %d attempts due to transient "
+                "GPU error %r (not a contract break); proceeding to optimization:\n%s",
+                max_attempts,
+                transient,
+                stderr_tail,
+            )
+            return
+
         broken = _stderr_indicates_broken_contract(last_result.stderr)
         detail = (
             f"contract-broken signature {broken!r}; stderr tail:\n{stderr_tail}"
@@ -471,6 +615,8 @@ def preflight_commandment_contract(
     finally:
         if cleanup_root is not None and cleanup_repo is not None:
             cleanup_eval_worktree(cleanup_repo, cleanup_root)
+            if preflight_logs_dir is not None:
+                shutil.rmtree(preflight_logs_dir, ignore_errors=True)
 
 
 def recapture_commandment_baseline(
@@ -559,7 +705,7 @@ def run_correctness_and_benchmark(
                 ["bash", correctness_script],
                 capture_output=True,
                 text=True,
-                timeout=600,
+                timeout=EVAL_BUILD_TIMEOUT_S,
                 cwd=str(eval_worktree),
                 env=eval_env,
             )
@@ -946,8 +1092,6 @@ def write_eval_results(
         fb_output_path = output_dir / f"round_{round_num}_full_benchmark.txt"
         fb_output_path.write_text(fb_raw["stdout"])
 
-    from minisweagent.run.pipeline_types import FullBenchmarkResult, RoundEvaluation
-
     fb_typed = None
     if isinstance(fb_raw, dict):
         failure = None
@@ -958,10 +1102,6 @@ def write_eval_results(
         elif not fb_raw.get("success", True) and fb_raw.get("returncode", 0) != 0:
             failure = f"benchmark failed (exit code {fb_raw.get('returncode')})"
         elif fb_raw.get("failure_reason"):
-            # Set by ``_compute_verified_speedup`` when latency parsing failed
-            # despite a clean exit; without this propagation a return-code-0
-            # benchmark with unparseable output looked like "everything passed
-            # but no verified speedup" with no diagnostic.
             failure = str(fb_raw["failure_reason"])
         fb_typed = FullBenchmarkResult(
             verified_speedup=fb_raw.get("verified_speedup"),
@@ -970,12 +1110,16 @@ def write_eval_results(
             failure_reason=failure,
         )
 
+    pt_raw = round_eval.get("per_task", [])
+    per_task = [PerTaskOutcome.from_dict(o) for o in pt_raw] if pt_raw else []
+
     return RoundEvaluation(
         round=round_num,
         best_patch=round_eval.get("best_patch", ""),
         best_task=round_eval.get("best_task", ""),
         benchmark_speedup=round_eval.get("benchmark_speedup", 1.0),
         full_benchmark=fb_typed,
+        per_task=per_task,
     )
 
 
@@ -1000,27 +1144,48 @@ def evaluate_round_best(
         return None
 
     # --- Collect candidates ---
+    task_files_dir = output_dir / "tasks" / f"round_{round_num}"
     candidates: list[dict[str, Any]] = []
+    # Dispatched candidates that failed / produced no improvement. Recorded so
+    # the dispatcher's adaptive-K success-rate penalty sees per-source totals
+    # (not just the survivors). Their speedups are dropped by the plausibility
+    # clamp downstream; only the per-kind counts matter.
+    failed_outcomes: list[dict[str, Any]] = []
+
+    def _record_failed(label: str, spd: float = 0.0) -> None:
+        failed_outcomes.append(
+            {
+                "label": label,
+                "kind": _resolve_task_kind(task_files_dir, label),
+                "speedup": spd,
+                "status": "failed",
+            }
+        )
+
     for task_dir in sorted(results_dir.iterdir()):
         if not task_dir.is_dir() or task_dir.name == "worktrees":
             continue
         br_file = task_dir / "best_results.json"
         if not br_file.exists():
             logger.warning("No best_results.json in %s", task_dir.name)
+            _record_failed(task_dir.name)
             continue
         try:
             br = json.loads(br_file.read_text())
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
             logger.warning("Failed to parse %s: %s", br_file, exc)
+            _record_failed(task_dir.name)
             continue
 
         speedup = float(br.get("best_patch_speedup", 0))
         patch_file = br.get("best_patch_file")
         if not patch_file:
             logger.warning("No patch file in %s", br_file)
+            _record_failed(task_dir.name, speedup)
             continue
         if speedup <= 0:
             logger.info("No improvement (speedup=%.4f) in %s", speedup, task_dir.name)
+            _record_failed(task_dir.name, speedup)
             continue
 
         kernel_time: float | None = None
@@ -1041,6 +1206,7 @@ def evaluate_round_best(
                 "patch_file": patch_file,
                 "speedup": speedup,
                 "kernel_time_ms": kernel_time,
+                "kind": _resolve_task_kind(task_files_dir, task_dir.name),
                 "per_shape_speedups": br.get("per_shape_speedups") or {},
                 "baseline_shape_latency_ms": br.get("baseline_shape_latency_ms") or {},
                 "candidate_shape_latency_ms": br.get("candidate_shape_latency_ms") or {},
@@ -1125,6 +1291,11 @@ def evaluate_round_best(
     if best.get("candidate_shape_latency_ms"):
         round_eval["candidate_shape_latency_ms"] = best["candidate_shape_latency_ms"]
 
+    round_eval["per_task"] = [
+        {"label": c["task"], "kind": c.get("kind", "planned"), "speedup": c["speedup"], "status": "ok"}
+        for c in candidates
+    ] + failed_outcomes
+
     # --- GEAK_AGENT_SELECT_PATCH: trust agent-reported speedup, skip eval ---
     if os.environ.get("GEAK_AGENT_SELECT_PATCH", "").strip() == "1":
         logger.info(
@@ -1142,10 +1313,12 @@ def evaluate_round_best(
         logger.warning("COMMANDMENT.md not found at %s; skipping FULL_BENCHMARK and PROFILE", commandment_path)
         eval_path = output_dir / f"round_{round_num}_evaluation.json"
         eval_path.write_text(json.dumps(round_eval, indent=2, default=str))
-        from minisweagent.run.pipeline_types import RoundEvaluation
-
         return RoundEvaluation(
-            round=round_num, best_patch=best_patch_file or "", best_task=best_task, benchmark_speedup=best_speedup
+            round=round_num,
+            best_patch=best_patch_file or "",
+            best_task=best_task,
+            benchmark_speedup=best_speedup,
+            per_task=[PerTaskOutcome.from_dict(o) for o in round_eval.get("per_task", [])],
         )
 
     repo_root = ctx.get("repo_root")
@@ -1174,14 +1347,13 @@ def evaluate_round_best(
         round_eval["status"] = "patch_failed"
         eval_path = output_dir / f"round_{round_num}_evaluation.json"
         eval_path.write_text(json.dumps(round_eval, indent=2, default=str))
-        from minisweagent.run.pipeline_types import FullBenchmarkResult, RoundEvaluation
-
         return RoundEvaluation(
             round=round_num,
             best_patch=best_patch_file or "",
             best_task=best_task,
             benchmark_speedup=best_speedup,
             full_benchmark=FullBenchmarkResult(failure_reason=f"patch apply failed: {exc}"),
+            per_task=[PerTaskOutcome.from_dict(o) for o in round_eval.get("per_task", [])],
         )
 
     try:

@@ -117,13 +117,24 @@ Before any other action, read the task prompt and classify it into exactly ONE o
 **Case A — user provided explicit run instructions / commands.**
 Indicators: a literal command-line invocation (``python <script>``, ``pytest ... -k ...``, ``make ...``, shell script, existing custom harness command). The command is opaque: it may NOT support GEAK's four harness flags.
 
-Action: **skip ``run_discovery``** — the user already told you what to run, so test discovery is unnecessary and wastes time. Go directly to ``commandment_from_user_command`` with the extracted user command. Do not generate a harness.
+**Pre-validated-harness exemption (check this BEFORE the shapes pre-check).** If the "Hints from the call site" section marks the harness **pre-validated** for the four standard modes, the shapes pre-check below does NOT apply: a pre-validated harness already encodes its authoritative shapes internally (the caller validated it end-to-end), so there are no "unpinned prompt shapes" to fix and there is nothing to regenerate. Route it straight to **A1** and call ``commandment_from_user_command`` with the harness invocation. Regenerating a pre-validated harness via ``harness-generator`` is always wrong: it discards a working harness and the generator loop can burn the entire preprocess budget without ever producing a baseline.
+
+**Shapes pre-check (decide this FIRST, before A1 vs A2 — but AFTER the pre-validated-harness exemption above).** If the task prompt carries shapes (a ``Shapes:`` line, explicit dims, or a dtype/quant tuple) **and** the user's command does not already pin those exact shapes (e.g. it has no matching ``-m/-n``/dim arguments) **and the harness is NOT marked pre-validated**, route to **A2-with-shapes** — *regardless of whether the command contains a GEAK mode flag*. A flag-aware command whose shapes are not pinned would otherwise be classified A1 and run the harness's full default sweep, ignoring the prompt shapes, until it times out. When you are **unsure** whether the command already pins the prompt's exact shapes, choose A2-with-shapes: needlessly sending a shape-pinning command to the generator only costs time / a possible regeneration (a perf cost), whereas wrongly keeping it in A1 silently drops the shapes and hits the default-sweep timeout (a correctness bug). Decide the shapes question BEFORE deciding the command is directly runnable.
+
+Split the remaining Case A (no unpinned prompt shapes) on whether the command already speaks GEAK's harness contract:
+
+- **A1 — flag-aware command.** The command text literally contains one of ``--correctness`` / ``--benchmark`` / ``--full-benchmark`` / ``--profile`` (or the "Hints from the call site" section marks the harness as passing the four-mode contract), **and** the shapes pre-check above did not divert it to A2. A harness passing the four-mode contract is necessary but **not sufficient** for A1: if the task prompt carries shapes the harness does not already pin, the shapes pre-check still diverts to A2-with-shapes (a four-mode-passing harness does not exempt it from the override). Follow the A1 action below.
+- **A2 — flag-less or composite command.** Otherwise (a plain ``python test.py`` / ``make ...`` with no GEAK flag, a request to cover several op/shape/quant facets of one kernel, or any command diverted by the shapes pre-check). Follow the A2 action below.
+
+You do not have to classify A1 vs A2 perfectly: ``commandment_from_user_command`` has a deterministic backstop that refuses a flag-less command and returns ``ok: False`` with ``PATH_A_FLAG_MISSING`` — see the recovery rule under A2.
+
+**A1 action — flag-aware command.** **skip ``run_discovery``** — the user already told you what to run, so test discovery is unnecessary and wastes time. Go directly to ``commandment_from_user_command`` with the extracted user command. Do not generate a harness. (Reminder: this applies only when the shapes pre-check did **not** divert the command — a flag-aware command whose prompt carries shapes the command does not already pin is the A2-with-shapes path, not A1.)
 
 **STRICT keyword-argument names for ``commandment_from_user_command``** (do NOT use synonyms — the tool will TypeError):
 
 ```
 commandment_from_user_command(
-    run_command="<user's verbatim shell command>",      # NOT command/cmd/user_command/raw_command/harness_command
+    run_command="<user's verbatim shell command, which already contains a GEAK mode flag>",  # NOT command/cmd/user_command/raw_command/harness_command
     out_path="<output_dir>/COMMANDMENT.md",             # NOT output/output_path/path/commandment_path
     modes_covered=["correctness","profile","benchmark","full_benchmark"],
     inferred_modes=[],
@@ -131,9 +142,16 @@ commandment_from_user_command(
 )
 ```
 
-**Important exception**: if the "Hints from the call site" section says the harness is **pre-validated** and supports the four standard modes (``--correctness``, ``--benchmark``, ``--full-benchmark``, ``--profile``), you MUST list all four modes in ``modes_covered`` when calling ``commandment_from_user_command``. The tool will substitute the correct flag for each COMMANDMENT section automatically. Do NOT put all modes in ``inferred_modes`` — use ``modes_covered``.
+Listing all four in ``modes_covered`` is correct **only for A1** (the command/harness already supports the four flags, so the tool substitutes the right flag per section). Do NOT use this all-four call for a flag-less command — that is the A2 path.
 
-**After ``commandment_from_user_command`` succeeds**, you **MUST** call ``collect_baseline`` before calling ``finish_preprocess``. Baseline is **required** for downstream verified-speedup evaluation:
+**A2 action — flag-less or composite command.** Do **NOT** call ``commandment_from_user_command`` with a flag-less command. Instead route on whether the **task prompt carries shapes** (a ``Shapes:`` line, explicit dims, or a dtype/quant tuple):
+
+- **A2-with-shapes:** **skip ``run_discovery``** (the prompt already gives the authoritative shapes) and dispatch ``harness-generator`` (then ``harness-verifier``, then ``render_commandment``) with the **prompt shapes ONLY**, mapped to the harness's CLI params (e.g. for the rmsnorm harness, weight ``(n,)`` → ``-n``, activation ``(m,n)`` → ``-m``, dtype → ``-d``, op → ``--mode``). The generated harness must use ONLY the prompt-provided shapes (same authoritative-override contract as Case B). A composite task (several facets of one source kernel) produces **one** harness that internally iterates all facets and emits **one** aggregate metric. **If a user-supplied harness exists** (the "Hints from the call site" section names one), also pass its path in the ``dispatch_subagent`` context as ``template_harness_path`` so the generator uses it as a structural template — the generator reads it and decides whether to reproduce it (shapes already match) or regenerate with the prompt shapes (shapes differ). Do **NOT** read the harness or compare shapes yourself — you have no file-read tool; that comparison is the generator's job. This bullet covers every shape-bearing command the pre-check diverts here, including: (a) a **single-flag** command whose prompt carries shapes it does not pin, and (b) a **build-bearing ``&&``** command whose prompt carries shapes. In all cases do **NOT** inject the shapes into the user's command yourself — the generator owns shape handling (there is no single way to add shapes; some harnesses take ``-m/-n`` flags, others need the shapes edited inside the file). A build-bearing ``&&`` command with **no** prompt shapes is not diverted and keeps the deterministic compile + correctness + performance route via ``commandment_from_user_command``.
+- **A2-no-shapes:** the command is flag-less AND the prompt names no shapes/dims. Do **NOT** dispatch ``harness-generator`` blind — with neither flags nor shapes it would fall back to the harness's full default sweep (the timeout that motivated this rule). Instead fall through to ``run_discovery`` and proceed exactly as **Case C** (discovery's ATD is authoritative for source/shapes). Record the user's flag-less command in ``notes`` for audit; it is not executed as the eval contract.
+
+**A2 recovery (do not omit):** if you do call ``commandment_from_user_command`` and it returns ``ok: False`` / ``PATH_A_FLAG_MISSING``, the command was either flag-less or a non-build ``&&`` amalgamation. **Switch to the A2 action** (route on shapes as above). Do NOT retry ``commandment_from_user_command`` with the same command — it will return ``ok: False`` again.
+
+**After ``commandment_from_user_command`` succeeds (A1)**, you **MUST** call ``collect_baseline`` before calling ``finish_preprocess``. Baseline is **required** for downstream verified-speedup evaluation:
 
 - If the return value includes a ``harness_path``, call ``collect_baseline(harness_path=<path>)`` and ``collect_profile(harness_path=<path>)``.
 - If ``harness_path`` is null/absent, call ``collect_baseline(eval_command="<eval_command from the return value>")`` — use the ``eval_command`` field from ``commandment_from_user_command``'s return value (NOT the original ``run_command`` you passed in, because the tool sanitizes the command to add GEAK metric markers). This runs the eval command directly and parses ``GEAK_METRIC`` / ``GEAK_RESULT_LATENCY_MS`` markers from stdout.
@@ -170,9 +188,11 @@ If ``source_language != target_language`` and ``target_language == "flydsl"``, c
 
 ## Step 3 — harness generation + verification (LLM subagents)
 
-**Step 3a.** Dispatch ``harness-generator`` via ``dispatch_subagent`` only for Case B or Case C.
+**Step 3a.** Dispatch ``harness-generator`` via ``dispatch_subagent`` for Case B, Case C, or the **A2-with-shapes** subcase of Case A.
 
 For Case B (user shape/config override): pass ``kernel_path``, ``repo_root``, and the exact user-provided shapes/configs. Do NOT pass ``discovery_context_path``.
+
+For A2-with-shapes (Case A, prompt carries shapes): pass ``kernel_path``, ``repo_root``, and the prompt shapes. If a user-supplied harness exists, also pass ``template_harness_path`` (see the A2-with-shapes action above). Do NOT pass ``discovery_context_path``.
 
 For Case C (normal Path B): pass ``kernel_path``, ``repo_root``, ``codebase_context_path``, and ``discovery_context_path`` from Step 1. The dispatcher inlines those files for the subagent, and the discovery context is authoritative.
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-from minisweagent import get_repo_root
+from minisweagent import get_data_dir
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ class SkillDescriptor:
 
 class SkillRuntime:
     def __init__(self):
-        skills_dir = get_repo_root() / "skills"
+        skills_dir = get_data_dir("skills")
         self.skills = self._discover_skills(skills_dir)
 
     def _extract_yaml_frontmatter(self, markdown: str) -> dict:

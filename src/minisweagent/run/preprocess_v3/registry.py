@@ -39,6 +39,7 @@ from typing import Any
 
 import yaml
 
+from minisweagent import get_data_dir
 from minisweagent.config import load_config
 
 logger = logging.getLogger(__name__)
@@ -83,28 +84,17 @@ UNLIMITED_MAX_STEPS: int = -1
 
 
 def _default_root() -> Path:
-    """Resolve the default discovery root to ``<repo>/subagents/preprocess``.
+    """Resolve the default discovery root to ``subagents/preprocess``.
 
-    Search order:
-    1. ``GEAK_SUBAGENTS_ROOT`` env var (explicit override for containers).
-    2. Walk up from this file looking for ``pyproject.toml`` + ``subagents/``
-       (works when running from a source checkout).
-    3. ``/workspace/subagents/preprocess`` (Docker convention).
-    4. Four-levels-up fallback (matches the on-disk layout when this file
-       is at ``src/minisweagent/run/preprocess_v3/registry.py``).
+    ``GEAK_SUBAGENTS_ROOT`` keeps its historical semantics: it points directly
+    at the ``subagents/preprocess`` subdir and is returned verbatim. When unset,
+    delegate to the shared :func:`get_data_dir` resolver (in-package first, then
+    /workspace and source-checkout fallbacks) and append ``preprocess``.
     """
     env_root = os.environ.get("GEAK_SUBAGENTS_ROOT")
     if env_root:
         return Path(env_root)
-    here = Path(__file__).resolve()
-    for candidate in here.parents:
-        if (candidate / "pyproject.toml").exists() and (candidate / "subagents").is_dir():
-            return candidate / "subagents" / "preprocess"
-    # Docker container: subagents/ copied to /workspace/
-    workspace = Path("/workspace/subagents/preprocess")
-    if workspace.is_dir():
-        return workspace
-    return here.parents[4] / "subagents" / "preprocess"
+    return get_data_dir("subagents") / "preprocess"
 
 
 class SubagentSpecError(ValueError):

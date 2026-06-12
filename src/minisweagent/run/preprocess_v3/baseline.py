@@ -86,6 +86,11 @@ _CORRECTNESS_GATE_TIMEOUT_S = int(
     )
 )
 
+#: Short timeout for the correctness gate that runs before baseline collection.
+#: Goal: fail in ~5 s on a broken kernel rather than spending ~5 min running
+#: the full benchmark loop. Override via ``GEAK_CORRECTNESS_GATE_TIMEOUT``.
+_CORRECTNESS_GATE_TIMEOUT_S = int(os.environ.get("GEAK_CORRECTNESS_GATE_TIMEOUT", "120"))
+
 
 @dataclass(frozen=True)
 class BaselineMetrics:
@@ -202,8 +207,23 @@ def _build_env(
     if work_dir is not None:
         existing = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = f"{work_dir}:{existing}" if existing else str(work_dir)
+        # Worktree-awareness contract (mirrors run_harness._build_env): a
+        # contract-compliant harness resolves every repo path from GEAK_WORK_DIR
+        # (e.g. ``os.environ.get("GEAK_WORK_DIR", "<fallback>")``). Without this
+        # the harness falls back to its own directory and cannot find the kernel
+        # source, so it runs nothing and emits no GEAK_RESULT_LATENCY_MS marker
+        # (silent "produced no latency"). GEAK_REPO_ROOT uses setdefault so an
+        # already-exported source root (set by the adapter) is preserved.
+        env["GEAK_WORK_DIR"] = str(work_dir)
+        env.setdefault("GEAK_REPO_ROOT", str(work_dir))
     env["HIP_VISIBLE_DEVICES"] = str(gpu_id)
     env["PYTHONUNBUFFERED"] = "1"
+    # Ensure rocprofv3 / hipcc resolve in the profile + benchmark subprocesses.
+    # Without ROCm bin on PATH the profiler exits 127 and the kernel is planned
+    # blind (no roofline). No-op when already present.
+    from minisweagent.run.postprocess.evaluation import _ensure_rocm_on_path
+
+    _ensure_rocm_on_path(env)
     if extra:
         env.update(extra)
     return env
@@ -214,8 +234,19 @@ def _benchmark_command(harness_path: Path, flag: str = "--benchmark") -> list[st
 
     Wraps with ``bash -lc`` so login-shell profile fragments are
     sourced — matches ``run/preprocess/run_harness._run_single``.
+
+    Picks the interpreter from the harness type: a ``.sh`` wrapper (e.g. the
+    Path-A sanitized ``_geak_sanitized_*.sh``, which exports PYTHONPATH then
+    ``exec python``) must be run by ``bash``, NOT ``python`` — invoking a shell
+    script with ``python`` makes it fail instantly (rc=1, ~0.02s) and trips the
+    correctness gate. Default to ``sys.executable`` for ``.py`` harnesses.
     """
-    inner = " ".join(shlex.quote(c) for c in [sys.executable, str(harness_path), flag])
+    suffix = harness_path.suffix.lower()
+    if suffix == ".sh":
+        interp: list[str] = ["bash"]
+    else:
+        interp = [sys.executable]
+    inner = " ".join(shlex.quote(c) for c in [*interp, str(harness_path), flag])
     return ["bash", "-lc", inner]
 
 

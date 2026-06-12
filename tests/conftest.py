@@ -21,6 +21,18 @@ def _no_git_prompt(monkeypatch):
     monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
 
 
+@pytest.fixture(autouse=True)
+def _unset_data_dir_env(monkeypatch):
+    """Ensure bundled-data discovery resolves in-package during tests.
+
+    A leaked GEAK_ROOT / GEAK_SUBAGENTS_ROOT (common in container
+    envs) would steer get_data_dir() away from the package and make the
+    subagent/skill discovery tests fail spuriously.
+    """
+    for var in ("GEAK_ROOT", "GEAK_SUBAGENTS_ROOT", "GEAK_USE_SKILLS"):
+        monkeypatch.delenv(var, raising=False)
+
+
 _global_stats_lock = threading.Lock()
 
 

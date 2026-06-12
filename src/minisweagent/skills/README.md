@@ -6,7 +6,7 @@ This directory holds **optional skills** that GEAK discovers at runtime. Each sk
 
 1. Create a **new folder** under this directory:
 
-   `GEAK/skills/<your-skill-folder>/`
+   `GEAK/src/minisweagent/skills/<your-skill-folder>/`
 
 2. Add a file named **`SKILL.md`** inside that folder (exact name, case-sensitive).
 
@@ -61,7 +61,7 @@ In **`SKILL.md`**, point to those files with **paths relative to `SKILL.md`** (f
 
 | Step | Action |
 |------|--------|
-| 1 | Create `GEAK/skills/<folder>/` |
+| 1 | Create `GEAK/src/minisweagent/skills/<folder>/` |
 | 2 | Add `SKILL.md` with `---` YAML block containing `name` and `description` |
 | 3 | Ensure `name` is unique across all skills in `skills/` |
 | 4 | Write the body with task-specific guidance and examples |

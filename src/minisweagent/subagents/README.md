@@ -6,7 +6,7 @@ This directory holds **subagent definitions** that GEAK discovers at runtime. Ea
 
 1. Create a **new folder** under this directory:
 
-   `GEAK/subagents/<your-subagent-folder>/`
+   `GEAK/src/minisweagent/subagents/<your-subagent-folder>/`
 
 2. Add a file named **`SUBAGENT.yaml`** inside that folder (exact name, case-sensitive).
 
@@ -25,7 +25,7 @@ description: >-                # When to use this subagent (shown to the LLM)
 execution_mode: inprocess      # "inprocess" (sync, shares model/env) or "subprocess" (async, own config)
 
 # For subprocess mode: entry script
-entry_script: scripts/my_script.sh   # Relative to GEAK root
+entry_script: scripts/my_script.sh   # Resolved against the bundled package first, then GEAK root
 
 # Parameters the subagent accepts (used to generate tool schema)
 parameters:
@@ -68,7 +68,7 @@ tools:
 | `name` | Yes | Stable identifier, must be unique across all subagents |
 | `description` | Yes | Written for the LLM -- explains *when* to use this subagent |
 | `execution_mode` | Yes | `inprocess` (sync, shares parent model/env) or `subprocess` (async, independent process) |
-| `entry_script` | No | Script to run in subprocess mode (relative to GEAK root). Required for `subprocess` mode. |
+| `entry_script` | No | Script to run in subprocess mode. Bundled under `src/minisweagent/` and resolved against the installed package first (then GEAK root); see `resolve_entry_script`. Required for `subprocess` mode. |
 | `parameters` | No | List of parameters the subagent accepts. Each has `name`, `type`, `description`, `required`. |
 
 ### Embedded configuration sections
@@ -130,7 +130,7 @@ registry.register_from_dict({
 
 | Step | Action |
 |------|--------|
-| 1 | Create `GEAK/subagents/<folder>/` |
+| 1 | Create `GEAK/src/minisweagent/subagents/<folder>/` |
 | 2 | Add `SUBAGENT.yaml` with metadata + embedded config |
 | 3 | Ensure `name` is unique across all subagents |
 | 4 | For subprocess mode: create and test the entry script |

@@ -34,12 +34,14 @@ from minisweagent.run.pipeline_helpers import (
     apply_mode_presets,
     resolve_max_rounds,
 )
+from minisweagent.run.preprocess.contract_normalize import is_amalgamation_command
 from minisweagent.run.preprocess_v3.adapter import run_preprocess_v3 as run_preprocessor
 from minisweagent.run.state import (
     PreprocessState,
     preprocess_hard_stop_handler,
     preprocess_soft_stop_handler,
 )
+from minisweagent.run.utils.gpu_manager import GPUManager
 from minisweagent.run.utils.task_parser import (
     _resolve_path_case,
     display_parsed_config,
@@ -479,10 +481,22 @@ def main(
                 )
             config = _deep_merge(config, _task_user_config)
 
-    if model_name is None and parsed_config.get("model"):
-        model_name = parsed_config["model"]
+    _task_model = parsed_config.get("model")
+    # Guard: the task's parsed `model` can be the INFERENCE model path (e.g.
+    # /home/.../gpt-oss-120b-BF16) leaking from a runtime_args block, not an LLM
+    # id. litellm can't infer a provider from a filesystem path -> BadRequestError
+    # ("LLM Provider NOT provided"), which crashes the preprocess orchestrator.
+    # An LLM id is never an absolute path; ignore path-like values and keep the
+    # configured agent model (model.model_name from the geak config).
+    if model_name is None and _task_model and not str(_task_model).startswith(("/", "~", ".")):
+        model_name = _task_model
         model = get_model(model_name, config.get("model", {}))
         logger.info("Using model (from task): [bold cyan]%s[/bold cyan]", model_name)
+    elif model_name is None and _task_model:
+        logger.info(
+            "Ignoring task 'model' that looks like a filesystem path (%s); "
+            "keeping configured agent model.", _task_model,
+        )
 
     if output is None and parsed_config.get("output_dir"):
         output = Path(parsed_config["output_dir"])
@@ -519,8 +533,21 @@ def main(
     if num_parallel is None:
         num_parallel = _as_int(parsed_config.get("num_parallel"))
     if num_parallel is None and parsed_gpu_ids:
-        num_parallel = len(parsed_gpu_ids)
-        logger.info("Auto-setting num_parallel=%s from gpu_ids.", num_parallel)
+        from minisweagent.run.utils.parallel_helpers import resolve_num_parallel
+
+        _par_cfg = config.get("parallel") or {}
+        _min_w = parsed_config.get("min_parallel") or _par_cfg.get("min_parallel")
+        _wpg = parsed_config.get("workers_per_gpu") or _par_cfg.get("workers_per_gpu")
+        num_parallel = resolve_num_parallel(
+            len(parsed_gpu_ids),
+            min_workers=int(_min_w) if _min_w is not None else None,
+            workers_per_gpu=int(_wpg) if _wpg is not None else None,
+        )
+        logger.info(
+            "Auto-setting num_parallel=%s from %d gpu_ids.",
+            num_parallel,
+            len(parsed_gpu_ids),
+        )
 
     kernel_name_for_output = parsed_config.get("kernel_name")
     if not kernel_name_for_output and kernel_url:
@@ -580,11 +607,20 @@ def main(
             logger.info("[bold cyan]Promoted test command to validated harness: %s[/bold cyan]", promoted)
 
     _target_language = "flydsl" if kernel_type in {"pytorch2flydsl", "flydsl"} else None
-    scoring_target_norm = (scoring_target or "wall").strip().lower()
+    # Scoring signal precedence: explicit --target > GEAK_SCORE_TARGET env > "wall".
+    # ``kernel`` scores GPU-only kernel time (torch.profiler CUDA events), which
+    # excludes host dispatch + DVFS jitter — the ±1% wall-time noise that drowns
+    # sub-2% kernel gains and lets the agent over-report a noisy favorable draw.
+    # Keep ``wall`` the default (E2E-correlated, what most callers expect); the
+    # env knob lets an operator switch the whole fleet to the low-noise signal
+    # without editing per-run CLI. Generic: no per-kernel special-casing.
+    scoring_target_norm = (
+        scoring_target or os.environ.get("GEAK_SCORE_TARGET") or "wall"
+    ).strip().lower()
     if scoring_target_norm not in {"wall", "kernel"}:
         logger.warning(
-            "Unknown --target=%s, falling back to 'wall'. Valid: wall|kernel.",
-            scoring_target,
+            "Unknown scoring target=%s, falling back to 'wall'. Valid: wall|kernel.",
+            scoring_target_norm,
         )
         scoring_target_norm = "wall"
     logger.info("Scoring target: %s (GEAK_RESULT_LATENCY_MS = %s_ms)", scoring_target_norm, scoring_target_norm)
@@ -611,6 +647,27 @@ def main(
     # ── SIGINT handler: first Ctrl-C -> SoftStop; second Ctrl-C -> ──
     # ── force-terminate registry and re-raise.                     ──
     state = PreprocessState(output_dir=preprocess_output_dir)
+    _gpu_mgr_cfg = config.get("gpu_manager") or {}
+    if "cpu_pressure_threshold" in _gpu_mgr_cfg:
+        logger.warning(
+            "gpu_manager.cpu_pressure_threshold is no longer a YAML knob — "
+            "the dispatcher now uses normalized per-core load with a fixed "
+            "default. Ignoring the configured value."
+        )
+    gpu_manager = GPUManager(
+        parsed_gpu_ids,
+        registry=state.registry,
+        stats_log_interval_s=float(_gpu_mgr_cfg.get("stats_log_interval_s", 30.0)),
+        event_log_path=preprocess_output_dir / "gpu_events.jsonl",
+    )
+
+    _parallel_cfg = config.get("parallel") or {}
+    _max_llm = parsed_config.get("max_concurrent_llm") or _parallel_cfg.get("max_concurrent_llm")
+    _llm_cap = int(_max_llm) if _max_llm is not None else (num_parallel or len(parsed_gpu_ids))
+    llm_semaphore: threading.Semaphore | None = threading.Semaphore(_llm_cap) if _llm_cap > 0 else None
+    if llm_semaphore is not None:
+        logger.info("LLM concurrency cap: %d", _llm_cap)
+
     _sigint_count = {"n": 0}
     _orig_sigint = signal.getsignal(signal.SIGINT)
 
@@ -682,7 +739,16 @@ def main(
                 else:
                     raise
         else:
-            if isinstance(test_command, str) and "&&" in test_command:
+            # Only pre-split a compound ``cmd_a && cmd_b`` into correctness /
+            # performance hints when it is a genuine build-bearing contract
+            # (mirrors the preprocessor's _try_synthesize_shell_contract_harness
+            # split). A non-build ``&&`` is an amalgamation (same script run twice
+            # with different settings, or two different tests chained); splitting it
+            # left=correctness / right=performance silently drops one metric. Pass
+            # it through whole as eval_command so the preprocessor's deterministic
+            # amalgamation guard fires (PATH_A_FLAG_MISSING) and routes it to the
+            # harness generator (Case A2), which resolves it into one metric.
+            if isinstance(test_command, str) and "&&" in test_command and not is_amalgamation_command(test_command):
                 left, right = test_command.rsplit("&&", 1)
                 correctness_command = left.strip() or None
                 performance_command = right.strip() or None
@@ -948,7 +1014,10 @@ def main(
 
         from minisweagent.run.unified import PipelineContext, run_pipeline
 
-        pipeline_mode = "mixed"
+        pipeline_mode = os.environ.get("GEAK_PIPELINE_MODE", "mixed").strip().lower()
+        if pipeline_mode not in {"fixed", "planned", "mixed"}:
+            logger.warning("Invalid GEAK_PIPELINE_MODE=%r, falling back to 'mixed'", pipeline_mode)
+            pipeline_mode = "mixed"
         logger.info("Running unified pipeline mode: %s", pipeline_mode)
         pipeline_result = run_pipeline(
             PipelineContext(
@@ -976,6 +1045,8 @@ def main(
                 soft_stop=budget.soft_stop,
                 registry=state.registry,
                 preprocess_only=preprocess_only,
+                gpu_manager=gpu_manager,
+                llm_semaphore=llm_semaphore,
             ),
             mode=pipeline_mode,
         )
@@ -997,6 +1068,10 @@ def main(
         # 4. Then run finalize + retention. Both are broad-except wrapped
         #    so a hook failure can't mask the original exception.
         budget.cancel_all_timers()
+        try:
+            gpu_manager.shutdown(cancel_pending=True)
+        except Exception:
+            logger.exception("gpu_manager.shutdown() failed during run cleanup")
         try:
             state.registry.terminate_all()
         except Exception:

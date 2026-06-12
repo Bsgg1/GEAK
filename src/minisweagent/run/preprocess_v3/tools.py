@@ -50,7 +50,6 @@ import inspect
 import json
 import logging
 import os
-import shlex
 import shutil
 import time
 from collections.abc import Callable
@@ -79,6 +78,13 @@ from minisweagent.run.preprocess_v3.orchestrator import (
 )
 from minisweagent.run.preprocess_v3.registry import SubagentRegistry, SubagentSpec
 from minisweagent.run.preprocess_v3.translate import TranslationResult, translate_to_flydsl
+from minisweagent.run.section_builders import (
+    build_benchmark_body,
+    build_correctness_body,
+    build_full_benchmark_body,
+    build_profile_body,
+    strip_mode_flags,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,27 +114,6 @@ _MODE_TO_FLAG: dict[str, str] = {
 }
 
 
-def _substitute_mode_flag(cmd: str, target_mode: str) -> str:
-    """Ensure *cmd* contains *target_mode*'s harness flag.
-
-    Three cases:
-    1. *cmd* already has the right flag → return unchanged.
-    2. *cmd* has a different known flag → replace it.
-    3. *cmd* has no known flag at all → return unchanged (safe fallback).
-    """
-    dst_flag = _MODE_TO_FLAG.get(target_mode)
-    if not dst_flag:
-        return cmd
-    if dst_flag in cmd:
-        return cmd
-    for other_mode, other_flag in _MODE_TO_FLAG.items():
-        if other_mode != target_mode and other_flag in cmd:
-            return cmd.replace(other_flag, dst_flag)
-    return cmd
-
-
-_DEFAULT_PROFILE_REPLAYS = 5
-
 #: Bounded-retry ceilings used by ``_finish_blockers`` so an unclearable
 #: deterministic-tool / verifier failure cannot spin the orchestrator loop up
 #: to its global ``step_limit``. Once these caps are hit the corresponding
@@ -137,23 +122,6 @@ _DEFAULT_PROFILE_REPLAYS = 5
 _MAX_DETERMINISTIC_PROBE_ATTEMPTS = 2
 #: Mirrors the prompt's "Maximum 3 generator attempts" budget for harness repair.
 _MAX_VERIFIER_ATTEMPTS = 3
-
-
-def _build_profile_section(profile_cmd: str) -> str:
-    """Wrap a ``--profile`` harness invocation with warmup + ``kernel-profile``.
-
-    Matches the PROFILE section that Path B's ``render_commandment`` produces:
-    one warmup pass (suppressed stdout), then ``kernel-profile`` wrapping the
-    same command to capture hardware counters and write ``profile.json``.
-    """
-    warmup = f"{profile_cmd} > /dev/null 2>&1 || true"
-    kernel_profile = (
-        f'kernel-profile "{profile_cmd}"'
-        f" --gpu-devices ${{GEAK_GPU_DEVICE}}"
-        f" --replays {_DEFAULT_PROFILE_REPLAYS}"
-        f" --json -o ${{GEAK_WORK_DIR}}/profile.json"
-    )
-    return f"{warmup}\n{kernel_profile}"
 
 
 def _extract_harness_from_command(cmd: str) -> str | None:
@@ -179,6 +147,28 @@ def _extract_harness_from_command(cmd: str) -> str | None:
             if not candidate.startswith("-"):
                 return candidate
     return None
+
+
+def _is_amalgamation_command(cmd: str) -> bool:
+    """Thin wrapper over :func:`contract_normalize.is_amalgamation_command`.
+
+    Kept local so this module's call sites read clearly and to preserve the safe
+    ImportError fallback: if the shared module cannot be imported, treat a ``&&``
+    command as an amalgamation and route to the harness generator (A2) rather than
+    risk a blind split. Flag-independent by design — it must catch flag-bearing
+    amalgamations too, since those would otherwise yield a harness path via
+    ``_extract_harness_from_command`` and slip past the flag-less backstop in
+    ``commandment_from_user_command``.
+    """
+    if "&&" not in cmd:
+        return False
+    try:
+        from minisweagent.run.preprocess.contract_normalize import (
+            is_amalgamation_command,
+        )
+    except ImportError:
+        return True
+    return is_amalgamation_command(cmd)
 
 
 def _try_synthesize_shell_contract_harness(
@@ -216,6 +206,18 @@ def _try_synthesize_shell_contract_harness(
         return None
     if not repo_root_str:
         return None
+    # Only synthesize for a genuine build-bearing command. A non-build `&&` is an
+    # amalgamation (same script twice with different settings, or two different
+    # tests chained); its resolution is delegated to the harness generator (A2) —
+    # the deterministic split below is intentionally NOT used for it. We do not
+    # distinguish same-script-twice from different-scripts here: the generator
+    # handles both, so neither is a "limitation" of this path.
+    if _is_amalgamation_command(cmd):
+        return None
+    # The split below hard-codes left=correctness / right=performance ordering;
+    # this is an intentional assumption that holds for the canonical
+    # "compile && correctness && performance" pattern but degrades for 3+ mixed
+    # segments (e.g. "make && python a && python b"). Kept deliberately simple.
     # Only split when the command has multiple meaningful segments, not
     # when && is just directory navigation (e.g. "cd /dir && bash script.sh").
     # A cd-only left half is not a correctness command.
@@ -1234,7 +1236,19 @@ def _make_tool_collect_baseline(
                 eval_command = saved_eval
 
         resolved_gpu = gpu_id if gpu_id is not None else agent.config.gpu_id
-        resolved_work_dir = Path(work_dir) if work_dir else None
+        # Fall back to the orchestrator's source repo when the subagent omits
+        # work_dir (it has no schema default and is frequently not passed).
+        # A None work_dir means _build_env sets neither PYTHONPATH nor
+        # GEAK_WORK_DIR, so the harness can't find the kernel source and silently
+        # produces no latency. At preprocess time no per-slot worktree exists yet,
+        # so the source repo is the correct target; optimization-time runs pass
+        # their per-slot worktree explicitly via the legacy run_harness path.
+        if work_dir:
+            resolved_work_dir = Path(work_dir)
+        elif agent.config.repo:
+            resolved_work_dir = Path(agent.config.repo)
+        else:
+            resolved_work_dir = None
 
         if harness_path:
             baseline: BaselineMetrics = collect_baseline_metrics(
@@ -1373,6 +1387,11 @@ def _make_tool_render_commandment(
             except Exception as exc:  # noqa: BLE001 — never let the gate crash finalize
                 logger.debug("render_commandment bypass-gate skipped (validator error): %s", exc)
 
+        # compile_command is intentionally left unset: for HIP the harness owns
+        # its own build (the harness-generator contract requires it to self-build
+        # via subprocess.run(make/hipcc), mtime-keyed on the kernel source). So the
+        # rendered COMMANDMENT carries no compile step — that is by design, not a
+        # gap. A changed CK/HIP source is still recompiled by the harness/JIT layer.
         ctx = CommandmentContext(
             kernel_path=Path(kernel_path),
             harness_path=Path(harness_path),
@@ -1462,6 +1481,28 @@ def _make_tool_commandment_from_user_command(
                 agent.model,
             )
 
+        # Deterministic amalgamation backstop (must run BEFORE harness extraction).
+        # A non-build ``&&`` command is a joint/amalgamation instruction (same
+        # script run twice with different settings, or two different tests chained).
+        # Splitting it left=correctness / right=performance silently drops one
+        # latency number. This guard is flag-INDEPENDENT on purpose: a flag-bearing
+        # amalgamation (e.g. "python t.py --benchmark --a && python t.py --benchmark
+        # --b") would otherwise yield a harness_path via
+        # ``_extract_harness_from_command`` and slip past the flag-less backstop
+        # below, running only the first half. Refuse here and route to A2.
+        if _is_amalgamation_command(cmd):
+            return {
+                "ok": False,
+                "error": "PATH_A_FLAG_MISSING",
+                "warnings": [
+                    "PATH_A_FLAG_MISSING: command chains segments with '&&' but has "
+                    "no build/compile prefix (amalgamation); a deterministic split "
+                    "would drop one metric. Dispatch harness-generator (Case A2) to "
+                    "resolve it into a single test emitting one metric. Do NOT retry "
+                    "commandment_from_user_command with the same command."
+                ],
+            }
+
         # Extract the harness path from the (possibly sanitized) command
         # so collect_baseline/collect_profile can use the real filesystem path.
         original_harness_path = _extract_harness_from_command(cmd)
@@ -1470,6 +1511,7 @@ def _make_tool_commandment_from_user_command(
         # standard GEAK harness flag, synthesize a 4-mode wrapper harness using
         # the legacy eval_contract_adapter so collect_baseline / collect_profile
         # have a real harness_path to point at.
+        synthesized: str | None = None
         if not original_harness_path:
             synthesized = _try_synthesize_shell_contract_harness(
                 cmd,
@@ -1487,6 +1529,32 @@ def _make_tool_commandment_from_user_command(
             original_harness_path = None
         if original_harness_path:
             agent._collected["harness_path"] = original_harness_path
+
+        # Deterministic backstop for the flag-less Path-A case (issue #258).
+        # A command that (a) exposes none of GEAK's four harness flags, (b) is
+        # not a compound ``&&`` shell contract, and (c) yielded no usable
+        # harness_path carries no per-mode contract: every COMMANDMENT section
+        # would receive the SAME command (the section builders cannot inject a
+        # mode flag a flag-less command never had), and the correctness preflight
+        # would then run the harness's full default sweep until it times out. Refuse to
+        # render that all-modes-identical artifact and signal the orchestrator to
+        # switch to harness synthesis (Case A2). This guard is independent of the
+        # ``modes_covered`` the LLM passed, so it cannot be defeated by the LLM
+        # listing all four modes as covered.
+        is_flagless = _extract_harness_from_command(cmd) is None and "&&" not in cmd and original_harness_path is None
+        if is_flagless:
+            return {
+                "ok": False,
+                "error": "PATH_A_FLAG_MISSING",
+                "warnings": [
+                    "PATH_A_FLAG_MISSING: flag-less command exposes none of "
+                    "--correctness/--benchmark/--full-benchmark/--profile and has no "
+                    "harness; dispatch harness-generator (Case A2) instead of copying "
+                    "the command into all four modes. Do NOT retry "
+                    "commandment_from_user_command with the same command."
+                ],
+            }
+
         # Preserve the sanitized command (with real paths) for
         # collect_baseline before we replace repo_root with ${GEAK_WORK_DIR}.
         eval_command_for_baseline = cmd
@@ -1514,25 +1582,47 @@ def _make_tool_commandment_from_user_command(
         warnings: list[str] = []
         modes_emitted: list[str] = []
 
-        # Invoke through run.sh so every Path-A section uses the same
-        # PYTHONPATH/HIP_VISIBLE_DEVICES/worktree contract as legacy
-        # COMMANDMENT generation while still supporting compound shell
-        # commands such as "compile && correctness && performance".
-        wrapped_cmd = f"${{GEAK_WORK_DIR}}/run.sh {shlex.quote(cmd)}"
+        # When we synthesized a shell-contract wrapper above, route the
+        # section bodies through IT — the wrapper accepts the 4-mode flags
+        # (--correctness, --benchmark, --full-benchmark, --profile) and
+        # internally dispatches the user's subcommand-style runner. Without
+        # this branch, `build_correctness_body` would bolt --correctness
+        # onto the user's opaque compound command (e.g. ending in
+        # `task_runner.py performance --correctness`), which the bare
+        # subcommand-style runner rejects with "unrecognized arguments".
+        if synthesized:
+            harness_from_cmd: str | None = synthesized
+            use_run_sh = True
+        else:
+            harness_from_cmd = _extract_harness_from_command(cmd)
+            use_run_sh = harness_from_cmd is not None
+
+        if use_run_sh:
+            # `_extract_harness_from_command` only matches `python|python3 <path>`
+            # invocations and returns just the path. The run.sh template execs
+            # its args via `bash -lc "$*"`, which would try to exec the .py
+            # directly (Permission denied, rc=126) without an interpreter prefix.
+            base_cmd = f"${{GEAK_WORK_DIR}}/run.sh python3 {harness_from_cmd}"
+        elif cmd.startswith("cd ${GEAK_WORK_DIR}"):
+            base_cmd = strip_mode_flags(cmd)
+        else:
+            base_cmd = strip_mode_flags(f"cd ${{GEAK_WORK_DIR}} && {cmd}")
+
+        section_builders: dict[str, Callable[[str], str]] = {
+            "correctness": build_correctness_body,
+            "profile": build_profile_body,
+            "benchmark": build_benchmark_body,
+            "full_benchmark": build_full_benchmark_body,
+        }
         for mode in PATH_A_MODES:
+            body = section_builders[mode](base_cmd)
             if mode in modes_covered_tup:
-                mode_cmd = _substitute_mode_flag(wrapped_cmd, mode)
-                if mode == "profile":
-                    mode_cmd = _build_profile_section(mode_cmd)
-                sections[mode] = mode_cmd
+                sections[mode] = body
                 modes_emitted.append(mode)
             elif mode in inferred_modes_tup:
                 src = source_mode or "<unspecified>"
-                inferred_cmd = _substitute_mode_flag(wrapped_cmd, mode)
-                if mode == "profile":
-                    inferred_cmd = _build_profile_section(inferred_cmd)
                 marker_line = f"# PATH_A_PARTIAL_COVERAGE: {mode} inferred from {src}"
-                sections[mode] = f"{marker_line}\n{inferred_cmd}"
+                sections[mode] = f"{marker_line}\n{body}"
                 warnings.append(f"PATH_A_PARTIAL_COVERAGE: {mode} inferred from {src}")
                 modes_emitted.append(mode)
             else:

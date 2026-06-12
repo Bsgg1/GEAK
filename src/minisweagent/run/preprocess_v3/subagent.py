@@ -389,6 +389,20 @@ class PreprocessSubagent:
             msg_extra["tool_calls"] = tool_call
         self.add_message("assistant", content, **msg_extra)
 
+        # The model ran out of output budget mid-tool-call, so the tool
+        # arguments are empty/partial. Dispatching would crash the tool with
+        # missing required args and the model would retry the same oversized
+        # call, looping forever. Surface a recoverable error that nudges it to
+        # shorten the command instead.
+        if isinstance(response, dict) and response.get("truncated_tool_call"):
+            raise _FormatError(
+                "PreprocessSubagent: your previous tool call was cut off because "
+                "it exceeded the output token limit, so its arguments were lost. "
+                "Reissue the tool call with a much shorter 'command' (e.g. write "
+                "large files in several smaller steps or via a heredoc split "
+                "across multiple calls)."
+            )
+
         # Prefer a bash submit marker when present — it short-circuits
         # the rest of the response handling (matches DefaultAgent).
         bash_actions = _BASH_BLOCK_RE.findall(content or "")

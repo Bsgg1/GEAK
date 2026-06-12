@@ -20,7 +20,7 @@ from typing import Any
 
 import yaml
 
-from minisweagent import get_repo_root
+from minisweagent import get_data_dir
 from minisweagent.config import load_config
 
 logger = logging.getLogger(__name__)
@@ -77,7 +77,7 @@ class SubAgentRegistry:
 
     def __init__(self, subagents_dir: Path | None = None):
         if subagents_dir is None:
-            subagents_dir = get_repo_root() / "subagents"
+            subagents_dir = get_data_dir("subagents")
         self._subagents_dir = subagents_dir
         self.subagents: dict[str, SubAgentDescriptor] = self._discover()
 

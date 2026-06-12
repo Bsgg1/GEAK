@@ -15,8 +15,7 @@ RUN make install
 RUN python3 -c "from profiler_mcp.server import profile_kernel; from metrix import Metrix; print('Core imports verified')"
 
 # Runtime assets (not needed for install; changes only rebuild cheap COPY layers)
-COPY subagents/ subagents/
-COPY skills/ skills/
+# subagents/ and skills/ now ship inside the package (bundled by `make install`).
 COPY docs/ docs/
 COPY scripts/ scripts/
 COPY entrypoint.sh ./

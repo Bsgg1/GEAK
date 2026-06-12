@@ -424,6 +424,7 @@ class OptimizationAgent:
             log_fn=self._log_message,
             patch_counter=self.patch_counter,
             source_file_paths=source_file_paths,
+            gpu_manager=getattr(self, "_gpu_manager", None),
         )
 
         save_and_test_tool = self.toolruntime._tool_table.get("save_and_test")
@@ -579,7 +580,14 @@ class OptimizationAgent:
             if _wm_text and not any("[Working Memory" in m.get("content", "") for m in self.messages[-3:]):
                 self.messages.append({"role": "user", "content": f"[Working Memory Update]\n{_wm_text}"})
 
-        response = self.model.query(self.messages)
+        _sem = getattr(self, "_llm_semaphore", None)
+        if _sem is not None:
+            _sem.acquire()
+        try:
+            response = self.model.query(self.messages)
+        finally:
+            if _sem is not None:
+                _sem.release()
         output = response["content"]
         msg_kwargs = {}
         if response.get("tools") and not self._will_use_bash(response):

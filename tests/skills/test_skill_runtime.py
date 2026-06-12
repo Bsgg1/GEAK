@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from minisweagent import package_dir
 from minisweagent.skills.skill_runtime import SkillDescriptor, SkillRuntime
 
 
@@ -189,7 +190,7 @@ class TestSkillRuntimeIntegration:
             assert "AMD" in s.description or "silu" in s.description.lower()
 
 
-_SKILLS_ROOT = _REPO_ROOT / "skills"
+_SKILLS_ROOT = package_dir / "skills"
 
 _EXPECTED_FLYDSL_DOCS = [
     "flydsl_optimization.md",

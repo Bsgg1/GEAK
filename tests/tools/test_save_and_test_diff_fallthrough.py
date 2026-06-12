@@ -232,9 +232,12 @@ def test_no_index_new_executable_file_preserves_mode(tmp_path):
     base_repo.mkdir()
     tool = _make_tool(tmp_path, base_repo=base_repo)
 
+    # NB: use ``bench.sh`` not ``run.sh`` — the latter is a GEAK-generated harness
+    # name that the exclude filter deliberately strips (see the generated-helper
+    # excludes), which would defeat the executable-bit assertion below.
     side_effects = [
         _git_diff_result("", returncode=0),
-        _no_index_result(_no_index_new_file(tmp_path, "run.sh", mode="100755", body="#!/bin/sh\necho hi\n")),
+        _no_index_result(_no_index_new_file(tmp_path, "bench.sh", mode="100755", body="#!/bin/sh\necho hi\n")),
     ]
 
     with (
@@ -246,7 +249,7 @@ def test_no_index_new_executable_file_preserves_mode(tmp_path):
     ):
         out = tool._get_patch_content()
 
-    assert "diff --git a/run.sh b/run.sh" in out
+    assert "diff --git a/bench.sh b/bench.sh" in out
     assert "new file mode 100755" in out, "executable bit must be preserved"
     assert "--- /dev/null" in out
 
@@ -304,16 +307,15 @@ def test_git_branch_success_path_still_strips_jit_cache(tmp_path):
     )
 
 
-def test_no_index_excludes_jit_cache_basenames(tmp_path):
-    """The no-index backup must pre-exclude every JIT-cache directory basename.
+def test_no_index_command_carries_no_pathspec(tmp_path):
+    """The ``git diff --no-index`` command must NOT pass pathspec excludes.
 
-    Pins that ``_get_patch_content`` wires the shared
-    ``jit_cache_diff_basename_excludes()`` helper into the ``git diff
-    --no-index`` command as ``:(exclude)<basename>`` pathspecs, so JIT
-    caches (e.g. ``flydsl_cache/``, ``.triton/``) are never even scanned.
+    ``git diff --no-index`` rejects any pathspec on git < ~2.45 (errors with a
+    usage message and returns an empty patch), which silently drops the agent's
+    whole change set on e.g. git 2.34 (Ubuntu 22.04 CI). The command must be the
+    bare two-path form; exclusion is handled by post-filtering the rendered patch
+    (see :func:`test_no_index_strips_jit_cache_sections`).
     """
-    from minisweagent.run.utils.generated_artifacts import jit_cache_diff_basename_excludes
-
     base_repo = tmp_path / "base"
     base_repo.mkdir()
     tool = _make_tool(tmp_path, base_repo=base_repo)
@@ -336,12 +338,40 @@ def test_no_index_excludes_jit_cache_basenames(tmp_path):
         tool._get_patch_content()
 
     no_index_cmd = next(c for c in captured_args if isinstance(c, list) and c[:3] == ["git", "diff", "--no-index"])
-    expected = jit_cache_diff_basename_excludes()
-    assert expected, "helper must return a non-empty list (test guards the contract)"
-    for basename in expected:
-        assert f":(exclude){basename}" in no_index_cmd, (
-            f"no-index backup must include :(exclude){basename}; got: {no_index_cmd}"
-        )
+    assert "--" not in no_index_cmd, f"no-index command must not carry a pathspec separator; got: {no_index_cmd}"
+    assert not any(str(a).startswith(":(exclude)") for a in no_index_cmd), (
+        f"no-index command must not carry :(exclude) pathspecs; got: {no_index_cmd}"
+    )
+
+
+def test_no_index_strips_jit_cache_sections(tmp_path):
+    """JIT-cache sections must be stripped from the rendered no-index patch.
+
+    Exclusion moved from unsupported ``--no-index`` pathspecs to a post-render
+    filter; this pins that a JIT-cache file present only in ``cwd`` is dropped
+    while a real source edit survives.
+    """
+    base_repo = tmp_path / "base"
+    base_repo.mkdir()
+    tool = _make_tool(tmp_path, base_repo=base_repo)
+
+    patch = _no_index_modified(base_repo, tmp_path) + _no_index_new_file(tmp_path, "flydsl_cache/abc.pkl")
+    side_effects = [
+        _git_diff_result("", returncode=0),
+        _no_index_result(patch),
+    ]
+
+    with (
+        mock.patch.object(SaveAndTestTool, "_is_git_repo", return_value=True),
+        mock.patch(
+            "minisweagent.tools.save_and_test.subprocess.run",
+            side_effect=side_effects,
+        ),
+    ):
+        out = tool._get_patch_content()
+
+    assert "kernel.py" in out, "real kernel.py edit must survive"
+    assert "flydsl_cache" not in out, f"JIT-cache section must be stripped from the no-index patch; got: {out!r}"
 
 
 def _git(args, cwd):

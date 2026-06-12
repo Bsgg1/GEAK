@@ -319,6 +319,10 @@ def task_file_to_agent_task(task_file: Path):
     if meta.get("starting_patch"):
         cfg["starting_patch"] = meta["starting_patch"]
 
+    # kind is dispatcher scheduling metadata persisted to the task .md YAML by the
+    # writer and read back by _resolve_task_kind() in postprocess.evaluation. It is
+    # intentionally NOT passed to AgentConfig: agents behave identically regardless
+    # of how they were scheduled (planned vs fixed canonical fill).
     for _passthrough_key in ("baseline_metrics", "benchmark_baseline"):
         if meta.get(_passthrough_key):
             cfg[_passthrough_key] = meta[_passthrough_key]
@@ -345,6 +349,9 @@ def run_task_batch(
     deadline=None,
     soft_stop=None,
     registry=None,
+    gpu_manager=None,
+    num_parallel: int | None = None,
+    llm_semaphore=None,
 ) -> dict[str, Any]:
     """Run a batch of task files via ParallelAgent pool mode.
 
@@ -458,7 +465,7 @@ def run_task_batch(
 
     try:
         raw_results = ParallelAgent.run_parallel(
-            num_parallel=len(gpu_ids),
+            num_parallel=num_parallel or len(gpu_ids),
             repo_path=repo_path,
             is_git_repo=is_git,
             task_content="",
@@ -474,6 +481,8 @@ def run_task_batch(
             deadline=deadline,
             soft_stop=soft_stop,
             registry=registry,
+            gpu_manager=gpu_manager,
+            llm_semaphore=llm_semaphore,
         )
     except Exception as exc:
         logger.error("Task batch execution failed: %s", exc, exc_info=True)
@@ -620,6 +629,9 @@ def run_staged_task_batch(
     deadline=None,
     soft_stop=None,
     registry=None,
+    gpu_manager=None,
+    num_parallel: int | None = None,
+    llm_semaphore=None,
 ) -> dict[str, Any]:
     """Priority-staged dispatch with early exit on improvement.
 
@@ -653,6 +665,9 @@ def run_staged_task_batch(
             deadline=deadline,
             soft_stop=soft_stop,
             registry=registry,
+            gpu_manager=gpu_manager,
+            num_parallel=num_parallel,
+            llm_semaphore=llm_semaphore,
         )
         all_results.append(
             {

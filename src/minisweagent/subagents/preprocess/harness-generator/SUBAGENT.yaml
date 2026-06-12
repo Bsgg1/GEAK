@@ -141,12 +141,36 @@ system_prompt: |
   - The harness is a THIN WRAPPER around existing repo code. Do NOT reimplement what the repo already does — import and call its existing functions.
 
   Shape source priority
-  1. If the task has a `USER TASK CONTEXT` / explicit shape override: use that exactly. Read discovered files only for invocation/reference logic and write `user_task:production` to `harness_shapes_source.txt`.
+  1. If the task has a `USER TASK CONTEXT` / explicit shape override: use those shapes exactly and write `user_task:production` to `harness_shapes_source.txt`. For invocation/reference logic, read `template_harness_path` when the context provides one (see "Template harness" below), else the discovered files.
   2. Else, if a `FILES YOU MUST READ` block names a benchmark/shape source: read it and use its ordered full case stream. Do NOT invent `ALL_CONFIGS` while that file is readable.
   3. Else, if a benchmark file exists FOR THIS KERNEL (imports or calls the same kernel function): use it. If discovery lists a benchmark file that's for a DIFFERENT kernel, ignore it.
   4. Else use the TEST file's shapes (parametrize, config lists, etc.).
   5. Only if no benchmark/test source file exists may you infer representative shapes from the kernel source.
   6. Write the chosen file's absolute path to `harness_shapes_source.txt` — it's the SINGLE source of truth for sampled cases.
+
+  Template harness (when context provides `template_harness_path`)
+  - The context names an existing user-supplied harness at `template_harness_path`. It arrives as a
+    PATH (not inlined) — open and read the file yourself. Use it as the structural template: its
+    reference/correctness logic, tolerances, per-tensor dtype/device/layout/contiguity, helper/aux
+    buffers, seed, and four-mode CLI wiring are the contract to preserve.
+  - Verifier-gate normalizations apply to BOTH branches below. A user-supplied harness is NOT
+    guaranteed gate-clean. Whether you reproduce or regenerate, preserve the harness's LOGIC but do
+    NOT copy hardcoded source-repo paths or source-repo-relative import strategy, and ensure the
+    output still satisfies the verifier's CRITICAL gates:
+      * resolve every repo path from `$GEAK_WORK_DIR` (never a hardcoded source-repo path);
+      * if `aiter` is used, set `AITER_META_DIR=$GEAK_WORK_DIR` AND a per-slot `AITER_JIT_DIR`
+        BEFORE `import aiter`;
+      * build the artifact itself when missing (do not require a pre-existing build dir);
+      * apply the `GEAK_MAX_BENCHMARK_SHAPES` / `_MAX_SHAPES` capping rule to ALL four modes (see
+        the MANDATORY shape budget above).
+  - Then compare the template's shapes/configs against the `USER TASK CONTEXT` shapes:
+      * If they ALREADY MATCH: reproduce the harness verbatim EXCEPT for the gate normalizations
+        above — skip only the shape-replacement step (it is the known-good harness; do not
+        needlessly rewrite its logic).
+      * If they DIFFER: reproduce it faithfully — reference/correctness logic, tolerances,
+        per-tensor dtype/device/layout/contiguity, helper/aux buffers, seed, and the four CLI
+        modes — replacing ONLY the shapes/configs with those from `USER TASK CONTEXT`.
+  - In both branches `harness_shapes_source.txt` stays `user_task:production`.
 
   Workflow
   1. Look at the discovered test file. If one exists and is suitable, prefer adapting it over building a new harness from scratch.
