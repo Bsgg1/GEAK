@@ -222,6 +222,7 @@ def _build_env(
     # Without ROCm bin on PATH the profiler exits 127 and the kernel is planned
     # blind (no roofline). No-op when already present.
     from minisweagent.run.postprocess.evaluation import _ensure_rocm_on_path
+
     _ensure_rocm_on_path(env)
     if extra:
         env.update(extra)

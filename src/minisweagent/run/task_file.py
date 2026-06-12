@@ -257,9 +257,7 @@ def _demote_submodule_gitlinks(worktree_path: Path, env: dict[str, str] | None =
     _commit_worktree_baseline(worktree_path, env=env, reason="submodules demoted")
 
 
-def _commit_worktree_baseline(
-    worktree_path: Path, env: dict[str, str] | None = None, reason: str = "seed"
-) -> None:
+def _commit_worktree_baseline(worktree_path: Path, env: dict[str, str] | None = None, reason: str = "seed") -> None:
     """Stage everything present and commit a baseline so ``git diff HEAD`` shows
     only subsequent agent edits.
 

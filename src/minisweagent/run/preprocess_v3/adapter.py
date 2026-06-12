@@ -165,10 +165,13 @@ def run_preprocess_v3(
         )
         # PreprocessResult is a frozen dataclass; stamp elapsed via replace().
         from dataclasses import replace as _dc_replace
+
         result = _dc_replace(result, elapsed_s=time.monotonic() - t0)
         logger.info(
             "v3 preprocess (pre-validated Path-A bypass) completed in %.1fs (success=%s, errors=%d)",
-            result.elapsed_s, result.success, len(result.errors),
+            result.elapsed_s,
+            result.success,
+            len(result.errors),
         )
         if not result.success and not _can_proceed_despite_failure(result):
             raise RuntimeError(
@@ -322,10 +325,14 @@ def _run_prevalidated_path_a(
     full_benchmark_stdout: str | None = None
     try:
         baseline = collect_baseline_metrics(
-            harness, work_dir=work_dir, gpu_id=gpu_id,
+            harness,
+            work_dir=work_dir,
+            gpu_id=gpu_id,
         )
         full_benchmark_stdout = capture_full_benchmark_stdout(
-            harness, work_dir=work_dir, gpu_id=gpu_id,
+            harness,
+            work_dir=work_dir,
+            gpu_id=gpu_id,
         )
     except Exception as exc:  # noqa: BLE001
         errors.append(f"collect_baseline failed: {exc}")
@@ -356,11 +363,7 @@ def _run_prevalidated_path_a(
         errors.append(f"render_commandment failed: {exc}")
         logger.error("pre-validated bypass: render_commandment failed: %s", exc)
 
-    success = (
-        baseline is not None
-        and baseline.success
-        and commandment_path is not None
-    )
+    success = baseline is not None and baseline.success and commandment_path is not None
     return PreprocessResult(
         success=success,
         kernel_language=kernel_language,

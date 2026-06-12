@@ -15,14 +15,18 @@ from minisweagent.run.utils.gpu_manager import GpuJob, GpuLease, GPUManager, Lea
 
 @pytest.fixture
 def manager_2gpu():
-    mgr = GPUManager([0, 1], stats_log_interval_s=0, reaper_interval_s=0)
+    mgr = GPUManager(
+        [0, 1], stats_log_interval_s=0, reaper_interval_s=0, cpu_pressure_threshold=float("inf")
+    )
     yield mgr
     mgr.shutdown()
 
 
 @pytest.fixture
 def manager_4gpu():
-    mgr = GPUManager([0, 1, 2, 3], stats_log_interval_s=0, reaper_interval_s=0)
+    mgr = GPUManager(
+        [0, 1, 2, 3], stats_log_interval_s=0, reaper_interval_s=0, cpu_pressure_threshold=float("inf")
+    )
     yield mgr
     mgr.shutdown()
 

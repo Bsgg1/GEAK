@@ -74,7 +74,7 @@ def _ensure_rocm_on_path(env: dict[str, str]) -> None:
     for var in ("ROCM_PATH", "HIP_PATH", "ROCM_HOME"):
         root = env.get(var) or os.environ.get(var)
         if root:
-            candidates.append(os.path.join(root, "bin"))
+            candidates.append(str(Path(root) / "bin"))
     # Conventional install locations (prefer an unversioned symlink, then newest).
     candidates.append("/opt/rocm/bin")
     candidates.extend(sorted(_glob.glob("/opt/rocm-*/bin"), reverse=True))
@@ -82,7 +82,7 @@ def _ensure_rocm_on_path(env: dict[str, str]) -> None:
     cur = env.get("PATH", "")
     parts = cur.split(os.pathsep) if cur else []
     for binp in candidates:
-        if binp and os.path.isdir(binp) and binp not in parts:
+        if binp and Path(binp).is_dir() and binp not in parts:
             parts.insert(0, binp)
             env["PATH"] = os.pathsep.join(parts)
             return

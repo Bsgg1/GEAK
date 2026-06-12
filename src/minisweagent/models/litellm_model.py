@@ -358,8 +358,9 @@ class LitellmModel:
         )
         if model_for_call and "/" not in model_for_call and has_base:
             logger.warning(
-                "litellm: model %r has no provider prefix; qualifying as 'openai/%s' "
-                "for the gateway base_url.", model_for_call, model_for_call,
+                "litellm: model %r has no provider prefix; qualifying as 'openai/%s' for the gateway base_url.",
+                model_for_call,
+                model_for_call,
             )
             model_for_call = f"openai/{model_for_call}"
         try:
