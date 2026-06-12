@@ -26,8 +26,7 @@ import yaml
 
 # Must match DEFAULT_REL_WS in run-reverse_knowledge.sh — only outputs under this tree.
 REVERSE_KL_WORKSPACE_REL = (
-    "mcp_tools/rag-mcp/knowledge-base/amd-knowledge-base/"
-    "layer-6-extended/optimize-guides/user-case/user"
+    "mcp_tools/rag-mcp/knowledge-base/amd-knowledge-base/layer-6-extended/optimize-guides/user-case/user"
 )
 
 
@@ -45,8 +44,7 @@ def _apply_tool_disables(config: dict) -> None:
             import rag_mcp  # noqa: F401
         except ImportError as e:
             raise RuntimeError(
-                "RAG is enabled in config but rag-mcp is not installed.\n"
-                "  pip install -e mcp_tools/rag-mcp"
+                "RAG is enabled in config but rag-mcp is not installed.\n  pip install -e mcp_tools/rag-mcp"
             ) from e
         _index_path = Path.home() / ".cache" / "amd-ai-devtool" / "semantic-index"
         _has_faiss = (_index_path / "index.faiss").exists() or (_index_path / "faiss.index").exists()
@@ -132,10 +130,10 @@ def main() -> None:
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))
 
-    from minisweagent.run.extra.config import configure_if_first_time
-    from minisweagent.models import get_model
-    from minisweagent.environments import get_environment_class
     from minisweagent.agents.interactive import InteractiveAgent, InteractiveAgentConfig
+    from minisweagent.environments import get_environment_class
+    from minisweagent.models import get_model
+    from minisweagent.run.extra.config import configure_if_first_time
 
     configure_if_first_time()
 
