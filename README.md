@@ -48,7 +48,7 @@ pip install -e .          # core package, including MCP runtime dependencies
 pip install -e '.[full]'  # core + dev + langchain + swe-rex
 
 # (or) plain, non-editable install — recommended for production / embedding
-# consumers (e.g. Hyperloom). The bundled subagents/ and skills/ data ships
+# consumers. The bundled subagents/ and skills/ data ships
 # inside the wheel, so no GEAK_ROOT, /workspace copy, or editable checkout is
 # required for runtime discovery to work.
 pip install .             # from a source checkout

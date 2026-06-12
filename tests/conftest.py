@@ -25,7 +25,7 @@ def _no_git_prompt(monkeypatch):
 def _unset_data_dir_env(monkeypatch):
     """Ensure bundled-data discovery resolves in-package during tests.
 
-    A leaked GEAK_ROOT / GEAK_SUBAGENTS_ROOT (common in container/Hyperloom
+    A leaked GEAK_ROOT / GEAK_SUBAGENTS_ROOT (common in container
     envs) would steer get_data_dir() away from the package and make the
     subagent/skill discovery tests fail spuriously.
     """
