@@ -21,7 +21,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.shortcuts import PromptSession
 from rich.console import Console
 
-from minisweagent import global_config_dir
+from minisweagent import get_repo_root, global_config_dir
 from minisweagent.agents.parallel_agent import BestPatchResult
 from minisweagent.config import builtin_config_dir, get_config_path
 from minisweagent.environments import get_environment_class
@@ -313,12 +313,13 @@ def main(
     # RAG MCP toggle: disable RAG tools when rag is not enabled
     rag_enabled = tools_cfg.get("rag", False)
     if rag_enabled:
+        _repo_root = get_repo_root()
         # Auto-install rag-mcp package if missing
         try:
             import rag_mcp  # noqa: F401
         except ImportError:
             logger.info("rag-mcp package not found, installing automatically...")
-            _rag_mcp_path = Path(__file__).resolve().parents[3] / "mcp_tools" / "rag-mcp"
+            _rag_mcp_path = _repo_root / "mcp_tools" / "rag-mcp"
             result = subprocess.run(
                 [sys.executable, "-m", "pip", "install", "-e", str(_rag_mcp_path)],
                 capture_output=True, text=True,
@@ -342,7 +343,7 @@ def main(
         _has_pkl = bool(list(_index_path.glob("*.pkl"))) if _index_path.exists() else False
         if not (_has_faiss and _has_pkl):
             logger.info("RAG index not found at %s, building automatically...", _index_path)
-            _build_script = Path(__file__).resolve().parents[3] / "scripts" / "build_index.py"
+            _build_script = _repo_root / "scripts" / "build_index.py"
             result = subprocess.run(
                 [sys.executable, str(_build_script), "--force"],
                 capture_output=True, text=True,
