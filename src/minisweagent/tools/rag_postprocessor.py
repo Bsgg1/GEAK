@@ -74,9 +74,13 @@ Instructions:
      "No relevant information found."
    """
 
-    def __init__(self, config: RAGPostProcessorConfig | None = None):
+    def __init__(self, config: RAGPostProcessorConfig | None = None, model=None):
         self.config = config or RAGPostProcessorConfig()
-        self._model = None
+        # A live, already-configured model (with api_key/base_url) takes
+        # precedence over reconstructing one from ``config.model_config``.
+        # Reusing the agent's model avoids a bare ``get_model()`` fallback that
+        # has no credentials when the caller omitted ``model_config``.
+        self._model = model
 
     @property
     def model(self):

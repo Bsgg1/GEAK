@@ -166,11 +166,16 @@ class ToolRuntime:
         self.use_strategy_manager = use_strategy_manager
         self._codebase_context: str | None = None
 
-    def wrap_rag_tools_with_postprocessor(self, model_config: dict | None = None) -> None:
-        """Wrap RAG MCP tools with RAGPostProcessor for result filtering."""
+    def wrap_rag_tools_with_postprocessor(self, model_config: dict | None = None, model=None) -> None:
+        """Wrap RAG MCP tools with RAGPostProcessor for result filtering.
+
+        When ``model`` (a live, configured model) is supplied it is reused
+        directly, so the postprocessor inherits the agent's api_key/base_url
+        instead of reconstructing a credential-less model from ``model_config``.
+        """
         from minisweagent.tools.rag_postprocessor import RAGPostProcessor, RAGPostProcessorConfig
 
-        postprocessor = RAGPostProcessor(RAGPostProcessorConfig(enabled=True, model_config=model_config))
+        postprocessor = RAGPostProcessor(RAGPostProcessorConfig(enabled=True, model_config=model_config), model=model)
 
         def _wrap(tool_callable):
             def wrapper(**kwargs):

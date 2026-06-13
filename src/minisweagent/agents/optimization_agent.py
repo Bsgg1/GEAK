@@ -245,7 +245,7 @@ class OptimizationAgent:
 
         # RAG MCP postprocessor wrapping (from DefaultAgent)
         try:
-            self.toolruntime.wrap_rag_tools_with_postprocessor()
+            self.toolruntime.wrap_rag_tools_with_postprocessor(model=self.model)
         except Exception as e:
             logger.warning("Failed to wrap RAG tools with postprocessor: %s", e)
 
