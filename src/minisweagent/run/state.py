@@ -388,14 +388,27 @@ def preprocess_soft_stop_handler(
 
     # ---- stage classifier ----
     if stage == PreprocessStage.HARNESS_INIT and not has_baseline:
-        # Hard fail: harness setup is broken; nothing useful to optimize.
-        state.hard_fail = True
-        state.fail_reason = (
-            f"preprocess soft cap ({soft_cap_s:.0f}s) reached during '{stage.value}' "
-            f"with no benchmark_baseline.txt produced; harness setup did not progress in time"
+        # The soft-cap read of has_baseline above can be stale: harness setup
+        # may be finishing the baseline concurrently (e.g. a slow profiler that
+        # writes benchmark_baseline.txt shortly after the cap fires). Re-check
+        # before declaring a hard fail so we don't emit a spurious error +
+        # registry teardown for a run that is actually progressing.
+        if not state.has_baseline_file():
+            # Genuine hard fail: harness setup is broken; nothing to optimize.
+            state.hard_fail = True
+            state.fail_reason = (
+                f"preprocess soft cap ({soft_cap_s:.0f}s) reached during '{stage.value}' "
+                f"with no benchmark_baseline.txt produced; harness setup did not progress in time"
+            )
+            logger.error("[preprocess] %s -- terminating registry and aborting run", state.fail_reason)
+            state.registry.terminate_all()
+            return
+        # Baseline appeared between the cap firing and now -- not a hard stop.
+        logger.warning(
+            "[preprocess] soft cap reached during '%s' but benchmark_baseline.txt is now present; "
+            "letting harness setup finish in borrowed time",
+            stage.value,
         )
-        logger.error("[preprocess] %s -- terminating registry and aborting run", state.fail_reason)
-        state.registry.terminate_all()
         return
 
     if stage == PreprocessStage.HARNESS_BENCHMARK:
