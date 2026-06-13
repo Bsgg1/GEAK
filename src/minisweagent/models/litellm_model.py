@@ -249,6 +249,14 @@ class LitellmModelConfig(AmdLlmModelConfig):
     tool_cache_control: bool = False
     """Attach ``cache_control`` to the last tool definition (Anthropic prompt caching)."""
 
+    cost_tracking: Literal["default", "ignore_errors"] = field(
+        default_factory=lambda: os.getenv("GEAK_COST_TRACKING", "ignore_errors")
+    )
+    """How to handle cost-calculation failures (e.g. a model missing from LiteLLM's price
+    registry). ``"default"`` logs a warning on each failure; ``"ignore_errors"`` (the default)
+    demotes it to a debug message so unregistered models don't spam the logs. The default can
+    be overridden per-run via the ``GEAK_COST_TRACKING`` env var or per-config via this field."""
+
 
 def _merge_completion_kwargs(
     config: LitellmModelConfig,
@@ -401,7 +409,8 @@ class LitellmModel:
                 model=self.config.litellm_model_name_override or None,
             )
         except Exception as e:
-            logger.warning(
+            _log = logger.debug if self.config.cost_tracking == "ignore_errors" else logger.warning
+            _log(
                 "Error calculating cost for model %s: %s. "
                 "See 'Updating the model registry' at https://klieret.short.gy/litellm-model-registry",
                 self.config.model_name,
