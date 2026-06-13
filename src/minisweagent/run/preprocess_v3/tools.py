@@ -1749,6 +1749,12 @@ def _make_tool_finish_preprocess(
                         logger.info("finish_preprocess derived harness_path from output_dir: %s", candidate)
                         break
 
+        # The orchestrator LLM has been observed to pass ``errors`` as a bare
+        # string instead of the schema-declared list. ``list("text")`` would
+        # explode it into individual characters, so coerce a scalar to a
+        # single-element list before normalizing.
+        if isinstance(errors, str):
+            errors = [errors]
         payload = {
             "harness_path": agent._collected.get("harness_path"),
             "commandment_path": agent._collected.get("commandment_path"),
