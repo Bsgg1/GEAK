@@ -388,25 +388,16 @@ def preprocess_soft_stop_handler(
 
     # ---- stage classifier ----
     if stage == PreprocessStage.HARNESS_INIT and not has_baseline:
-        # The soft-cap read of has_baseline above can be stale: harness setup
-        # may be finishing the baseline concurrently (e.g. a slow profiler that
-        # writes benchmark_baseline.txt shortly after the cap fires). Re-check
-        # before declaring a hard fail so we don't emit a spurious error +
-        # registry teardown for a run that is actually progressing.
-        if not state.has_baseline_file():
-            # Genuine hard fail: harness setup is broken; nothing to optimize.
-            state.hard_fail = True
-            state.fail_reason = (
-                f"preprocess soft cap ({soft_cap_s:.0f}s) reached during '{stage.value}' "
-                f"with no benchmark_baseline.txt produced; harness setup did not progress in time"
-            )
-            logger.error("[preprocess] %s -- terminating registry and aborting run", state.fail_reason)
-            state.registry.terminate_all()
-            return
-        # Baseline appeared between the cap firing and now -- not a hard stop.
+        # The soft cap is a *borrow* signal, not a kill: harness-init is still
+        # in flight (e.g. a slow profiler that writes benchmark_baseline.txt
+        # minutes after the cap fires). Warn and continue in borrowed time like
+        # every other soft-cap stage. The hard cap (preprocess_hard_stop_handler)
+        # is the only thing that may set hard_fail / terminate the registry --
+        # setting either here would abort an otherwise-healthy run at the next
+        # stage boundary (see PreprocessState.advance_stage).
         logger.warning(
-            "[preprocess] soft cap reached during '%s' but benchmark_baseline.txt is now present; "
-            "letting harness setup finish in borrowed time",
+            "[preprocess] soft cap reached during '%s' with no benchmark_baseline.txt yet; "
+            "letting harness setup finish in borrowed time (hard cap remains the kill switch)",
             stage.value,
         )
         return
