@@ -21,7 +21,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.shortcuts import PromptSession
 from rich.console import Console
 
-from minisweagent import global_config_dir
+from minisweagent import get_repo_root, global_config_dir
 from minisweagent.agents.parallel_agent import BestPatchResult
 from minisweagent.config import builtin_config_dir, get_config_path
 from minisweagent.environments import get_environment_class
@@ -92,14 +92,26 @@ def _normalize_kernel_type(value: Any) -> str:
     return "other"
 
 
+# Extensions that mean ``--output`` points at a trajectory *file* (so its parent
+# is the run directory). Anything else is treated as the run directory itself.
+_TRAJECTORY_FILE_SUFFIXES = {".json", ".jsonl", ".traj"}
+
+
 def _derive_output_dir(output: Path | None, kernel_name: str | None) -> tuple[Path, bool]:
     """Derive the output directory from ``-o``/``--output``.
 
     Returns ``(path, auto)``. ``auto`` is True iff ``output`` was ``None`` and
     geak generated the path under ``<cwd>/optimization_logs/``.
 
-    - If output is a file path: output_dir = output.parent (auto=False)
     - If output is a directory: output_dir = output (auto=False)
+    - If output is an existing file: output_dir = output.parent (auto=False)
+    - If output does not exist yet: treat it as a trajectory *file* (and use
+      its parent) only when its extension is a known trajectory-file type;
+      otherwise treat it as the directory to create. A bare ``Path.suffix``
+      check is wrong here because model/output directory names routinely
+      contain dots (e.g. ``zai-org-GLM-4.7``, ``MiniMax-M2.1``), which Python
+      misreads as a file extension -- collapsing the run into its parent and
+      making every such run write into (and clobber) the shared parent dir.
     - If output is not provided: use ./optimization_logs/<kernel_name>_<timestamp>
       (auto=True)
 
@@ -120,7 +132,17 @@ def _derive_output_dir(output: Path | None, kernel_name: str | None) -> tuple[Pa
 
         return (Path.cwd() / Path(generate_patch_output_dir(kernel_name))).resolve(), True
 
-    if output.suffix:
+    # Prefer what the path actually is on disk over guessing from its name.
+    if output.is_dir():
+        return output.resolve(), False
+    if output.is_file():
+        return output.parent.resolve(), False
+
+    # Path does not exist yet: only treat it as a trajectory file (use parent)
+    # when its extension is a real trajectory-file type. Otherwise it is the
+    # directory we should create -- a dot in a directory name (e.g. a model
+    # version like "GLM-4.7") must NOT be mistaken for a file extension.
+    if output.suffix.lower() in _TRAJECTORY_FILE_SUFFIXES:
         return output.parent.resolve(), False
 
     return output.resolve(), False
@@ -313,12 +335,13 @@ def main(
     # RAG MCP toggle: disable RAG tools when rag is not enabled
     rag_enabled = tools_cfg.get("rag", False)
     if rag_enabled:
+        _repo_root = get_repo_root()
         # Auto-install rag-mcp package if missing
         try:
             import rag_mcp  # noqa: F401
         except ImportError:
             logger.info("rag-mcp package not found, installing automatically...")
-            _rag_mcp_path = Path(__file__).resolve().parents[3] / "mcp_tools" / "rag-mcp"
+            _rag_mcp_path = _repo_root / "mcp_tools" / "rag-mcp"
             result = subprocess.run(
                 [sys.executable, "-m", "pip", "install", "-e", str(_rag_mcp_path)],
                 capture_output=True, text=True,
@@ -342,7 +365,7 @@ def main(
         _has_pkl = bool(list(_index_path.glob("*.pkl"))) if _index_path.exists() else False
         if not (_has_faiss and _has_pkl):
             logger.info("RAG index not found at %s, building automatically...", _index_path)
-            _build_script = Path(__file__).resolve().parents[3] / "scripts" / "build_index.py"
+            _build_script = _repo_root / "scripts" / "build_index.py"
             result = subprocess.run(
                 [sys.executable, str(_build_script), "--force"],
                 capture_output=True, text=True,

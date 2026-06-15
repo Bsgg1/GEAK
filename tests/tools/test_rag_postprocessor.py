@@ -115,13 +115,56 @@ class TestRAGPostProcessorModelRouting:
         with patch("minisweagent.models.get_model_class") as mock_get_class:
             mock_get_class.return_value = _make_deterministic_model
 
-            pp = RAGPostProcessor(RAGPostProcessorConfig(
-                enabled=True,
-                model_config={"model_class": "amd_llm", "model_name": "test"},
-            ))
+            pp = RAGPostProcessor(
+                RAGPostProcessorConfig(
+                    enabled=True,
+                    model_config={"model_class": "amd_llm", "model_name": "test"},
+                )
+            )
             model1 = pp.model
             model2 = pp.model
             assert model1 is model2
+
+
+class _RecordingModel:
+    """Minimal model double that records the ``tools`` kwarg and returns a
+    configurable response, so we can assert how the postprocessor calls it."""
+
+    def __init__(self, content):
+        self._content = content
+        self.tools = [{"function": {"name": "agent_tool"}}]  # mimic a live agent model
+        self.calls = []
+
+    def query(self, messages, **kwargs):
+        self.calls.append(kwargs)
+        return {"content": self._content}
+
+
+class TestRAGPostProcessorPassedModel:
+    """Behavior when a live (tool-bearing) agent model is reused by the postprocessor."""
+
+    def test_passed_model_takes_precedence(self):
+        model = _RecordingModel("cleaned text")
+        pp = RAGPostProcessor(RAGPostProcessorConfig(enabled=True), model=model)
+        assert pp.model is model
+
+    def test_process_disables_tools_on_call(self):
+        # The postprocessor must pass tools=[] so the reused agent model cannot
+        # answer with a tool call (which would yield empty content).
+        model = _RecordingModel("cleaned text")
+        pp = RAGPostProcessor(RAGPostProcessorConfig(enabled=True), model=model)
+        out = pp.process("raw rag chunks", query="q")
+        assert out == "cleaned text"
+        assert model.calls and model.calls[0].get("tools") == []
+
+    def test_empty_response_falls_back_to_raw(self):
+        # Regression: if the model returns empty content (e.g. it emitted a tool
+        # call), process() must return the raw RAG result, not "".
+        raw = "raw rag chunks that must survive"
+        for empty in ("", "   ", None):
+            model = _RecordingModel(empty)
+            pp = RAGPostProcessor(RAGPostProcessorConfig(enabled=True), model=model)
+            assert pp.process(raw) == raw
 
 
 class TestRAGPostProcessorConfig:
@@ -150,6 +193,7 @@ class TestGetModelClassRouting:
 
     def test_amd_llm_resolves(self):
         from minisweagent.models.amd_llm import AmdLlmModel
+
         assert get_model_class("any-model", "amd_llm") == AmdLlmModel
 
     def test_deterministic_resolves(self):

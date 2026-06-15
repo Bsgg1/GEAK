@@ -118,6 +118,37 @@ class TestDeriveOutputDir:
         assert out_dir == (tmp_path / "silu").resolve()
         assert auto is False
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "zai-org-GLM-4.7-Flash__geak-49c6b480",
+            "MiniMaxAI-MiniMax-M2.1__geak-1660c67a",
+            "neo4j-text-to-cypher-Gemma-3-27B-Instruct-2025.04.0__geak-3dccbdc0",
+            "maldv-QwentileLambda2.5-32B-Instruct__geak-98f4cbd4",
+        ],
+    )
+    def test_dotted_directory_name_is_not_treated_as_file(self, tmp_path: Path, name: str) -> None:
+        # Regression: a non-existent output dir whose name contains a dot (model
+        # version strings like "GLM-4.7", "M2.1", "2025.04.0") must resolve to
+        # that dir itself, NOT its parent. The old ``Path.suffix`` heuristic
+        # misread the trailing ".N..." as a file extension and collapsed every
+        # such run into the shared parent dir, so parallel runs clobbered each
+        # other and the intended per-run subdir stayed empty.
+        target = tmp_path / name
+        out_dir, auto = mini_module._derive_output_dir(target, None)
+        assert out_dir == target.resolve()
+        assert out_dir != tmp_path.resolve()
+        assert auto is False
+
+    @pytest.mark.parametrize("suffix", [".json", ".jsonl", ".traj"])
+    def test_nonexistent_trajectory_file_uses_parent(self, tmp_path: Path, suffix: str) -> None:
+        # A non-existent path with a real trajectory-file extension is still
+        # treated as a file, so the run directory is its parent.
+        f = tmp_path / "run_dir" / f"trajectory{suffix}"
+        out_dir, auto = mini_module._derive_output_dir(f, None)
+        assert out_dir == f.parent.resolve()
+        assert auto is False
+
 
 class TestFinalReportToBestpatchresult:
     def test_none_returns_none(self) -> None:

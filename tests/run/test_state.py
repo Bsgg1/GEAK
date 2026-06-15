@@ -184,12 +184,17 @@ def test_terminate_all_after_all_futures_done_reports_zero():
 # ---------------------------------------------------------------------------
 
 
-def test_soft_stop_hard_fail_when_harness_init_without_baseline_file(tmp_path):
+def test_soft_stop_warn_and_continue_when_harness_init_without_baseline_file(tmp_path):
+    # The soft cap is a borrow signal, not a kill. Even when harness-init has
+    # not produced benchmark_baseline.txt yet, the soft handler must only warn
+    # and enter borrow mode -- the hard cap is the sole kill switch. Setting
+    # hard_fail / terminating the registry here would abort an otherwise-healthy
+    # run whose baseline lands minutes after the cap fires.
     state = PreprocessState(output_dir=tmp_path)
     state.current_stage = PreprocessStage.HARNESS_INIT
     preprocess_soft_stop_handler(state, soft_cap_s=900, hard_cap_s=1800)
-    assert state.hard_fail is True
-    assert state.fail_reason and "harness setup" in state.fail_reason.lower()
+    assert state.hard_fail is False
+    assert state.in_borrow_mode is True
 
 
 def test_soft_stop_warn_and_skip_profiling_when_harness_benchmark(tmp_path):

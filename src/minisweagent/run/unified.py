@@ -121,7 +121,8 @@ def _resolve_tools(ctx: PipelineContext, mode: Mode):
         runtime.disable_tools(["query", "optimize"])
     else:
         try:
-            runtime.wrap_rag_tools_with_postprocessor()
+            _pp_model = ctx.model or (ctx.model_factory() if ctx.model_factory else None)
+            runtime.wrap_rag_tools_with_postprocessor(model=_pp_model)
         except Exception as exc:
             logger.warning("Failed to wrap RAG tools with postprocessor: %s", exc)
 

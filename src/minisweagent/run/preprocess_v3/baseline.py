@@ -73,7 +73,7 @@ _DEFAULT_QUICK = False
 #:   GEAK_BENCH_TIMEOUT    — benchmark + correctness gate (each keeps its own default)
 #:   GEAK_PROFILE_TIMEOUT  — profiler-mcp invocation
 _BENCHMARK_TIMEOUT_S = int(os.environ.get("GEAK_BENCH_TIMEOUT", "600"))
-_PROFILE_TIMEOUT_S = int(os.environ.get("GEAK_PROFILE_TIMEOUT", "120"))
+_PROFILE_TIMEOUT_S = int(os.environ.get("GEAK_PROFILE_TIMEOUT", "300"))
 
 #: Short timeout for the correctness gate that runs before baseline collection.
 #: Goal: fail fast on a broken kernel rather than spending minutes running the
