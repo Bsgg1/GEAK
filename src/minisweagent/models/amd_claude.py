@@ -154,8 +154,13 @@ class AmdClaudeModel(AmdLlmModelBase):
 
         all_kwargs = self.config.model_kwargs | kwargs
         filtered_kwargs = {k: v for k, v in all_kwargs.items() if k in supported_params}
+        # An explicit ``tools`` kwarg (including an empty list) overrides the
+        # model's default palette for this one call — e.g. the RAG postprocessor
+        # reuses the agent's tool-bearing model but passes ``tools=[]`` so the
+        # LLM cannot answer with a tool call (which would yield empty content).
+        tools_override = filtered_kwargs["tools"] if "tools" in filtered_kwargs else self.tools
         filtered_kwargs["tools"] = convert_openai_tools_to_claude(
-            self.tools,
+            tools_override,
             cache_control=True,
         )
 

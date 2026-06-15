@@ -234,6 +234,29 @@ def _register_litellm_registry(path: Path | str | None) -> None:
         litellm.utils.register_model(json.loads(p.read_text(encoding="utf-8")))
 
 
+_COST_TRACKING_VALUES = frozenset({"default", "ignore_errors"})
+
+
+def _resolve_cost_tracking() -> str:
+    """Read GEAK_COST_TRACKING, falling back to a safe default on an invalid value.
+
+    The field is typed ``Literal["default", "ignore_errors"]`` but the env var is
+    free-form, so a typo (e.g. ``ignore_error``) would otherwise be accepted
+    verbatim and silently behave like ``"default"`` (the only branch the code
+    checks is ``== "ignore_errors"``). Normalize here so a misspelling is logged
+    and coerced to the documented default instead of failing quietly.
+    """
+    value = os.getenv("GEAK_COST_TRACKING", "ignore_errors")
+    if value in _COST_TRACKING_VALUES:
+        return value
+    logger.warning(
+        "Invalid GEAK_COST_TRACKING=%r; expected one of %s. Falling back to 'ignore_errors'.",
+        value,
+        sorted(_COST_TRACKING_VALUES),
+    )
+    return "ignore_errors"
+
+
 @dataclass
 class LitellmModelConfig(AmdLlmModelConfig):
     """Configuration for :class:`NewLitellmModel`."""
@@ -249,9 +272,7 @@ class LitellmModelConfig(AmdLlmModelConfig):
     tool_cache_control: bool = False
     """Attach ``cache_control`` to the last tool definition (Anthropic prompt caching)."""
 
-    cost_tracking: Literal["default", "ignore_errors"] = field(
-        default_factory=lambda: os.getenv("GEAK_COST_TRACKING", "ignore_errors")
-    )
+    cost_tracking: Literal["default", "ignore_errors"] = field(default_factory=lambda: _resolve_cost_tracking())
     """How to handle cost-calculation failures (e.g. a model missing from LiteLLM's price
     registry). ``"default"`` logs a warning on each failure; ``"ignore_errors"`` (the default)
     demotes it to a debug message so unregistered models don't spam the logs. The default can
@@ -323,8 +344,15 @@ class LitellmModel:
     )
     def _query(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
         filtered = _merge_completion_kwargs(self.config, kwargs)
+        # An explicit ``tools`` kwarg (including an empty list) overrides the
+        # model's default tool palette for this one call. Callers that reuse a
+        # shared, tool-bearing agent model for a tools-free task (e.g. the RAG
+        # postprocessor) pass ``tools=[]`` so the LLM cannot emit a tool call
+        # that would come back as empty content. ``_merge_completion_kwargs``
+        # already surfaced the override into ``filtered`` when present.
+        tools_override = filtered["tools"] if "tools" in filtered else self.tools
         filtered["tools"] = convert_openai_tools_to_litellm(
-            self.tools,
+            tools_override,
             tool_cache_control=self.config.tool_cache_control,
         )
         existing_headers = filtered.get("extra_headers") or {}

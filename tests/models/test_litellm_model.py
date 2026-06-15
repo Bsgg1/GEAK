@@ -10,6 +10,7 @@ from minisweagent.models.litellm_model import (
     _coerce_tool_arguments,
     _first_function_tool_call,
     _openai_tool_call_to_api_shape,
+    _resolve_cost_tracking,
     convert_openai_tools_to_litellm,
     normalize_messages_for_litellm_api,
 )
@@ -403,3 +404,60 @@ class TestLitellmModelUserHeader:
             model.query([{"role": "user", "content": "hi"}])
         headers = comp.call_args.kwargs["extra_headers"]
         assert headers["user"] == "alice@amd.com"
+
+
+class TestPerCallToolsOverride:
+    """An explicit ``tools`` kwarg overrides the model's default tool palette
+    for that single call (used by the RAG postprocessor to pass ``tools=[]``)."""
+
+    def _model_with_tools(self):
+        model = LitellmModel(model_name="openai/gpt-4", model_kwargs={"api_key": "k"})
+        model.set_tools([{"name": "bash", "description": "run", "parameters": {"type": "object"}}])
+        return model
+
+    def test_explicit_empty_tools_overrides_default(self):
+        model = self._model_with_tools()
+        with (
+            patch(
+                "minisweagent.models.litellm_model.litellm.completion", return_value=_fake_litellm_response()
+            ) as comp,
+            patch(
+                "minisweagent.models.litellm_model.litellm.cost_calculator.completion_cost",
+                return_value=0.0,
+            ),
+        ):
+            model.query([{"role": "user", "content": "hi"}], tools=[])
+        assert comp.call_args.kwargs["tools"] == []
+
+    def test_default_tools_used_when_no_override(self):
+        model = self._model_with_tools()
+        with (
+            patch(
+                "minisweagent.models.litellm_model.litellm.completion", return_value=_fake_litellm_response()
+            ) as comp,
+            patch(
+                "minisweagent.models.litellm_model.litellm.cost_calculator.completion_cost",
+                return_value=0.0,
+            ),
+        ):
+            model.query([{"role": "user", "content": "hi"}])
+        sent = comp.call_args.kwargs["tools"]
+        assert [t["function"]["name"] for t in sent] == ["bash"]
+
+
+class TestResolveCostTracking:
+    """GEAK_COST_TRACKING is normalized; invalid values fall back safely."""
+
+    def test_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv("GEAK_COST_TRACKING", raising=False)
+        assert _resolve_cost_tracking() == "ignore_errors"
+
+    def test_valid_values_pass_through(self, monkeypatch):
+        monkeypatch.setenv("GEAK_COST_TRACKING", "default")
+        assert _resolve_cost_tracking() == "default"
+        monkeypatch.setenv("GEAK_COST_TRACKING", "ignore_errors")
+        assert _resolve_cost_tracking() == "ignore_errors"
+
+    def test_invalid_value_falls_back(self, monkeypatch):
+        monkeypatch.setenv("GEAK_COST_TRACKING", "ignore_error")  # typo
+        assert _resolve_cost_tracking() == "ignore_errors"

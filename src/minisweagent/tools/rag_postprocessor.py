@@ -120,13 +120,23 @@ Instructions:
 
         logger.debug("RAG postprocessor processing %d chars", len(rag_result))
 
+        # Pass ``tools=[]`` so this call never offers the LLM a tool palette.
+        # The model here may be the agent's shared, tool-bearing model (reused
+        # for its credentials); without this, the LLM could answer with a tool
+        # call, ``content`` would be empty, and we would silently return "".
         response = self.model.query(
-            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}]
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}],
+            tools=[],
         )
 
-        result = response["content"]
-        logger.debug("RAG postprocessor output %d chars", len(result))
+        result = response.get("content") or ""
+        if not result.strip():
+            # Defensive fallback: an empty response (e.g. the model emitted a
+            # tool call despite tools=[]) must not clobber the retrieval result.
+            logger.warning("RAG postprocessor returned empty content; falling back to raw RAG result.")
+            return rag_result
 
+        logger.debug("RAG postprocessor output %d chars", len(result))
         return result
 
 

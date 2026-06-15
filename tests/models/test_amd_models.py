@@ -73,6 +73,31 @@ def _make_claude_model():
         return AmdClaudeModel(config)
 
 
+class TestAmdClaudePerCallToolsOverride:
+    """An explicit ``tools`` kwarg overrides the model's default palette for a
+    single call (the RAG postprocessor passes ``tools=[]`` to a reused model)."""
+
+    def _model_with_tools(self):
+        model = _make_claude_model()
+        model.tools = [{"function": {"name": "bash", "description": "run", "parameters": {"type": "object"}}}]
+        model.client = MagicMock()
+        model.client.messages.create.return_value = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="ok")], usage=None, stop_reason="end_turn"
+        )
+        return model
+
+    def test_explicit_empty_tools_overrides_default(self):
+        model = self._model_with_tools()
+        model.query([{"role": "user", "content": "hi"}], tools=[])
+        assert model.client.messages.create.call_args.kwargs["tools"] == []
+
+    def test_default_tools_used_when_no_override(self):
+        model = self._model_with_tools()
+        model.query([{"role": "user", "content": "hi"}])
+        sent = model.client.messages.create.call_args.kwargs["tools"]
+        assert [t["name"] for t in sent] == ["bash"]
+
+
 class TestAmdClaudeFormatMessages:
     def test_system_extracted(self):
         model = _make_claude_model()
