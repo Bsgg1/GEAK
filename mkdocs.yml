@@ -40,6 +40,7 @@ nav:
       - Overview: developer/index.md
       - System & instance prompts: developer/prompts.md
       - MCP and native tools: developer/mcp-tools.md
+  - Compatibility matrix: compatibility.md
   - ROCm environment: env_install.md
   - RAG sub-agent: subagent_guide.md
 
