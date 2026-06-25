@@ -410,10 +410,7 @@ class LitellmModel:
             or (self.config.model_kwargs or {}).get("api_base")
             or (self.config.model_kwargs or {}).get("base_url")
         )
-        force_stream = (
-            _is_amd_llm_gateway_api_base(effective_api_base)
-            and not filtered.get("stream")
-        )
+        force_stream = _is_amd_llm_gateway_api_base(effective_api_base) and not filtered.get("stream")
         try:
             if force_stream:
                 chunks = list(
